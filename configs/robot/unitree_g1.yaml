@@ -1,0 +1,63 @@
+project:
+  name: g1_nav_rl
+
+robot:
+  asset_source: builtin_isaaclab
+  asset_name: G1_CFG
+  prim_path: "{ENV_REGEX_NS}/Robot"
+  init_state:
+    pos: [0.0, 0.0, 0.78]
+    rot_wxyz: [1.0, 0.0, 0.0, 0.0]
+
+scene:
+  num_envs: 1
+  env_spacing: 2.5
+  ground_prim_path: "/World/defaultGroundPlane"
+  light_prim_path: "/World/Light"
+  dome_light:
+    intensity: 3000.0
+    color: [0.75, 0.75, 0.75]
+  viewer:
+    eye: [3.5, 3.5, 2.5]
+    target: [0.0, 0.0, 0.9]
+
+camera:
+  mount_link: "torso_link"
+  prim_name: "front_cam"
+  update_period: 0.1
+  width: 640
+  height: 480
+  data_types:
+    - rgb
+    - distance_to_image_plane
+  pinhole:
+    focal_length: 24.0
+    focus_distance: 400.0
+    horizontal_aperture: 20.955
+    clipping_range: [0.1, 100000.0]
+  offset:
+    pos: [0.30, 0.0, 0.10]
+    rot_wxyz: [0.5, -0.5, 0.5, -0.5]
+    convention: "ros"
+
+observations:
+  rgb_normalize: true
+  depth_min: 0.0
+  depth_max: 10.0
+  include:
+    rgb: true
+    depth: true
+    proprio: true
+
+debug_cube:
+  enabled: true
+  prim_path: "{ENV_REGEX_NS}/DebugCube"
+  size: [0.5, 0.5, 0.5]
+  pos: [2.0, 0.0, 0.25]
+  color: [0.2, 0.8, 0.2]
+
+debug:
+  print_every: 100
+  save_screenshots: true
+  save_every: 100
+  screenshot_dir: "outputs/camera"
