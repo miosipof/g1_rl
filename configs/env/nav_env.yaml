@@ -1,0 +1,23 @@
+# Minimal command-level navigation environment configuration.
+# This is not yet a full Isaac Lab RL task config; it configures the lightweight
+# G1NavEnv wrapper in src/g1_nav_rl/envs/nav_env.py.
+
+max_episode_steps: 500
+success_radius: 0.20
+use_depth_safety: true
+
+reward:
+  progress_weight: 1.0
+  command_penalty_weight: 0.01
+  success_bonus: 1.0
+
+# Defaults mirror configs/robot/g1_command_proxy.yaml::obstacle_safety.
+depth_safety:
+  enabled: true
+  vertical_band: [0.25, 0.90]
+  center_width_frac: 0.60
+  safety_distance: 2.0
+  hard_stop_distance: 1.1
+  forward_scale_at_safety: 0.0
+  sidestep_speed: 0.30
+  yaw_away_rate: 0.50

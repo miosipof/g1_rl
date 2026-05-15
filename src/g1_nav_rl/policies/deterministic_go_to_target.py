@@ -59,7 +59,6 @@ class GoToTargetControllerCfg:
         )
 
 
-
 def _validate_state_tensors(pos_xy_w: torch.Tensor, yaw: torch.Tensor, target_xy_w: torch.Tensor) -> None:
     if not torch.is_tensor(pos_xy_w):
         raise TypeError(f"pos_xy_w must be a torch.Tensor, got {type(pos_xy_w)!r}")
