@@ -58,6 +58,10 @@ from g1_nav_rl.policies.deterministic_go_to_target import (  # noqa: E402
     GoToTargetControllerCfg,
     compute_go_to_target_command,
 )
+from g1_nav_rl.safety.depth_safety_filter import (  # noqa: E402
+    DepthSafetyFilterCfg,
+    apply_depth_safety_filter,
+)
 
 
 def load_yaml(path: str | Path) -> dict:
@@ -142,106 +146,6 @@ def build_camera_observation(scene: InteractiveScene, proxy: G1CommandProxy) -> 
         "proprio": proxy.observation(),
     }
 
-
-
-def apply_depth_safety_filter(
-    depth: torch.Tensor,
-    command: torch.Tensor,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Modify [vx, vy, wz] using a simple front-depth safety rule.
-
-    depth shape:
-        [num_envs, H, W, 1]
-
-    If the center region is too close, reduce forward velocity and sidestep
-    toward the side with more free space.
-    """
-    safety_cfg = CFG.get("obstacle_safety", {})
-    if not safety_cfg.get("enabled", False):
-        return command, {
-            "enabled": 0.0,
-            "center_min": float("nan"),
-            "left_min": float("nan"),
-            "right_min": float("nan"),
-            "active": 0.0,
-        }
-
-    depth_2d = depth[..., 0]
-    num_envs, height, width = depth_2d.shape
-
-    y0_frac, y1_frac = safety_cfg["vertical_band"]
-    y0 = int(height * float(y0_frac))
-    y1 = int(height * float(y1_frac))
-
-    center_width = int(width * float(safety_cfg["center_width_frac"]))
-    cx0 = max(0, (width - center_width) // 2)
-    cx1 = min(width, (width + center_width) // 2)
-
-    band = depth_2d[:, y0:y1, :]
-
-    center_min = band[:, :, cx0:cx1].amin(dim=(1, 2))
-
-    if cx0 > 0:
-        left_min = band[:, :, :cx0].amin(dim=(1, 2))
-    else:
-        left_min = center_min
-
-    if cx1 < width:
-        right_min = band[:, :, cx1:].amin(dim=(1, 2))
-    else:
-        right_min = center_min
-
-    filtered = command.clone()
-
-    safety_distance = float(safety_cfg["safety_distance"])
-    hard_stop_distance = float(safety_cfg["hard_stop_distance"])
-    forward_scale = float(safety_cfg["forward_scale_at_safety"])
-    sidestep_speed = float(safety_cfg["sidestep_speed"])
-    yaw_away_rate = float(safety_cfg["yaw_away_rate"])
-
-    center_blocked = center_min < safety_distance
-    hard_blocked = center_min < hard_stop_distance
-    moving_forward = filtered[:, 0] > 0.0
-
-    # Slow forward motion when something is close.
-    filtered[:, 0] = torch.where(
-        center_blocked & moving_forward,
-        filtered[:, 0] * forward_scale,
-        filtered[:, 0],
-    )
-
-    # Hard stop forward motion when very close.
-    filtered[:, 0] = torch.where(
-        hard_blocked & moving_forward,
-        torch.zeros_like(filtered[:, 0]),
-        filtered[:, 0],
-    )
-
-    # Pick the clearer side.
-    go_left = left_min > right_min
-    sidestep = torch.where(
-        go_left,
-        torch.full_like(filtered[:, 1], sidestep_speed),
-        torch.full_like(filtered[:, 1], -sidestep_speed),
-    )
-    yaw_bump = torch.where(
-        go_left,
-        torch.full_like(filtered[:, 2], yaw_away_rate),
-        torch.full_like(filtered[:, 2], -yaw_away_rate),
-    )
-
-    filtered[:, 1] = torch.where(center_blocked, sidestep, filtered[:, 1])
-    filtered[:, 2] = torch.where(center_blocked, filtered[:, 2] + yaw_bump, filtered[:, 2])
-
-    info = {
-        "enabled": 1.0,
-        "center_min": float(center_min[0].detach().cpu()),
-        "left_min": float(left_min[0].detach().cpu()),
-        "right_min": float(right_min[0].detach().cpu()),
-        "active": float(center_blocked[0].detach().cpu()),
-    }
-
-    return filtered, info
 
 
 @configclass
@@ -362,6 +266,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
         CFG["target"]["controller"],
         success_radius=float(CFG["target"]["success_radius"]),
     )
+    depth_safety_cfg = DepthSafetyFilterCfg.from_mapping(CFG.get("obstacle_safety", {}))
 
     print_every = int(CFG["debug"]["print_every"])
     save_every = int(CFG["debug"]["save_every"])
@@ -397,7 +302,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
         )
 
         if last_obs is not None:
-            command, last_safety_info = apply_depth_safety_filter(last_obs["depth"], raw_command)
+            command, last_safety_info = apply_depth_safety_filter(last_obs["depth"], raw_command, depth_safety_cfg)
         else:
             command = raw_command
 
