@@ -1,0 +1,106 @@
+project:
+  name: g1_nav_rl
+
+scene:
+  num_envs: 1
+  env_spacing: 4.0
+  ground_prim_path: "/World/defaultGroundPlane"
+  light_prim_path: "/World/Light"
+  dome_light:
+    intensity: 3000.0
+    color: [0.75, 0.75, 0.75]
+  viewer:
+    eye: [4.0, 4.0, 3.0]
+    target: [0.0, 0.0, 0.8]
+
+proxy:
+  prim_path: "{ENV_REGEX_NS}/G1Proxy"
+  body_prim_path: "{ENV_REGEX_NS}/G1Proxy/body"
+  init_state:
+    pos: [0.0, 0.0, 0.55]
+    yaw: 0.0
+
+  # Approximate command-level body footprint.
+  # Not a full G1 mesh; this is a stable navigation proxy.
+  body:
+    size: [0.55, 0.40, 1.10]
+    color: [0.1, 0.35, 0.9]
+
+  command_limits:
+    max_vx: 0.8
+    max_vy: 0.5
+    max_wz: 1.2
+    max_ax: 1.0
+    max_ay: 1.0
+    max_awz: 2.0
+    smoothing_alpha: 0.20
+
+camera:
+  prim_path: "{ENV_REGEX_NS}/G1Proxy/front_cam"
+  update_period: 0.05
+  width: 640
+  height: 480
+  data_types:
+    - rgb
+    - distance_to_image_plane
+  pinhole:
+    focal_length: 24.0
+    focus_distance: 400.0
+    horizontal_aperture: 20.955
+    clipping_range: [0.1, 100000.0]
+  offset:
+    # Approximate front camera position on a G1-like torso.
+    pos: [0.35, 0.0, 0.35]
+    rot_wxyz: [0.5, -0.5, 0.5, -0.5]
+    convention: "ros"
+
+
+
+observations:
+  rgb_normalize: true
+  depth_min: 0.0
+  depth_max: 10.0
+
+debug:
+  print_every: 20
+  save_screenshots: true
+  save_every: 40
+  screenshot_dir: "outputs/command_proxy_camera"
+
+debug_cube:
+  enabled: true
+  prim_path: "{ENV_REGEX_NS}/DebugCube"
+  size: [0.8, 0.8, 0.8]
+  pos: [2.2, 0.0, 0.4]
+  color: [0.2, 0.8, 0.2]
+
+  
+target:
+  enabled: true
+  prim_path: "{ENV_REGEX_NS}/Target"
+  pos: [4.0, 0.0, 0.08]
+  size: [0.25, 0.25, 0.16]
+  color: [1.0, 0.1, 0.1]
+  success_radius: 0.20
+  controller:
+    k_vx: 0.8
+    k_vy: 0.8
+    k_wz: 1.8
+    slow_radius: 1.0
+
+
+
+obstacle_safety:
+  enabled: true
+
+  # Portion of the depth image used for front-obstacle detection.
+  vertical_band: [0.25, 0.90]
+  center_width_frac: 0.60
+
+  # If the center depth is below safety_distance, slow/avoid.
+  # If below hard_stop_distance, stop forward motion.  
+  safety_distance: 2.0
+  hard_stop_distance: 1.1
+  forward_scale_at_safety: 0.0
+  sidestep_speed: 0.30
+  yaw_away_rate: 0.50  
