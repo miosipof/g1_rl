@@ -5,6 +5,8 @@ from typing import Mapping, Protocol, runtime_checkable
 
 import torch
 
+from g1_nav_rl.utils.geometry import wrap_to_pi
+
 
 @runtime_checkable
 class CommandProxyLike(Protocol):
@@ -56,10 +58,6 @@ class GoToTargetControllerCfg:
             success_radius=float(success_radius),
         )
 
-
-def wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
-    """Wrap angles in radians to [-pi, pi]."""
-    return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 
 def _validate_state_tensors(pos_xy_w: torch.Tensor, yaw: torch.Tensor, target_xy_w: torch.Tensor) -> None:
