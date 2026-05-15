@@ -1,10 +1,10 @@
 # G1 Navigation RL — Project Introduction
 
-## Purpose
+## 1. Purpose
 
-This repository is an Isaac Sim / Isaac Lab prototype for building a **high-level navigation stack for Unitree G1-like operation**.
+This repository is an Isaac Sim / Isaac Lab prototype for building a **command-level navigation stack for Unitree G1-like operation**.
 
-The key design decision is that we are **not trying to train or simulate full low-level humanoid locomotion**. On the real G1, the intended deployment interface is expected to be high-level movement commands such as:
+The central design decision is that this project does **not** attempt to train or simulate full low-level humanoid locomotion. The intended real-robot deployment boundary is expected to be a high-level velocity command interface, conceptually:
 
 ```text
 move(vx, vy, wz)
@@ -12,67 +12,75 @@ move(vx, vy, wz)
 
 where:
 
-- `vx` = forward/backward velocity in the robot/body frame
-- `vy` = lateral velocity in the robot/body frame
-- `wz` = yaw rate
+- `vx` is forward/backward velocity in the robot/body frame,
+- `vy` is lateral velocity in the robot/body frame,
+- `wz` is yaw rate.
 
-Therefore, the simulation stack is being shaped around the same abstraction:
+Therefore, the simulation is shaped around the same abstraction:
 
 ```text
 G1-like perception + command-level 2D motion interface
 ```
 
-instead of:
+rather than:
 
 ```text
 full G1 joint-level balance and locomotion policy
 ```
 
-This keeps the simulation transferable to the real robot: policies trained or tested in simulation should output the same type of command that the physical robot will receive.
+This aligns the simulated policy boundary with the intended real Unitree G1 command boundary. It improves transferability at the command/API level, but real deployment will still require a real G1 command adapter, command-rate validation, latency handling, sensor-frame calibration, and hard safety limits.
 
 ---
 
-## Current repository snapshot
+## 2. Current repository snapshot
 
-The uploaded archive contains the following meaningful files:
+The uploaded archive is a smoke-test prototype. It contains a small set of working scripts and modules plus several placeholders for the future production stack.
 
 ```text
-configs/
-  robot/
-    unitree_g1.yaml
-    g1_command_proxy.yaml
-  env/
-    nav_env.yaml          # placeholder, currently empty
-  train/
-    ppo.yaml              # placeholder, currently empty
+g1_rl/
+  README.md                         # currently empty
+  G1_INTRO.md                       # project overview
+  ROADMAP.md                        # implementation roadmap
 
-scripts/
-  smoke_test_scene.py
-  smoke_test_command_proxy.py
-  smoke_test_go_to_target.py
-  train.py                # placeholder, currently empty
-  eval.py                 # placeholder, currently empty
+  configs/
+    robot/
+      unitree_g1.yaml               # Isaac Lab built-in G1 RGB-D smoke-test config
+      g1_command_proxy.yaml         # command-proxy, RGB-D, target, cube, depth-safety config
+    env/
+      nav_env.yaml                  # placeholder, currently empty
+    train/
+      ppo.yaml                      # placeholder, currently empty
 
-src/g1_nav_rl/
-  observations/
-    rgbd_obs.py
-  robots/
-    g1_command_proxy.py
-  envs/
-    nav_env.py            # placeholder, currently empty
-  rewards/
-    navigation_reward.py  # placeholder, currently empty
+  scripts/
+    smoke_test_scene.py             # built-in G1 articulation + RGB-D smoke test
+    smoke_test_command_proxy.py     # command proxy movement smoke test
+    smoke_test_go_to_target.py      # go-to-target + depth safety smoke test
+    train.py                        # placeholder, currently empty
+    eval.py                         # placeholder, currently empty
+
+  src/g1_nav_rl/
+    observations/
+      rgbd_obs.py                   # RGB-D + proprio observation builder for built-in G1
+    robots/
+      g1_command_proxy.py           # kinematic command-level proxy
+      g1_asset.py                   # placeholder, currently empty
+    envs/
+      nav_env.py                    # placeholder, currently empty
+    rewards/
+      navigation_reward.py          # placeholder, currently empty
+    utils/
+      __init__.py                   # placeholder
 ```
 
-`README.md` is currently empty, so this file is intended to document the current state and rationale of the work.
+The current repository should be treated as a validated prototype direction, not as a production navigation environment.
 
 ---
 
-## What has been implemented
+## 3. What has been implemented
 
-### 1. Built-in Isaac Lab G1 smoke test
+### 3.1 Built-in Isaac Lab G1 RGB-D smoke test
 
-File:
+Relevant files:
 
 ```text
 scripts/smoke_test_scene.py
@@ -80,15 +88,13 @@ configs/robot/unitree_g1.yaml
 src/g1_nav_rl/observations/rgbd_obs.py
 ```
 
-This was the first validation step.
-
-It uses Isaac Lab’s built-in `G1_CFG` asset and attaches a front RGB-D camera to the G1 torso link:
+This test uses Isaac Lab's built-in `G1_CFG` articulation and attaches a front RGB-D camera to the G1 torso link:
 
 ```text
 {ENV_REGEX_NS}/Robot/torso_link/front_cam
 ```
 
-The purpose was to confirm that Isaac Sim / Isaac Lab can:
+Its purpose is to check that Isaac Sim / Isaac Lab can:
 
 - load the G1 asset,
 - run headless rendering,
@@ -98,7 +104,7 @@ The purpose was to confirm that Isaac Sim / Isaac Lab can:
 - expose proprioceptive robot state,
 - save camera screenshots.
 
-The observation helper returns:
+The observation helper returns a dictionary of camera and robot-state tensors:
 
 ```python
 {
@@ -113,13 +119,13 @@ The observation helper returns:
 }
 ```
 
-This confirmed that Isaac Lab can provide the perception signals we need. However, it also showed that using the full G1 articulation directly is not the right path for the high-level navigation objective, because we do not want to solve low-level humanoid balance and gait control in this project.
+This test is useful for sensor placement, asset sanity checks, and later comparison with real G1 frame layout. It is **not** the main navigation architecture, because this project does not currently solve full humanoid balance or gait control.
 
 ---
 
-### 2. Command-level G1 proxy
+### 3.2 Command-level G1 proxy
 
-Files:
+Relevant files:
 
 ```text
 src/g1_nav_rl/robots/g1_command_proxy.py
@@ -127,22 +133,20 @@ configs/robot/g1_command_proxy.yaml
 scripts/smoke_test_command_proxy.py
 ```
 
-This is the main architectural pivot.
-
-`G1CommandProxy` models the real robot interface we intend to use:
+`G1CommandProxy` models the high-level command interface we intend to use:
 
 ```python
 proxy.set_command([vx, vy, wz])
 proxy.step(dt)
 ```
 
-It keeps internal state:
+The proxy maintains a compact command-level state:
 
 ```text
 x, y, z, yaw, vx, vy, wz
 ```
 
-and returns command-level proprioception:
+and exposes command-level proprioception:
 
 ```text
 [x, y, yaw, vx, vy, wz]
@@ -153,7 +157,7 @@ The proxy applies:
 - velocity limits,
 - acceleration limits,
 - yaw-rate limits,
-- smoothing,
+- command smoothing,
 - body-frame to world-frame velocity integration.
 
 Important implementation detail:
@@ -162,19 +166,19 @@ Important implementation detail:
 The proxy deliberately avoids PhysX rigid-body tensor writes.
 ```
 
-Instead, it moves a clean USD `Xform` prim directly. This was done because the earlier PhysX rigid-body version produced CUDA illegal memory access errors in the Isaac Sim / Isaac Lab environment.
+Instead, it moves a clean USD `Xform` prim directly. This was chosen because earlier PhysX rigid-body tensor writes caused CUDA illegal memory access errors in the tested Isaac Sim / Isaac Lab environment.
 
-The current USD structure is:
+The current USD hierarchy is:
 
 ```text
-/World/envs/env_0/G1Proxy             # clean moving Xform
+/World/envs/env_0/G1Proxy             # clean moving Xform root
 /World/envs/env_0/G1Proxy/body        # visual proxy body
 /World/envs/env_0/G1Proxy/front_cam   # RGB-D camera
 ```
 
-This avoids transform-operation warnings and keeps the proxy stable.
+The proxy is **kinematic**. It does not model physical balance, foot contacts, whole-body dynamics, or collision response. Obstacle handling is currently performed through perception and command filtering, not through humanoid physics.
 
-The command-proxy smoke test executes a scripted command sequence:
+The command-proxy smoke test executes a scripted sequence:
 
 ```text
 0-299     move forward
@@ -183,28 +187,28 @@ The command-proxy smoke test executes a scripted command sequence:
 900+      stop
 ```
 
-This validated:
+This checks that:
 
 - `[vx, vy, wz]` commands move the proxy,
 - yaw updates correctly,
 - the RGB-D camera moves with the proxy,
-- screenshots are saved,
-- the proprio vector is reduced to the command-level state.
+- screenshots can be saved,
+- the proprio vector is reduced to command-level state.
 
 ---
 
-### 3. Deterministic go-to-target controller
+### 3.3 Deterministic go-to-target controller
 
-File:
+Relevant file:
 
 ```text
 scripts/smoke_test_go_to_target.py
 ```
 
-This test adds a simple target marker and computes a deterministic command:
+This script adds a target marker and computes a deterministic command:
 
 ```text
-current pose + target pose -> [vx, vy, wz]
+current proxy pose + target pose -> [vx, vy, wz]
 ```
 
 The target is configured in:
@@ -213,7 +217,7 @@ The target is configured in:
 configs/robot/g1_command_proxy.yaml
 ```
 
-Current target example:
+Example target configuration:
 
 ```yaml
 target:
@@ -228,42 +232,37 @@ The controller works in the robot/body frame. It computes:
 - yaw error,
 - target-relative position in the body frame,
 - velocity command,
-- slow-down behavior near the target,
+- slowdown behavior near the target,
 - stop behavior inside the success radius.
 
-This validated that the proxy can move from `A` to `B` using a reusable high-level navigation command.
+This provides a deterministic A-to-B baseline before introducing map-based planning or reinforcement learning.
 
-Example validated behavior:
+Recommended production destination:
 
 ```text
-start:  [0.0, 0.0]
-target: [3.0, 1.0]
-
-step 0     distance ≈ 3.16
-step 100   distance ≈ 1.85
-step 200   distance ≈ 0.54
-step 300   distance ≈ 0.28
-success    distance ≈ 0.20
+scripts/smoke_test_go_to_target.py
+  compute_go_to_target_command()
+    -> src/g1_nav_rl/policies/deterministic_go_to_target.py
 ```
 
-This gives us a deterministic baseline before introducing RL.
+The `policies/` package should contain modules that map observations or target state directly to `[vx, vy, wz]`. The `planning/` package should be reserved for occupancy grids, costmaps, path planning, local waypoint selection, and trajectory planning.
 
 ---
 
-### 4. Depth-based obstacle safety layer
+### 3.4 Depth-based obstacle safety layer
 
-File:
+Relevant file:
 
 ```text
 scripts/smoke_test_go_to_target.py
 ```
 
-The go-to-target smoke test now includes a simple front-depth safety filter:
+The go-to-target smoke test includes a simple front-depth safety filter:
 
 ```text
-raw A->B command
+raw go-to-target command
     -> depth safety filter
-    -> final command sent to proxy
+    -> safe command sent to proxy
 ```
 
 The safety layer examines a configurable crop of the depth image:
@@ -281,11 +280,11 @@ obstacle_safety:
 
 If an obstacle is too close in the center crop, it:
 
-- suppresses forward velocity,
-- chooses a sidestep direction based on which side has more free space,
+- suppresses or reduces forward velocity,
+- chooses a sidestep direction based on which side appears more open,
 - adds a yaw-away command.
 
-This was tested with a debug cube placed in the path:
+Example debug-cube configuration:
 
 ```yaml
 debug_cube:
@@ -294,11 +293,11 @@ debug_cube:
   pos: [2.2, 0.0, 0.4]
 ```
 
-Validated behavior:
+Example diagnostic interpretation:
 
 ```text
 raw command        : [3.2, 0.0, 0.0]
-target command     : [0.0, -0.3, -0.5]
+safe command       : [0.0, -0.3, -0.5]
 safety depth       : center=1.450, ... active=True
 ```
 
@@ -310,29 +309,57 @@ The camera saw an obstacle ahead.
 The safety layer blocked forward motion and commanded a sidestep/yaw maneuver.
 ```
 
-The proxy then successfully moved around the cube and reached the target.
+This is not a full obstacle-avoidance planner. It is a near-field safety reflex.
+
+Recommended production destination:
+
+```text
+scripts/smoke_test_go_to_target.py
+  apply_depth_safety_filter()
+    -> src/g1_nav_rl/safety/depth_safety.py
+```
+
+The current filter uses minimum depth in image crops. That is simple but noise-sensitive. A production version should ignore invalid pixels and use a robust statistic such as a low percentile instead of a raw minimum.
 
 ---
 
-## Why we chose this architecture
+## 4. Why this architecture is appropriate
 
-### We match the real robot command interface
+### 4.1 It matches the intended real robot control boundary
 
-The physical G1 will not be controlled through joint torques for this project. We expect to send high-level motion commands. Therefore, the simulation should also operate at the high-level command interface:
+The physical G1 is expected to be controlled through a high-level motion interface for this project, not through joint torques. Therefore, the simulated policy output should also be:
 
 ```text
-policy output -> [vx, vy, wz]
+[vx, vy, wz]
 ```
 
-This is the main sim-to-real transfer boundary.
+This avoids training a policy against a simulation boundary that will not exist during deployment.
 
-### We avoid solving low-level humanoid locomotion
+---
 
-Training or stabilizing a full humanoid locomotion policy is a separate, much harder problem. It would introduce unnecessary risk and obscure the actual project objective: high-level navigation, target following, obstacle avoidance, and perception-conditioned motion.
+### 4.2 It avoids turning navigation into a locomotion project
 
-### Deterministic baselines come before RL
+Full humanoid locomotion training would require balance, contact dynamics, gait stabilization, fall recovery, torque limits, and extensive sim-to-real work. That is a separate research problem.
 
-Before any RL experiment, deterministic policies give us:
+This project is instead focused on:
+
+```text
+perception -> target/map reasoning -> safe high-level command generation
+```
+
+Low-level walking should remain handled by the robot's built-in controller or SDK-level high-level motion interface.
+
+---
+
+### 4.3 Deterministic baselines come before RL
+
+The current deterministic stack is intentionally simple:
+
+```text
+target position -> go-to-target controller -> depth safety -> [vx, vy, wz]
+```
+
+This gives the project:
 
 - expected behavior,
 - measurable baselines,
@@ -340,15 +367,15 @@ Before any RL experiment, deterministic policies give us:
 - fallback behavior,
 - sanity checks for observations and actions.
 
-The current deterministic stack is intentionally simple but useful:
+Reinforcement learning should be added only after the deterministic environment, observation API, metrics, and safety layer are stable.
 
-```text
-target position -> go-to-target controller -> depth safety -> [vx, vy, wz]
-```
+---
 
-### Safety is outside the policy
+### 4.4 Safety must stay outside the learned policy
 
-Even when we later add learned policies, raw policy output should not go directly to the robot. The safe command path should be:
+Even if learned policies are added later, raw policy output should not be sent directly to the simulator or real robot.
+
+The safe command path should be:
 
 ```text
 policy command
@@ -358,15 +385,13 @@ policy command
     -> sim or real G1 adapter
 ```
 
-The current depth filter is the first prototype of that safety layer.
+The current depth filter is the first prototype of this external safety layer.
 
 ---
 
-## Current limitations
+## 5. Current limitations
 
-The current repository is still a prototype. The following components are not production-ready yet.
-
-### No reusable environment class yet
+### 5.1 No reusable environment class yet
 
 The main logic still lives in smoke-test scripts.
 
@@ -376,16 +401,18 @@ Current placeholder:
 src/g1_nav_rl/envs/nav_env.py
 ```
 
-Expected next step:
+Expected production API:
 
 ```python
-env.reset()
+obs = env.reset()
 obs, reward, done, info = env.step(action)
 ```
 
-### Lidar is not implemented yet
+---
 
-The current perception stack has RGB and depth. Lidar is planned but not present in the uploaded repo.
+### 5.2 Lidar is not implemented yet
+
+The current perception stack has RGB and depth. Lidar or ray-scan sensing is planned but not present in the uploaded implementation.
 
 Target production perception:
 
@@ -393,11 +420,15 @@ Target production perception:
 RGB + depth + lidar/ray-scan + command-level proprioception
 ```
 
-### No map / costmap yet
+Lidar should be prioritized next because 2D navigation should primarily use a lidar-derived occupancy grid or costmap. RGB-D should act as near-field safety and, later, semantic perception.
 
-The current obstacle handling is direct depth-threshold reflex behavior. It is not a planner.
+---
 
-Target production mapping stack:
+### 5.3 No map, costmap, or trajectory planner yet
+
+Current obstacle handling is direct depth-threshold reflex behavior. It is not map-based planning.
+
+Target deterministic navigation stack:
 
 ```text
 lidar scan
@@ -405,24 +436,14 @@ lidar scan
     -> cleanup/filtering
     -> obstacle inflation
     -> local costmap
+    -> path/local waypoint planner
+    -> velocity command
+    -> command limiter + safety filter
 ```
 
-### No trajectory planner yet
+---
 
-The current controller points directly toward the target. It can sidestep around a simple obstacle, but it does not compute a global or local path.
-
-Target deterministic stack:
-
-```text
-target_xy
-    -> occupancy/costmap
-    -> path planner
-    -> local waypoint
-    -> trajectory tracker
-    -> [vx, vy, wz]
-```
-
-### No RL training pipeline yet
+### 5.4 No RL training pipeline yet
 
 The placeholders exist:
 
@@ -434,11 +455,19 @@ scripts/eval.py
 
 but they are currently empty.
 
-RL should come after the deterministic environment and metrics are stable.
+When RL is introduced, it should start with low-dimensional observations such as:
 
-### No YOLO target perception yet
+```text
+lidar scan + target vector + current command/proprio state
+```
 
-The final target pipeline is planned but not implemented:
+Raw RGB-D end-to-end RL should not be the first RL experiment.
+
+---
+
+### 5.5 No YOLO or semantic target perception yet
+
+The future target-perception pipeline is planned but not implemented:
 
 ```text
 RGB frame
@@ -450,40 +479,84 @@ RGB frame
     -> target_xy
 ```
 
+This should be added after deterministic navigation is stable.
+
 ---
 
-## Recommended next production step
+### 5.6 No real G1 adapter yet
 
-The next step should be to convert the current smoke-test logic into reusable modules.
+The repo currently contains only simulation-side proxy logic. Real deployment requires a separate adapter that sends safe velocity commands to the G1 through the selected Unitree SDK/API path.
 
-Recommended target structure:
+The production policy should not know whether it is controlling simulation or hardware. That difference should live behind adapters:
+
+```text
+SimCommandAdapter  -> G1CommandProxy
+RealG1Adapter      -> physical Unitree G1 high-level command API
+```
+
+---
+
+## 6. Recommended next production step
+
+The next step is to move reusable logic out of the smoke-test scripts into modules.
+
+Recommended near-term structure:
 
 ```text
 src/g1_nav_rl/
   robots/
     g1_command_proxy.py
+    command_types.py
+    adapters.py
+
+  observations/
+    rgbd_articulation_obs.py
+    rgbd_proxy_obs.py
+    nav_obs.py
 
   sensors/
-    rgbd.py
     lidar.py
 
   safety/
-    depth_safety.py
     command_limiter.py
+    depth_safety.py
+    lidar_safety.py
+    watchdog.py
+
+  policies/
+    deterministic_go_to_target.py
+    deterministic_target_following.py
 
   planning/
-    go_to_target.py
-    local_planner.py
+    occupancy_grid.py
     costmap.py
+    local_planner.py
+    trajectory_tracker.py
 
   envs/
     g1_nav_env.py
 
-  policies/
-    deterministic.py
+  metrics/
+    navigation_metrics.py
 ```
 
-Minimum production environment API:
+Consistent migration targets:
+
+| Current script/function | Production destination |
+|---|---|
+| `G1CommandProxy` | `src/g1_nav_rl/robots/g1_command_proxy.py` |
+| `compute_go_to_target_command()` | `src/g1_nav_rl/policies/deterministic_go_to_target.py` |
+| `apply_depth_safety_filter()` | `src/g1_nav_rl/safety/depth_safety.py` |
+| proxy RGB-D observation builder | `src/g1_nav_rl/observations/rgbd_proxy_obs.py` |
+| built-in G1 RGB-D observation builder | `src/g1_nav_rl/observations/rgbd_articulation_obs.py` |
+| target/debug object spawning | `src/g1_nav_rl/scenes/objects.py` |
+| smoke-test scene assembly | `src/g1_nav_rl/envs/g1_nav_env.py` or `src/g1_nav_rl/scenes/g1_nav_scene.py` |
+
+---
+
+## 7. Minimum target environment API
+
+The production environment should expose:
 
 ```python
 class G1NavEnv:
@@ -503,6 +576,7 @@ Recommended observation:
     "lidar": lidar_scan,
     "proprio": [x, y, yaw, vx, vy, wz],
     "target": [dx_body, dy_body, distance, bearing],
+    "costmap": optional_local_costmap,
 }
 ```
 
@@ -527,110 +601,61 @@ collisions / near-collisions
 
 ---
 
-## Suggested near-term implementation plan
+## 8. Immediate cleanup items
 
-### Step 1 — Refactor current scripts into modules
-
-Move the current logic out of `smoke_test_go_to_target.py`:
+Before further development, clean the repository/archive hygiene:
 
 ```text
-compute_go_to_target_command() -> planning/go_to_target.py
-apply_depth_safety_filter()    -> safety/depth_safety.py
-build_camera_observation()     -> sensors/rgbd.py
+remove .git/ from shared zip archives unless intentionally sharing history
+remove __MACOSX/
+remove __pycache__/
+remove *.pyc
+fill README.md with status and run instructions
+add pyproject.toml or equivalent install metadata
 ```
 
-Keep the smoke scripts, but make them call the reusable modules.
+Recommended `.gitignore` additions:
 
-### Step 2 — Implement `G1NavEnv`
-
-Create:
-
-```text
-src/g1_nav_rl/envs/g1_nav_env.py
+```gitignore
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+__MACOSX/
+outputs/
+logs/
+.venv/
 ```
 
-The environment should own:
-
-- scene setup,
-- proxy setup,
-- observation building,
-- action application,
-- reward calculation,
-- done logic,
-- metrics.
-
-### Step 3 — Add lidar
-
-Add a simulated planar lidar or ray-caster sensor. Use it to build a local 2D obstacle representation.
-
-### Step 4 — Add deterministic map-based navigation
-
-Use the lidar-derived grid to build:
-
-```text
-occupancy grid -> inflated costmap -> local waypoint -> velocity command
-```
-
-### Step 5 — Add real/sim command adapter boundary
-
-Define one command interface:
-
-```python
-send_velocity(vx, vy, wz)
-```
-
-Implement:
-
-```text
-SimCommandAdapter  -> G1CommandProxy
-RealG1Adapter      -> real G1 high-level command API
-```
-
-### Step 6 — Add RL experiments only after deterministic baseline is stable
-
-Start with low-dimensional observations:
-
-```text
-lidar scan + target vector + current velocity
-```
-
-Do not start with raw RGB-D end-to-end RL.
-
-### Step 7 — Add YOLO-based target perception
-
-Once navigation is stable, add:
-
-```text
-YOLO detection -> RGB-D localization -> temporal tracking -> target_xy
-```
-
-Then connect that target estimate to the same deterministic or learned navigation policy.
+Also fix the proxy-body initialization inconsistency between `smoke_test_command_proxy.py` and `smoke_test_go_to_target.py`: the moving root should own global pose, and the body should be local under the root.
 
 ---
 
-## Current status summary
+## 9. Current status summary
 
-Working now:
+Working or implemented in prototype form:
 
-- Isaac Lab G1 RGB-D smoke test
-- command-level G1 proxy
-- RGB-D camera attached to proxy
-- command-level proprioception `[x, y, yaw, vx, vy, wz]`
-- scripted command smoke test
-- deterministic A-to-B controller
-- depth-based front-obstacle safety reflex
-- screenshots for RGB and depth
+- Isaac Lab built-in G1 RGB-D smoke test,
+- command-level kinematic G1 proxy,
+- RGB-D camera attached to proxy,
+- command-level proprioception `[x, y, yaw, vx, vy, wz]`,
+- scripted command smoke test,
+- deterministic A-to-B controller,
+- simple depth-based safety reflex.
 
 Not implemented yet:
 
-- lidar
-- reusable `G1NavEnv`
-- map/costmap
-- trajectory planner
-- Gym/Gymnasium wrapper
-- PPO training
-- YOLO target detector
-- real G1 command adapter
-- robustness tests for moving target, sudden obstacles, and occlusion
+- reusable `G1NavEnv`,
+- lidar/ray-scan sensor,
+- occupancy grid,
+- costmap,
+- planner,
+- real G1 adapter,
+- RL training loop,
+- semantic target detection/tracking.
 
-The repository is therefore at the transition point between **validated smoke-test prototype** and **production navigation environment**.
+The correct next milestone is therefore not “train RL.” It is:
+
+```text
+refactor smoke tests -> reusable command-level navigation environment -> add lidar/costmap -> add deterministic planner -> then consider RL
+```
