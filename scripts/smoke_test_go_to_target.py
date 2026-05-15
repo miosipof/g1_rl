@@ -54,6 +54,10 @@ from g1_nav_rl.robots.g1_command_proxy import (  # noqa: E402
     G1CommandProxy,
     G1CommandProxyLimits,
 )
+from g1_nav_rl.policies.deterministic_go_to_target import (  # noqa: E402
+    GoToTargetControllerCfg,
+    compute_go_to_target_command,
+)
 
 
 def load_yaml(path: str | Path) -> dict:
@@ -85,9 +89,6 @@ def ensure_proxy_roots_exist(num_envs: int) -> None:
         UsdGeom.Xform.Define(stage, path)
         print(f"[INFO]: Ensured proxy root exists: {path}", flush=True)
 
-
-def wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
-    return torch.atan2(torch.sin(angle), torch.cos(angle))
 
 
 def save_camera_images(obs: dict[str, torch.Tensor], out_dir: Path, step_idx: int) -> None:
@@ -141,53 +142,6 @@ def build_camera_observation(scene: InteractiveScene, proxy: G1CommandProxy) -> 
         "proprio": proxy.observation(),
     }
 
-
-def compute_go_to_target_command(
-    proxy: G1CommandProxy,
-    target_xy_w: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute [vx, vy, wz] to move toward a target.
-
-    The command is expressed in the robot/body frame:
-      vx = forward/backward
-      vy = left/right
-      wz = yaw rate
-
-    Returns:
-      command, distance, yaw_error
-    """
-    ctrl = CFG["target"]["controller"]
-
-    pos_xy = proxy.pos_w[:, 0:2]
-    yaw = proxy.yaw
-
-    delta_w = target_xy_w - pos_xy
-    distance = torch.linalg.norm(delta_w, dim=-1)
-
-    desired_yaw = torch.atan2(delta_w[:, 1], delta_w[:, 0])
-    yaw_error = wrap_to_pi(desired_yaw - yaw)
-
-    cos_yaw = torch.cos(yaw)
-    sin_yaw = torch.sin(yaw)
-
-    # World vector expressed in body frame: R_world_body^T * delta_world.
-    rel_x_b = cos_yaw * delta_w[:, 0] + sin_yaw * delta_w[:, 1]
-    rel_y_b = -sin_yaw * delta_w[:, 0] + cos_yaw * delta_w[:, 1]
-
-    slow_radius = float(ctrl["slow_radius"])
-    speed_scale = (distance / max(slow_radius, 1e-6)).clamp(0.0, 1.0)
-
-    vx = float(ctrl["k_vx"]) * rel_x_b * speed_scale
-    vy = float(ctrl["k_vy"]) * rel_y_b * speed_scale
-    wz = float(ctrl["k_wz"]) * yaw_error
-
-    command = torch.stack([vx, vy, wz], dim=-1)
-
-    success_radius = float(CFG["target"]["success_radius"])
-    reached = distance < success_radius
-    command[reached, :] = 0.0
-
-    return command, distance, yaw_error
 
 
 def apply_depth_safety_filter(
@@ -404,6 +358,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
     )
     target_xy_w = scene.env_origins[:, 0:2].to(device=device) + target_local_xy
 
+    target_controller_cfg = GoToTargetControllerCfg.from_mapping(
+        CFG["target"]["controller"],
+        success_radius=float(CFG["target"]["success_radius"]),
+    )
+
     print_every = int(CFG["debug"]["print_every"])
     save_every = int(CFG["debug"]["save_every"])
     save_screenshots = bool(CFG["debug"]["save_screenshots"])
@@ -431,7 +390,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
         if not simulation_app.is_running():
             break
 
-        raw_command, distance, yaw_error = compute_go_to_target_command(proxy, target_xy_w)
+        raw_command, distance, yaw_error = compute_go_to_target_command(
+            proxy,
+            target_xy_w,
+            target_controller_cfg,
+        )
 
         if last_obs is not None:
             command, last_safety_info = apply_depth_safety_filter(last_obs["depth"], raw_command)
