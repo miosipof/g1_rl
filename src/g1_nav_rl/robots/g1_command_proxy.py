@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Sequence
+import math
 
 import torch
 import omni.usd
@@ -17,6 +18,41 @@ class G1CommandProxyLimits:
     max_ay: float
     max_awz: float
     smoothing_alpha: float
+
+
+
+def ensure_canonical_xform_ops(prim) -> tuple[UsdGeom.XformOp, UsdGeom.XformOp, UsdGeom.XformOp]:
+    """Ensure Isaac-Lab-compatible USD xform ops on a prim.
+
+    Isaac Lab transform views validate that Xform prims use exactly this op order:
+
+        xformOp:translate, xformOp:orient, xformOp:scale
+
+    A raw ``UsdGeom.Xform.Define(...)`` prim has an empty op order, and
+    ``XformCommonAPI.SetRotate(...)`` creates a rotateXYZ op. Both can break
+    sensors such as RayCaster that initialize transform views during ``sim.reset``.
+    """
+    xformable = UsdGeom.Xformable(prim)
+    ordered_ops = list(xformable.GetOrderedXformOps())
+    ordered_names = [op.GetOpName() for op in ordered_ops]
+    canonical_names = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+    if ordered_names != canonical_names:
+        xformable.ClearXformOpOrder()
+        translate_op = xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionDouble)
+        orient_op = xformable.AddOrientOp(precision=UsdGeom.XformOp.PrecisionDouble)
+        scale_op = xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionDouble)
+        translate_op.Set(Gf.Vec3d(0.0, 0.0, 0.0))
+        orient_op.Set(Gf.Quatd(1.0, Gf.Vec3d(0.0, 0.0, 0.0)))
+        scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
+        return translate_op, orient_op, scale_op
+
+    op_by_name = {op.GetOpName(): op for op in ordered_ops}
+    return (
+        op_by_name["xformOp:translate"],
+        op_by_name["xformOp:orient"],
+        op_by_name["xformOp:scale"],
+    )
 
 
 class G1CommandProxy:
@@ -131,16 +167,19 @@ class G1CommandProxy:
                 UsdGeom.Xform.Define(self.stage, prim_path)
                 prim = self.stage.GetPrimAtPath(prim_path)
 
-            xform_api = UsdGeom.XformCommonAPI(prim)
+            translate_op, orient_op, scale_op = ensure_canonical_xform_ops(prim)
 
             x, y, z = pos_cpu[env_id].tolist()
-            yaw_deg = float(yaw_cpu[env_id]) * 180.0 / 3.141592653589793
+            yaw_half = 0.5 * float(yaw_cpu[env_id])
 
-            xform_api.SetTranslate(Gf.Vec3d(x, y, z))
-            xform_api.SetRotate(
-                Gf.Vec3f(0.0, 0.0, yaw_deg),
-                UsdGeom.XformCommonAPI.RotationOrderXYZ,
+            translate_op.Set(Gf.Vec3d(x, y, z))
+            orient_op.Set(
+                Gf.Quatd(
+                    math.cos(yaw_half),
+                    Gf.Vec3d(0.0, 0.0, math.sin(yaw_half)),
+                )
             )
+            scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
 
     def observation(self) -> torch.Tensor:
         """Return [x, y, yaw, vx, vy, wz]."""
