@@ -30,6 +30,30 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None)
 parser.add_argument("--max_steps", type=int, default=120)
+parser.add_argument(
+    "--command",
+    type=float,
+    nargs=3,
+    default=[0.0, 0.0, 0.0],
+    metavar=("VX", "VY", "WZ"),
+    help="Constant proxy command used during the lidar smoke loop. Default keeps proxy stationary.",
+)
+parser.add_argument(
+    "--assert_range_decrease",
+    action="store_true",
+    help=(
+        "Deprecated for this static RayCaster smoke test. "
+        "Use --assert_proxy_relative_distance_decrease instead."
+    ),
+)
+parser.add_argument(
+    "--assert_proxy_relative_distance_decrease",
+    action="store_true",
+    help=(
+        "Assert that the obstacle point cloud moves closer in proxy/body frame "
+        "during a forward-motion run. This does not imply true moving RayCaster rays."
+    ),
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -63,6 +87,10 @@ from g1_nav_rl.sensors.lidar import (  # noqa: E402
     LidarObservationCfg,
     build_lidar_proxy_observation,
     summarize_lidar_observation,
+)
+from g1_nav_rl.sensors.lidar_mount import (  # noqa: E402
+    LidarMountSyncCfg,
+    sync_lidar_mounts_to_proxy_usd,
 )
 
 
@@ -213,11 +241,14 @@ class G1LidarSceneCfg(InteractiveSceneCfg):
 
     # RayCaster pose lookup is most reliable in headless mode when the
     # attachment path is a physics prim. The command proxy root is a manually
-    # moved USD Xform, so for this first stationary lidar smoke test we attach
-    # the sensor to a tiny kinematic rigid mount colocated with the proxy root.
-    # The sensor offset below still represents the lidar frame relative to this
-    # mount. Later, for moving lidar, make the proxy body / mount a proper
-    # kinematic rigid object and update it via the sim/real adapter.
+    # moved USD Xform, so this smoke test attaches the sensor to a tiny
+    # kinematic rigid mount colocated with the proxy root.
+    #
+    # Important: in Isaac Sim 5.1 / Isaac Lab, trying to move this mount through
+    # the RigidObject tensor API caused PhysX GPU illegal-memory-access errors
+    # in this setup. Keep it as an AssetBase USD/physics prim for static
+    # RayCaster validation. For proxy-relative mapping, transform hit points
+    # into the moving proxy frame instead of moving the RayCaster itself.
     lidar_mount = AssetBaseCfg(
         prim_path=CFG["lidar"]["prim_path"],
         init_state=AssetBaseCfg.InitialStateCfg(
@@ -297,6 +328,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
 
     proxy = make_proxy(device=device, num_envs=num_envs)
     proxy.reset(scene.env_origins)
+
+    # Keep the visual/attachment mount colocated with the command proxy in USD.
+    # RayCaster raw ranges remain tied to its initialized attachment pose in this
+    # static-mesh smoke setup. The proxy-relative point cloud below still moves
+    # because hit points are transformed into the current proxy frame.
+    lidar_mount_paths = resolve_env_prim_paths(CFG["lidar"]["prim_path"], num_envs)
+    mount_sync_cfg = LidarMountSyncCfg()
+    sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
+
     scene.reset()
 
     print("[INFO]: Starting lidar smoke test...", flush=True)
@@ -306,6 +346,10 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
         f"resolution={grid_cfg.resolution}",
         flush=True,
     )
+    print(f"[INFO]: proxy command: {list(args_cli.command)}", flush=True)
+
+    min_range_history: list[float] = []
+    proxy_relative_distance_history: list[float] = []
 
     # Give sensors one frame to populate buffers after reset.
     scene.write_data_to_sim()
@@ -316,11 +360,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
         if not simulation_app.is_running():
             break
 
-        # Keep the proxy stationary for the first lidar smoke test. We only want
-        # to validate the sensor, local 2D projection, and occupancy rasterization.
-        zero_cmd = torch.zeros((num_envs, 3), dtype=torch.float32, device=device)
-        proxy.set_command(zero_cmd)
+        # Default command is zero, but tests can pass --command to validate that
+        # the kinematic lidar mount remains synchronized with the moving proxy.
+        command = torch.tensor(args_cli.command, dtype=torch.float32, device=device).view(1, 3).repeat(num_envs, 1)
+        proxy.set_command(command)
         proxy.step(sim_dt)
+        sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
 
         scene.write_data_to_sim()
         sim.step()
@@ -345,17 +390,64 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
             valid_ranges = ranges[0][valid[0]]
             min_valid = float(valid_ranges.detach().cpu().min().item()) if valid_ranges.numel() else float("nan")
             max_valid = float(valid_ranges.detach().cpu().max().item()) if valid_ranges.numel() else float("nan")
+            rel_points = lidar_obs["lidar_points_b"][0][valid[0]]
+            rel_distances = torch.linalg.norm(rel_points, dim=-1) if rel_points.numel() else torch.empty(0, device=device)
+            min_rel_distance = (
+                float(rel_distances.detach().cpu().min().item())
+                if rel_distances.numel()
+                else float("nan")
+            )
+
+            if valid_ranges.numel():
+                min_range_history.append(min_valid)
+            if rel_distances.numel():
+                proxy_relative_distance_history.append(min_rel_distance)
 
             print("-" * 80, flush=True)
             print(f"step               : {step_idx}", flush=True)
             print(f"lidar              : {summarize_lidar_observation(lidar_obs)}", flush=True)
             print(f"valid range min/max: {min_valid:.3f} / {max_valid:.3f}", flush=True)
+            print(f"proxy-relative min : {min_rel_distance:.3f}", flush=True)
             print(f"occupied cells     : {occupied}", flush=True)
             print(f"proxy position     : {proxy.debug_state()['pos_w']}", flush=True)
             print(f"proxy yaw          : {proxy.debug_state()['yaw'][0]:.3f}", flush=True)
 
             if save_grid and save_every > 0 and step_idx % save_every == 0:
                 save_occupancy_grid_image(grid, grid_dir, step_idx)
+
+    if min_range_history:
+        print(
+            f"[INFO]: raw RayCaster min range first/last: "
+            f"{min_range_history[0]:.3f} / {min_range_history[-1]:.3f}",
+            flush=True,
+        )
+
+    if proxy_relative_distance_history:
+        print(
+            f"[INFO]: proxy-relative min distance first/last: "
+            f"{proxy_relative_distance_history[0]:.3f} / {proxy_relative_distance_history[-1]:.3f}",
+            flush=True,
+        )
+
+    if args_cli.assert_range_decrease:
+        raise RuntimeError(
+            "--assert_range_decrease is disabled for this static RayCaster smoke test. "
+            "The raw RayCaster range does not reliably update when the USD/kinematic "
+            "mount is moved in headless mode. Use "
+            "--assert_proxy_relative_distance_decrease to validate proxy-frame mapping, "
+            "or switch to a true moving sensor path later, such as RTX lidar or a "
+            "fully physics-owned robot/mount architecture."
+        )
+
+    if args_cli.assert_proxy_relative_distance_decrease:
+        if len(proxy_relative_distance_history) < 2:
+            raise RuntimeError("No proxy-relative distance history was collected.")
+        if not (proxy_relative_distance_history[-1] < proxy_relative_distance_history[0] - 0.05):
+            raise RuntimeError(
+                "Expected proxy-relative obstacle distance to decrease by at least 0.05 m. "
+                f"first={proxy_relative_distance_history[0]:.3f}, "
+                f"last={proxy_relative_distance_history[-1]:.3f}"
+            )
 
     print("[INFO]: Lidar smoke test complete.", flush=True)
 
