@@ -172,6 +172,16 @@ def scenario_library() -> Dict[str, Scenario]:
                 RectObstacle("LowerBox", center=(2.2, -0.85), size=(0.8, 0.8)),
             ),
         ),
+        "wide_gap": Scenario(
+            name="wide_gap",
+            description="Two boxes with a central gap; useful for inflation sanity checks.",
+            start=(0.0, 0.0, 0.0),
+            target=(4.0, 0.0),
+            obstacles=(
+                RectObstacle("UpperBox", center=(2.2, 0.85), size=(0.8, 0.8)),
+                RectObstacle("LowerBox", center=(2.2, -1.85), size=(0.8, 0.8)),
+            ),
+        ),        
     }
 
 
