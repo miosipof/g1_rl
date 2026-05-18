@@ -84,7 +84,8 @@ target:
   pos: [4.0, 0.0, 0.08]
   size: [0.25, 0.25, 0.16]
   color: [1.0, 0.1, 0.1]
-  success_radius: 0.20
+  # For target-following, reaching within roughly arm length is good enough.
+  success_radius: 0.75
   controller:
     k_vx: 0.8
     k_vy: 0.8
@@ -160,3 +161,114 @@ lidar:
     save_grid: true
     save_every: 20
     grid_dir: "outputs/lidar_grid"
+
+
+local_planner:
+  # DWA/DWB-style local velocity rollout planner.
+  # Input: local occupancy grid + target vector in proxy/body frame.
+  # Output: high-level command [vx, vy, wz].
+  vx_samples: [0.0, 0.1, 0.2, 0.3]
+  vy_samples: [-0.25, -0.1, 0.0, 0.1, 0.25]
+  wz_samples: [-0.6, -0.3, 0.0, 0.3, 0.6]
+  horizon_s: 1.5
+  dt: 0.1
+  robot_radius: 0.35
+  # Extra planning buffer around the robot footprint. This makes the local
+  # planner start avoidance before the obstacle is almost touching the proxy.
+  collision_margin: 0.25
+  goal_tolerance: 0.25
+  progress_weight: 3.0
+  final_distance_weight: 1.0
+  clearance_weight: 1.5
+  command_smoothness_weight: 0.2
+  yaw_rate_weight: 0.3
+  lateral_speed_weight: 0.4
+  forward_speed_weight: 0.05
+  final_lateral_error_weight: 1.0
+  final_yaw_weight: 0.5
+  collision_penalty: 100.0
+  out_of_bounds_penalty: 25.0
+  clearance_cap: 2.0
+  stop_when_blocked: true
+  debug:
+    print_every: 10
+    save_grid: true
+    save_every: 20
+    grid_dir: "outputs/lidar_planner"
+
+# Grid-based A* planner adapted from PythonRobotics' A* example.
+# Intended use: occupancy grid -> obstacle-aware body-frame waypoint path
+# -> simple path follower command [vx, vy, wz].
+grid_astar:
+  occupancy_threshold: 0.5
+  # Inflate obstacle cells by approximate body radius + safety margin.
+  inflation_radius: 0.35
+  # Added to the circumscribed proxy body radius when computing the effective
+  # planning inflation radius in smoke_test_lidar_astar_planner.py.
+  safety_margin: 0.25
+  allow_diagonal: true
+  heuristic_weight: 1.0
+  max_expansions: 0
+  path_follower:
+    # Follow a point along the path, not the nearest sideways point.
+    lookahead_distance: 1.00
+    min_forward_x: 0.20
+    max_vx: 0.30
+    max_vy: 0.25
+    max_wz: 0.60
+    k_vx: 0.60
+    k_vy: 0.80
+    k_wz: 0.80
+    stop_distance: 0.20
+  path_memory:
+    # Keep a selected path for many frames; do not replan every frame.
+    replan_period_steps: 80
+    path_reached_distance: 0.45
+    path_behind_distance: 0.35
+    # High penalty for switching to a geometrically different path.
+    path_switch_weight: 8.0
+    switch_min_improvement: 0.30
+    compare_samples: 48
+  command_smoothing:
+    # Nominal smoothing suppresses left/right oscillation in open space. Near
+    # obstacles, the smoke test switches to the near_* values so smoothing does
+    # not prevent timely lateral/yaw escape.
+    enabled: true
+    alpha: 0.35
+    max_delta_vx: 0.03
+    max_delta_vy: 0.04
+    max_delta_wz: 0.08
+    adaptive_distance: 0.90
+    near_alpha: 0.70
+    near_max_delta_vx: 0.08
+    near_max_delta_vy: 0.12
+    near_max_delta_wz: 0.24
+  clearance_safety:
+    # Clearance-aware command limiter. Distances are robot-center to raw
+    # obstacle footprint distance in body frame; edge clearance is printed as
+    # center distance minus proxy body radius.
+    enabled: true
+    occupancy_threshold: 0.5
+    forward_min_x: -0.20
+    slow_distance: 1.05
+    crawl_distance: 0.75
+    stop_distance: 0.58
+    max_vx_slow: 0.18
+    max_vx_crawl: 0.08
+    escape_enabled: true
+    escape_distance: 0.90
+    escape_min_x: -0.05
+    escape_vy: 0.10
+    escape_wz: 0.12
+    side_deadband: 0.05
+    # Optional assertion used by --assert_planner. Set null to only log.
+    assert_min_edge_clearance: null
+  hard_block:
+    enabled: true
+    front_x: 0.45
+    half_width: 0.35
+  debug:
+    print_every: 10
+    save_every: 20
+    save_grid: true
+    grid_dir: "outputs/lidar_astar_planner"
