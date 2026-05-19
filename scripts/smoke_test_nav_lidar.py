@@ -47,7 +47,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-SCRIPT_VERSION = "smoke_test_nav_lidar_v13_phase4_side_clearance_safety"
+SCRIPT_VERSION = "smoke_test_nav_lidar_v15_minimal_safety_guard"
 
 from isaaclab.app import AppLauncher  # noqa: E402
 
@@ -419,20 +419,38 @@ parser.add_argument("--allow_backward", action="store_true")
 # Phase-4 LiDAR-only safety filter. Disabled by default; when enabled it runs
 # after NavRuntime emits the nominal command and before the proxy receives it.
 parser.add_argument("--enable_safety", action="store_true", help="Enable LiDAR-based slow/stop/backup/sidestep/stuck command filter.")
-parser.add_argument("--safety_front_slow_distance", type=float, default=1.20)
-parser.add_argument("--safety_front_stop_distance", type=float, default=0.70)
-parser.add_argument("--safety_front_backup_distance", type=float, default=0.45)
-parser.add_argument("--safety_side_open_distance", type=float, default=0.90)
-parser.add_argument("--safety_side_slow_distance", type=float, default=0.90)
-parser.add_argument("--safety_side_stop_distance", type=float, default=0.65)
-parser.add_argument("--safety_side_critical_distance", type=float, default=0.45)
+parser.add_argument("--safety_front_slow_distance", type=float, default=0.90)
+parser.add_argument("--safety_front_stop_distance", type=float, default=0.55)
+parser.add_argument("--safety_front_backup_distance", type=float, default=0.35)
+parser.add_argument("--safety_side_open_distance", type=float, default=0.80)
+parser.add_argument("--safety_side_slow_distance", type=float, default=0.0)
+parser.add_argument("--safety_side_stop_distance", type=float, default=0.45)
+parser.add_argument("--safety_side_critical_distance", type=float, default=0.35)
 parser.add_argument("--safety_clearance_percentile", type=float, default=0.10)
-parser.add_argument("--safety_backup_speed", type=float, default=0.12)
-parser.add_argument("--safety_backup_lateral_speed", type=float, default=0.06)
-parser.add_argument("--safety_sidestep_speed", type=float, default=0.12)
-parser.add_argument("--safety_slow_min_scale", type=float, default=0.25)
-parser.add_argument("--safety_stuck_window_steps", type=int, default=50)
+parser.add_argument("--safety_backup_speed", type=float, default=0.08)
+parser.add_argument("--safety_backup_lateral_speed", type=float, default=0.03)
+parser.add_argument("--safety_sidestep_speed", type=float, default=0.08)
+parser.add_argument("--safety_slow_min_scale", type=float, default=0.50)
+parser.add_argument("--safety_stuck_window_steps", type=int, default=0)
 parser.add_argument("--safety_stuck_recovery_steps", type=int, default=30)
+
+# Optional RGB-D/depth safety filter. This runs after LiDAR safety, using the
+# camera depth image only. RGB is reserved for later semantic target detection.
+parser.add_argument("--enable_rgbd_safety", action="store_true", help="Enable RGB-D/depth command safety filter after LiDAR safety.")
+parser.add_argument("--rgbd_safety_front_slow_distance", type=float, default=0.90)
+parser.add_argument("--rgbd_safety_front_stop_distance", type=float, default=0.55)
+parser.add_argument("--rgbd_safety_front_backup_distance", type=float, default=0.35)
+parser.add_argument("--rgbd_safety_side_open_distance", type=float, default=0.80)
+parser.add_argument("--rgbd_safety_side_slow_distance", type=float, default=0.0)
+parser.add_argument("--rgbd_safety_side_stop_distance", type=float, default=0.45)
+parser.add_argument("--rgbd_safety_side_critical_distance", type=float, default=0.35)
+parser.add_argument("--rgbd_safety_vertical_band", type=float, nargs=2, default=(0.25, 0.90))
+parser.add_argument("--rgbd_safety_center_width_frac", type=float, default=0.60)
+parser.add_argument("--rgbd_safety_clearance_percentile", type=float, default=0.05)
+parser.add_argument("--rgbd_safety_slow_min_scale", type=float, default=0.50)
+parser.add_argument("--rgbd_safety_backup_speed", type=float, default=0.08)
+parser.add_argument("--rgbd_safety_backup_lateral_speed", type=float, default=0.03)
+parser.add_argument("--rgbd_safety_sidestep_speed", type=float, default=0.08)
 parser.add_argument(
     "--use_config_proxy_dynamics",
     action="store_true",
@@ -458,6 +476,9 @@ if "--list_scenarios" in sys.argv:
     raise SystemExit(0)
 
 args_cli = parser.parse_args()
+# Isaac/RTX cameras must be enabled before AppLauncher starts the app.
+if bool(args_cli.enable_rgbd_safety):
+    args_cli.enable_cameras = True
 GRID_SOURCE = "lidar" if bool(args_cli.lidar_only) else str(args_cli.grid_source)
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -473,7 +494,7 @@ from pxr import Usd, UsdGeom  # noqa: E402
 import isaaclab.sim as sim_utils  # noqa: E402
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg  # noqa: E402
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg  # noqa: E402
-from isaaclab.sensors import RayCasterCfg, patterns  # noqa: E402
+from isaaclab.sensors import CameraCfg, RayCasterCfg, patterns  # noqa: E402
 from isaaclab.utils import configclass  # noqa: E402
 
 from g1_nav_rl.mapping.occupancy_grid import (  # noqa: E402
@@ -495,7 +516,7 @@ from g1_nav_rl.navigation.simple_nav import (  # noqa: E402
     Target2D as NavTarget2D,
 )
 from g1_nav_rl.navigation.runtime import NavRuntime, NavRuntimeConfig  # noqa: E402
-from g1_nav_rl.navigation.safety import LidarSafetyConfig, LidarSafetyFilter  # noqa: E402
+from g1_nav_rl.navigation.safety import LidarSafetyConfig, LidarSafetyFilter, RgbdSafetyConfig, RgbdSafetyFilter  # noqa: E402
 from g1_nav_rl.robots.g1_command_proxy import (  # noqa: E402
     G1CommandProxy,
     G1CommandProxyLimits,
@@ -544,6 +565,12 @@ class StepRecord:
     safety_right_clearance: float = math.inf
     safety_override: bool = False
     safety_scale: float = 1.0
+    rgbd_safety_action: str = "disabled"
+    rgbd_safety_front_depth: float = math.inf
+    rgbd_safety_left_depth: float = math.inf
+    rgbd_safety_right_depth: float = math.inf
+    rgbd_safety_override: bool = False
+    rgbd_safety_scale: float = 1.0
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -2068,6 +2095,16 @@ def print_step(
         flush=True,
     )
     print(
+        f"rgbd safety action     : {record.rgbd_safety_action} "
+        f"(override={record.rgbd_safety_override}, scale={record.rgbd_safety_scale:.2f})",
+        flush=True,
+    )
+    print(
+        f"rgbd depth front/L/R   : {record.rgbd_safety_front_depth:.3f} / "
+        f"{record.rgbd_safety_left_depth:.3f} / {record.rgbd_safety_right_depth:.3f}",
+        flush=True,
+    )
+    print(
         f"nominal [vx, vy, wz]   : [{record.nominal_vx:.3f}, {record.nominal_vy:.3f}, {record.nominal_wz:.3f}]",
         flush=True,
     )
@@ -2148,6 +2185,26 @@ class G1NavLidarSceneCfg(InteractiveSceneCfg):
         debug_vis=bool(CFG["lidar"].get("debug_vis", False)),
     )
 
+    if bool(args_cli.enable_rgbd_safety):
+        camera = CameraCfg(
+            prim_path=CFG["camera"]["prim_path"],
+            update_period=float(CFG["camera"]["update_period"]),
+            height=int(CFG["camera"]["height"]),
+            width=int(CFG["camera"]["width"]),
+            data_types=list(CFG["camera"].get("data_types", ["rgb", "distance_to_image_plane"])),
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=float(CFG["camera"]["pinhole"]["focal_length"]),
+                focus_distance=float(CFG["camera"]["pinhole"]["focus_distance"]),
+                horizontal_aperture=float(CFG["camera"]["pinhole"]["horizontal_aperture"]),
+                clipping_range=tuple(CFG["camera"]["pinhole"]["clipping_range"]),
+            ),
+            offset=CameraCfg.OffsetCfg(
+                pos=tuple(CFG["camera"]["offset"]["pos"]),
+                rot=tuple(CFG["camera"]["offset"]["rot_wxyz"]),
+                convention=str(CFG["camera"]["offset"].get("convention", "ros")),
+            ),
+        )
+
 
 def make_proxy(device: torch.device, num_envs: int) -> G1CommandProxy:
     limits_cfg = CFG["proxy"]["command_limits"]
@@ -2181,6 +2238,21 @@ def make_proxy(device: torch.device, num_envs: int) -> G1CommandProxy:
         init_yaw=float(CFG["proxy"]["init_state"]["yaw"]),
         limits=limits,
     )
+
+
+def build_rgbd_depth_observation(scene: InteractiveScene) -> torch.Tensor | None:
+    """Return env0 RGB-D camera depth tensor when RGB-D safety is enabled."""
+    if not bool(args_cli.enable_rgbd_safety):
+        return None
+    camera = scene["camera"]
+    depth = camera.data.output.get("distance_to_image_plane")
+    if depth is None:
+        raise RuntimeError("RGB-D safety is enabled but camera output has no distance_to_image_plane depth image.")
+    depth = depth.detach().to(dtype=torch.float32).contiguous()
+    depth_min = float(CFG.get("observations", {}).get("depth_min", 0.0))
+    depth_max = float(CFG.get("observations", {}).get("depth_max", 10.0))
+    depth = torch.nan_to_num(depth, nan=depth_max, posinf=depth_max, neginf=depth_min)
+    return depth.clamp(min=depth_min, max=depth_max)
 
 
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> None:
@@ -2283,6 +2355,31 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
             max_wz=float(args_cli.max_wz),
         )
     )
+    rgbd_safety_filter = RgbdSafetyFilter(
+        RgbdSafetyConfig(
+            enabled=bool(args_cli.enable_rgbd_safety),
+            vertical_band=(float(args_cli.rgbd_safety_vertical_band[0]), float(args_cli.rgbd_safety_vertical_band[1])),
+            center_width_frac=float(args_cli.rgbd_safety_center_width_frac),
+            depth_min=float(CFG.get("observations", {}).get("depth_min", 0.0)),
+            depth_max=float(CFG.get("observations", {}).get("depth_max", 10.0)),
+            max_clearance=float(CFG.get("observations", {}).get("depth_max", 10.0)),
+            clearance_percentile=float(args_cli.rgbd_safety_clearance_percentile),
+            front_slow_distance=float(args_cli.rgbd_safety_front_slow_distance),
+            front_stop_distance=float(args_cli.rgbd_safety_front_stop_distance),
+            front_backup_distance=float(args_cli.rgbd_safety_front_backup_distance),
+            side_open_distance=float(args_cli.rgbd_safety_side_open_distance),
+            side_slow_distance=float(args_cli.rgbd_safety_side_slow_distance),
+            side_stop_distance=float(args_cli.rgbd_safety_side_stop_distance),
+            side_critical_distance=float(args_cli.rgbd_safety_side_critical_distance),
+            slow_min_scale=float(args_cli.rgbd_safety_slow_min_scale),
+            backup_speed=float(args_cli.rgbd_safety_backup_speed),
+            backup_lateral_speed=float(args_cli.rgbd_safety_backup_lateral_speed),
+            sidestep_speed=float(args_cli.rgbd_safety_sidestep_speed),
+            max_vx=float(args_cli.max_vx),
+            max_vy=float(args_cli.max_vy),
+            max_wz=float(args_cli.max_wz),
+        )
+    )
     nav_target = NavTarget2D(
         x=float(target_xy_w[0, 0].detach().cpu().item()),
         y=float(target_xy_w[0, 1].detach().cpu().item()),
@@ -2351,6 +2448,16 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
         f"[INFO]: lidar conservative obstacle model: thickness={float(args_cli.lidar_obstacle_thickness):.3f}, "
         f"lateral_padding={float(args_cli.lidar_obstacle_lateral_padding):.3f}, map_mode={args_cli.lidar_map_mode}, "
         f"map_update_every={int(args_cli.map_update_every)}",
+        flush=True,
+    )
+    print(
+        f"[INFO]: RGB-D/depth safety filter: {'enabled' if args_cli.enable_rgbd_safety else 'disabled'} "
+        f"(slow={float(args_cli.rgbd_safety_front_slow_distance):.2f}, "
+        f"stop={float(args_cli.rgbd_safety_front_stop_distance):.2f}, "
+        f"backup={float(args_cli.rgbd_safety_front_backup_distance):.2f}, "
+        f"side_slow={float(args_cli.rgbd_safety_side_slow_distance):.2f}, "
+        f"side_stop={float(args_cli.rgbd_safety_side_stop_distance):.2f}, "
+        f"side_critical={float(args_cli.rgbd_safety_side_critical_distance):.2f})",
         flush=True,
     )
     print(f"[INFO]: proxy dynamics: {'YAML config' if args_cli.use_config_proxy_dynamics else 'direct baseline mode'}", flush=True)
@@ -2458,6 +2565,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
     nonstraight_command_count = 0
     replan_count = 0
     safety_override_count = 0
+    rgbd_safety_override_count = 0
 
     waypoint_index = 1
     save_grid = not bool(args_cli.no_save_grid)
@@ -2545,8 +2653,16 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
             target=nav_target,
             step_index=step_idx,
         )
-        vx, vy, wz = safety_result.command.tuple
         safety_info = safety_result.info
+
+        rgbd_depth = build_rgbd_depth_observation(scene)
+        if rgbd_depth is not None:
+            rgbd_safety_result = rgbd_safety_filter.apply(safety_result.command, depth=rgbd_depth)
+        else:
+            rgbd_safety_result = RgbdSafetyFilter.disabled_result(safety_result.command)
+        rgbd_safety_info = rgbd_safety_result.info
+
+        vx, vy, wz = rgbd_safety_result.command.tuple
         waypoint_xy_b = nav_command.waypoint_xy_b if nav_command.waypoint_xy_b is not None else (0.0, 0.0)
 
         scenario_clearance = min_scenario_edge_clearance(x, y, OBSTACLES, body_radius)
@@ -2591,6 +2707,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
             safety_right_clearance=safety_info.right_clearance,
             safety_override=safety_info.override_active,
             safety_scale=safety_info.scale,
+            rgbd_safety_action=rgbd_safety_info.action,
+            rgbd_safety_front_depth=rgbd_safety_info.front_clearance,
+            rgbd_safety_left_depth=rgbd_safety_info.left_clearance,
+            rgbd_safety_right_depth=rgbd_safety_info.right_clearance,
+            rgbd_safety_override=rgbd_safety_info.override_active,
+            rgbd_safety_scale=rgbd_safety_info.scale,
         )
         records.append(record)
 
@@ -2643,6 +2765,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
             nonstraight_command_count += 1
         if bool(safety_info.override_active):
             safety_override_count += 1
+        if bool(rgbd_safety_info.override_active):
+            rgbd_safety_override_count += 1
 
         cmd = torch.tensor([[vx, vy, wz]], dtype=torch.float32, device=device).repeat(num_envs, 1)
         proxy.set_command(cmd)
@@ -2676,6 +2800,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
     print(f"[INFO]: nonstraight command count: {nonstraight_command_count}", flush=True)
     print(f"[INFO]: replan count: {replan_count}", flush=True)
     print(f"[INFO]: safety override count: {safety_override_count}", flush=True)
+    print(f"[INFO]: RGB-D safety override count: {rgbd_safety_override_count}", flush=True)
     print(f"[INFO]: wrote trace: {csv_path}", flush=True)
     print("[INFO]: minimal nav + LiDAR smoke test complete.", flush=True)
 

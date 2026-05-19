@@ -1,9 +1,10 @@
-"""Small LiDAR-based command safety filter.
+"""Minimal post-planner safety filters.
 
-This module is intentionally a post-planner filter. It does not plan, build maps,
-modify A* paths, or talk to Isaac/G1. It takes a nominal body-frame command from
-``NavRuntime``/``SimpleNavigator`` plus current LiDAR points in the robot body
-frame and returns a locally safer ``MotionCommand``.
+These filters are intentionally conservative *guards*, not local planners. They
+do not plan, build maps, modify A* paths, or talk to Isaac/G1. They only clamp
+or override the current body-frame ``MotionCommand`` in near-collision cases.
+Default thresholds are deliberately soft/minimal: normal obstacle passing should
+be handled by the planner/replanner, not by the safety layer.
 
 Frame convention matches the navigation smoke tests:
 
@@ -43,30 +44,35 @@ class LidarSafetyConfig:
     clearance_percentile: float = 0.10
     max_clearance: float = 8.0
 
-    # Front-zone intervention distances.
-    front_slow_distance: float = 1.20
-    front_stop_distance: float = 0.70
-    front_backup_distance: float = 0.45
+    # Front-zone intervention distances. Defaults are intentionally minimal:
+    # the planner should route around known obstacles, while this filter guards
+    # against near-field surprises.
+    front_slow_distance: float = 0.90
+    front_stop_distance: float = 0.55
+    front_backup_distance: float = 0.35
 
-    # Side-zone intervention distances. These are checked independently from
-    # the front sector so that the robot does not keep moving along an obstacle
-    # with insufficient lateral clearance. ``side_open_distance`` is retained
-    # for front-blocked sidestep selection; the three side_* thresholds below
-    # govern ordinary side-clearance behavior.
-    side_open_distance: float = 0.90
-    side_slow_distance: float = 0.90
-    side_stop_distance: float = 0.65
-    side_critical_distance: float = 0.45
+    # Side-zone intervention distances. Ordinary side slowing is disabled by
+    # default (side_slow_distance=0). Lateral motion into a very close side
+    # obstacle can still be suppressed, and critical side proximity can still
+    # trigger a short sidestep.
+    side_open_distance: float = 0.80
+    side_slow_distance: float = 0.0
+    side_stop_distance: float = 0.45
+    side_critical_distance: float = 0.35
 
-    # Override commands.
-    slow_min_scale: float = 0.25
-    backup_speed: float = 0.12
-    backup_lateral_speed: float = 0.06
-    sidestep_speed: float = 0.12
+    # Override commands. Keep defaults gentle to avoid turning safety into a
+    # long-horizon behavior controller.
+    slow_min_scale: float = 0.50
+    backup_speed: float = 0.08
+    backup_lateral_speed: float = 0.03
+    sidestep_speed: float = 0.08
     sidestep_wz: float = 0.0
 
-    # Stuck detection. Set stuck_window_steps <= 1 to disable.
-    stuck_window_steps: int = 50
+    # Stuck detection is disabled by default. In these smoke tests it is easy
+    # for safety-induced slowdown or repeated replanning to look like being
+    # stuck, which can cause the safety layer to push the robot away from the
+    # planned route. Enable explicitly only for dedicated recovery experiments.
+    stuck_window_steps: int = 0
     stuck_min_command_speed: float = 0.08
     stuck_min_pose_progress: float = 0.05
     stuck_min_target_progress: float = 0.05
@@ -327,40 +333,59 @@ class LidarSafetyFilter:
                 stuck_active=False,
             )
 
-        # 2. Continue active stuck recovery before ordinary slow/stop rules.
+        # 2. Continue active stuck recovery before ordinary slow/stop rules,
+        # but release it early once the near field is clear. This keeps recovery
+        # from pushing the robot far away after the original hazard disappeared.
         if self._recovery_remaining > 0:
-            self._recovery_remaining -= 1
-            cmd = MotionCommand(
-                vx=-abs(float(self.config.backup_speed)),
-                vy=float(self._recovery_side_sign) * abs(float(self.config.backup_lateral_speed)),
-                wz=0.0,
+            near_field_clear = (
+                clearances.front >= float(self.config.front_slow_distance)
+                and clearances.left >= max(float(self.config.side_stop_distance), float(self.config.side_critical_distance))
+                and clearances.right >= max(float(self.config.side_stop_distance), float(self.config.side_critical_distance))
             )
-            return self._result(
-                cmd,
-                clearances,
-                action="stuck_recovery",
-                reason="fixed-duration backup/sidestep recovery active",
-                scale=0.0,
-                stuck_active=True,
-            )
+            if near_field_clear:
+                self._recovery_remaining = 0
+            else:
+                self._recovery_remaining -= 1
+                cmd = MotionCommand(
+                    vx=-abs(float(self.config.backup_speed)),
+                    vy=float(self._recovery_side_sign) * abs(float(self.config.backup_lateral_speed)),
+                    wz=0.0,
+                )
+                return self._result(
+                    cmd,
+                    clearances,
+                    action="stuck_recovery",
+                    reason="fixed-duration backup/sidestep recovery active",
+                    scale=0.0,
+                    stuck_active=True,
+                )
 
         # 3. Start stuck recovery if commanded motion is not producing progress.
+        # This is intentionally gated by near-field evidence; otherwise repeated
+        # replanning or safety-induced slowdown can falsely trigger recovery.
         if self._stuck_detected():
-            self._recovery_side_sign = self._choose_side_sign(clearances)
-            self._recovery_remaining = max(0, int(self.config.stuck_recovery_steps) - 1)
-            cmd = MotionCommand(
-                vx=-abs(float(self.config.backup_speed)),
-                vy=float(self._recovery_side_sign) * abs(float(self.config.backup_lateral_speed)),
-                wz=0.0,
+            near_obstacle = (
+                clearances.front < float(self.config.front_slow_distance)
+                or clearances.left < max(float(self.config.side_stop_distance), float(self.config.side_critical_distance))
+                or clearances.right < max(float(self.config.side_stop_distance), float(self.config.side_critical_distance))
             )
-            return self._result(
-                cmd,
-                clearances,
-                action="stuck_recovery",
-                reason="nominal command effort with insufficient pose/target progress",
-                scale=0.0,
-                stuck_active=True,
-            )
+            if near_obstacle:
+                self._recovery_side_sign = self._choose_side_sign(clearances)
+                self._recovery_remaining = max(0, int(self.config.stuck_recovery_steps) - 1)
+                cmd = MotionCommand(
+                    vx=-abs(float(self.config.backup_speed)),
+                    vy=float(self._recovery_side_sign) * abs(float(self.config.backup_lateral_speed)),
+                    wz=0.0,
+                )
+                return self._result(
+                    cmd,
+                    clearances,
+                    action="stuck_recovery",
+                    reason="nominal command effort with insufficient pose/target progress near obstacle",
+                    scale=0.0,
+                    stuck_active=True,
+                )
+            self.reset()
 
         # 4. Stop or sidestep when front is too close.
         if clearances.front < float(self.config.front_stop_distance):
@@ -420,12 +445,36 @@ class LidarSafetyFilter:
                 stuck_active=False,
             )
 
-        # 6. Side-slow/side-stop: reduce forward motion when lateral clearance
-        # is tight and never allow lateral velocity into the close side.
+        # 6. Side-stop only suppresses lateral motion into a very close side
+        # obstacle. It does not push away and does not slow forward progress.
+        side_stop = float(self.config.side_stop_distance)
+        if float(clearances.left) < side_stop and float(nominal_cmd.vy) > 0.0:
+            cmd = MotionCommand(vx=float(nominal_cmd.vx), vy=0.0, wz=float(nominal_cmd.wz))
+            return self._result(
+                cmd,
+                clearances,
+                action="side_stop",
+                reason=f"suppress_left_vy left_clearance={clearances.left:.3f} < side_stop={side_stop:.3f}",
+                scale=1.0,
+                stuck_active=False,
+            )
+        if float(clearances.right) < side_stop and float(nominal_cmd.vy) < 0.0:
+            cmd = MotionCommand(vx=float(nominal_cmd.vx), vy=0.0, wz=float(nominal_cmd.wz))
+            return self._result(
+                cmd,
+                clearances,
+                action="side_stop",
+                reason=f"suppress_right_vy right_clearance={clearances.right:.3f} < side_stop={side_stop:.3f}",
+                scale=1.0,
+                stuck_active=False,
+            )
+
+        # 7. Optional side-slow. Disabled by default when side_slow_distance <= 0
+        # or side_slow_distance <= side_stop_distance. This mode should be used
+        # only in dedicated experiments because it can fight the planner.
         side_min = min(float(clearances.left), float(clearances.right))
         side_slow = float(self.config.side_slow_distance)
-        side_stop = float(self.config.side_stop_distance)
-        if side_min < side_slow:
+        if side_slow > side_stop and side_min < side_slow:
             denom = max(1.0e-6, side_slow - side_stop)
             side_scale = (side_min - side_stop) / denom
             side_scale = _clip(side_scale, float(self.config.slow_min_scale), 1.0)
@@ -499,3 +548,326 @@ class LidarSafetyFilter:
             target=target,
             step_index=step_index,
         )
+
+
+@dataclass(frozen=True)
+class RgbdSafetyConfig:
+    """Depth-image command safety filter for RGB-D cameras.
+
+    This is intentionally a post-planner filter, like :class:`LidarSafetyFilter`.
+    It uses only the depth channel of an RGB-D observation: RGB is reserved for
+    later semantic/perception work.  The image is split into a vertical band and
+    left/center/right horizontal crops.  The resulting depth clearances are used
+    to slow, stop, backup, or sidestep the nominal body-frame command.
+    """
+
+    enabled: bool = True
+
+    # Image crop. Fractions are in [0, 1], using image coordinates.
+    vertical_band: tuple[float, float] = (0.25, 0.90)
+    center_width_frac: float = 0.60
+
+    # Depth value handling.
+    depth_min: float = 0.05
+    depth_max: float = 10.0
+    clearance_percentile: float = 0.05
+    max_clearance: float = 10.0
+
+    # Front/center intervention distances. Defaults are minimal and only guard
+    # near-field depth hazards.
+    front_slow_distance: float = 0.90
+    front_stop_distance: float = 0.55
+    front_backup_distance: float = 0.35
+
+    # Side/depth crop intervention distances. Ordinary side slowing is disabled
+    # by default; RGB-D side crops are noisy and should not wall-follow.
+    side_open_distance: float = 0.80
+    side_slow_distance: float = 0.0
+    side_stop_distance: float = 0.45
+    side_critical_distance: float = 0.35
+
+    # Override commands.
+    slow_min_scale: float = 0.50
+    backup_speed: float = 0.08
+    backup_lateral_speed: float = 0.03
+    sidestep_speed: float = 0.08
+    sidestep_wz: float = 0.0
+
+    # Command clipping after safety override.
+    max_vx: float = 0.30
+    max_vy: float = 0.25
+    max_wz: float = 0.60
+
+
+@dataclass(frozen=True)
+class RgbdSafetyInfo:
+    """Debug information for one RGB-D safety-filter application."""
+
+    action: str
+    reason: str
+    override_active: bool
+    scale: float
+    front_clearance: float
+    left_clearance: float
+    right_clearance: float
+    valid_pixels: int
+
+
+@dataclass(frozen=True)
+class RgbdSafetyResult:
+    """Output of :class:`RgbdSafetyFilter`."""
+
+    command: MotionCommand
+    info: RgbdSafetyInfo
+
+
+@dataclass(frozen=True)
+class DepthCropClearances:
+    front: float
+    left: float
+    right: float
+    valid_pixels: int
+
+
+def _depth_to_batched_2d(depth: torch.Tensor) -> torch.Tensor:
+    """Normalize supported depth layouts to [N, H, W]."""
+    if not torch.is_tensor(depth):
+        raise TypeError(f"depth must be a torch.Tensor, got {type(depth)!r}")
+    depth = depth.detach().to(dtype=torch.float32)
+    if depth.ndim == 4:
+        if int(depth.shape[-1]) != 1:
+            raise ValueError(f"4D depth must have shape [N,H,W,1], got {tuple(depth.shape)}")
+        return depth[..., 0]
+    if depth.ndim == 3:
+        if int(depth.shape[-1]) == 1:
+            return depth[..., 0].unsqueeze(0)
+        return depth
+    if depth.ndim == 2:
+        return depth.unsqueeze(0)
+    raise ValueError(f"Unsupported depth shape {tuple(depth.shape)}")
+
+
+def _crop_indices(height: int, width: int, cfg: RgbdSafetyConfig) -> tuple[int, int, int, int]:
+    if height <= 0 or width <= 0:
+        raise ValueError(f"depth image must have positive height/width, got {(height, width)}")
+    y0_frac, y1_frac = cfg.vertical_band
+    y0 = int(round(height * _clip(float(y0_frac), 0.0, 1.0)))
+    y1 = int(round(height * _clip(float(y1_frac), 0.0, 1.0)))
+    y0 = max(0, min(height - 1, y0))
+    y1 = max(y0 + 1, min(height, y1))
+    center_width = int(round(width * _clip(float(cfg.center_width_frac), 0.01, 1.0)))
+    center_width = max(1, min(width, center_width))
+    cx0 = max(0, (width - center_width) // 2)
+    cx1 = min(width, cx0 + center_width)
+    return y0, y1, cx0, cx1
+
+
+def _depth_clearance(values: torch.Tensor, *, cfg: RgbdSafetyConfig) -> tuple[float, int]:
+    if values.numel() == 0:
+        return float(cfg.max_clearance), 0
+    values = values.detach().to(dtype=torch.float32)
+    mask = torch.isfinite(values) & (values >= float(cfg.depth_min)) & (values <= float(cfg.depth_max))
+    valid = values[mask]
+    if valid.numel() == 0:
+        return float(cfg.max_clearance), 0
+    q = _clip(float(cfg.clearance_percentile), 0.0, 1.0)
+    return float(torch.quantile(valid.cpu(), q).item()), int(valid.numel())
+
+
+def compute_rgbd_depth_clearances(depth: torch.Tensor, *, cfg: RgbdSafetyConfig | None = None) -> DepthCropClearances:
+    """Compute left/center/right clearances from an RGB-D depth image.
+
+    The returned ``front`` value is the low-percentile depth in the center crop.
+    ``left`` and ``right`` are the corresponding side crop clearances.  Missing
+    or invalid pixels are treated as no obstacle and return ``cfg.max_clearance``.
+    """
+    cfg = cfg or RgbdSafetyConfig()
+    depth_2d = _depth_to_batched_2d(depth)
+    # The current smoke tests use env0.  The function remains batch-compatible
+    # at the input boundary but returns scalar env0 clearances by design.
+    d0 = depth_2d[0]
+    height, width = int(d0.shape[0]), int(d0.shape[1])
+    y0, y1, cx0, cx1 = _crop_indices(height, width, cfg)
+    band = d0[y0:y1, :]
+
+    front, n_front = _depth_clearance(band[:, cx0:cx1], cfg=cfg)
+    left, n_left = _depth_clearance(band[:, :cx0], cfg=cfg) if cx0 > 0 else (front, n_front)
+    right, n_right = _depth_clearance(band[:, cx1:], cfg=cfg) if cx1 < width else (front, n_front)
+    return DepthCropClearances(front=front, left=left, right=right, valid_pixels=n_front + n_left + n_right)
+
+
+class RgbdSafetyFilter:
+    """Deterministic RGB-D/depth safety layer for nominal navigation commands."""
+
+    def __init__(self, config: RgbdSafetyConfig | None = None) -> None:
+        self.config = config or RgbdSafetyConfig()
+
+    @staticmethod
+    def disabled_result(nominal_cmd: MotionCommand) -> RgbdSafetyResult:
+        return RgbdSafetyResult(
+            command=nominal_cmd,
+            info=RgbdSafetyInfo(
+                action="disabled",
+                reason="rgbd safety filter disabled",
+                override_active=False,
+                scale=1.0,
+                front_clearance=math.inf,
+                left_clearance=math.inf,
+                right_clearance=math.inf,
+                valid_pixels=0,
+            ),
+        )
+
+    def _result(
+        self,
+        cmd: MotionCommand,
+        clearances: DepthCropClearances,
+        *,
+        action: str,
+        reason: str,
+        scale: float,
+    ) -> RgbdSafetyResult:
+        cfg = self.config
+        final_cmd = MotionCommand(
+            vx=_clip(cmd.vx, -abs(cfg.max_vx), abs(cfg.max_vx)),
+            vy=_clip(cmd.vy, -abs(cfg.max_vy), abs(cfg.max_vy)),
+            wz=_clip(cmd.wz, -abs(cfg.max_wz), abs(cfg.max_wz)),
+        )
+        return RgbdSafetyResult(
+            command=final_cmd,
+            info=RgbdSafetyInfo(
+                action=action,
+                reason=reason,
+                override_active=action not in {"ok", "disabled"},
+                scale=float(scale),
+                front_clearance=float(clearances.front),
+                left_clearance=float(clearances.left),
+                right_clearance=float(clearances.right),
+                valid_pixels=int(clearances.valid_pixels),
+            ),
+        )
+
+    def _choose_side_sign(self, clearances: DepthCropClearances) -> float:
+        # +1 means left (+vy), -1 means right (-vy). Prefer the side with more depth.
+        return 1.0 if float(clearances.left) >= float(clearances.right) else -1.0
+
+    def apply(self, nominal_cmd: MotionCommand, *, depth: torch.Tensor) -> RgbdSafetyResult:
+        """Apply RGB-D/depth safety to one nominal command."""
+        if not bool(self.config.enabled):
+            return self.disabled_result(nominal_cmd)
+
+        cfg = self.config
+        clearances = compute_rgbd_depth_clearances(depth, cfg=cfg)
+
+        # 1. Critical front depth: backup and bias toward the clearer side.
+        if clearances.front < float(cfg.front_backup_distance):
+            side = self._choose_side_sign(clearances)
+            cmd = MotionCommand(vx=-abs(float(cfg.backup_speed)), vy=side * abs(float(cfg.backup_lateral_speed)), wz=0.0)
+            return self._result(
+                cmd,
+                clearances,
+                action="rgbd_backup",
+                reason=f"front_depth={clearances.front:.3f} < backup={cfg.front_backup_distance:.3f}",
+                scale=0.0,
+            )
+
+        # 2. Stop or sidestep if the center depth crop is too close.
+        if clearances.front < float(cfg.front_stop_distance):
+            left_open = clearances.left >= float(cfg.side_open_distance)
+            right_open = clearances.right >= float(cfg.side_open_distance)
+            if left_open or right_open:
+                side = self._choose_side_sign(clearances)
+                if left_open and not right_open:
+                    side = 1.0
+                elif right_open and not left_open:
+                    side = -1.0
+                cmd = MotionCommand(vx=0.0, vy=side * abs(float(cfg.sidestep_speed)), wz=float(cfg.sidestep_wz))
+                return self._result(
+                    cmd,
+                    clearances,
+                    action="rgbd_sidestep_left" if side > 0 else "rgbd_sidestep_right",
+                    reason=f"front_depth={clearances.front:.3f} < stop={cfg.front_stop_distance:.3f}; side open",
+                    scale=0.0,
+                )
+            return self._result(
+                MotionCommand(0.0, 0.0, 0.0),
+                clearances,
+                action="rgbd_stop",
+                reason=f"front_depth={clearances.front:.3f} < stop={cfg.front_stop_distance:.3f}; no side open",
+                scale=0.0,
+            )
+
+        # 3. Side-critical depth: move away from the closer side.
+        side_critical = float(cfg.side_critical_distance)
+        if clearances.left < side_critical or clearances.right < side_critical:
+            if clearances.left < clearances.right:
+                side = -1.0
+                action = "rgbd_sidestep_right"
+                side_name = "left"
+                side_clearance = float(clearances.left)
+            else:
+                side = 1.0
+                action = "rgbd_sidestep_left"
+                side_name = "right"
+                side_clearance = float(clearances.right)
+            cmd = MotionCommand(vx=0.0, vy=side * abs(float(cfg.sidestep_speed)), wz=float(cfg.sidestep_wz))
+            return self._result(
+                cmd,
+                clearances,
+                action=action,
+                reason=f"{side_name}_depth={side_clearance:.3f} < side_critical={side_critical:.3f}",
+                scale=0.0,
+            )
+
+        # 4. Side-stop only suppresses lateral motion into a very close
+        # side depth obstacle. It does not push away and does not slow forward
+        # progress.
+        side_stop = float(cfg.side_stop_distance)
+        if float(clearances.left) < side_stop and float(nominal_cmd.vy) > 0.0:
+            return self._result(
+                MotionCommand(float(nominal_cmd.vx), 0.0, float(nominal_cmd.wz)),
+                clearances,
+                action="rgbd_side_stop",
+                reason=f"suppress_left_vy left_depth={clearances.left:.3f} < side_stop={side_stop:.3f}",
+                scale=1.0,
+            )
+        if float(clearances.right) < side_stop and float(nominal_cmd.vy) < 0.0:
+            return self._result(
+                MotionCommand(float(nominal_cmd.vx), 0.0, float(nominal_cmd.wz)),
+                clearances,
+                action="rgbd_side_stop",
+                reason=f"suppress_right_vy right_depth={clearances.right:.3f} < side_stop={side_stop:.3f}",
+                scale=1.0,
+            )
+
+        # 5. Optional side-slow. Disabled by default when side_slow_distance <= 0
+        # or side_slow_distance <= side_stop_distance.
+        side_min = min(float(clearances.left), float(clearances.right))
+        side_slow = float(cfg.side_slow_distance)
+        if side_slow > side_stop and side_min < side_slow:
+            denom = max(1.0e-6, side_slow - side_stop)
+            scale = _clip((side_min - side_stop) / denom, float(cfg.slow_min_scale), 1.0)
+            vx = float(nominal_cmd.vx)
+            if vx > 0.0:
+                vx *= scale
+            return self._result(
+                MotionCommand(vx, float(nominal_cmd.vy), float(nominal_cmd.wz)),
+                clearances,
+                action="rgbd_side_slow",
+                reason=f"side_depth={side_min:.3f} < side_slow={side_slow:.3f}",
+                scale=scale,
+            )
+
+        # 5. Front-slow.
+        if nominal_cmd.vx > 0.0 and clearances.front < float(cfg.front_slow_distance):
+            denom = max(1.0e-6, float(cfg.front_slow_distance) - float(cfg.front_stop_distance))
+            scale = _clip((float(clearances.front) - float(cfg.front_stop_distance)) / denom, float(cfg.slow_min_scale), 1.0)
+            return self._result(
+                MotionCommand(float(nominal_cmd.vx) * scale, float(nominal_cmd.vy), float(nominal_cmd.wz)),
+                clearances,
+                action="rgbd_slow",
+                reason=f"front_depth={clearances.front:.3f} < slow={cfg.front_slow_distance:.3f}",
+                scale=scale,
+            )
+
+        return self._result(nominal_cmd, clearances, action="ok", reason="clear", scale=1.0)

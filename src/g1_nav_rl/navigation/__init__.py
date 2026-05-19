@@ -32,15 +32,27 @@ from .runtime import (
 )
 
 from .safety import (
+    DepthCropClearances,
     LidarSafetyConfig,
     LidarSafetyFilter,
     LidarSafetyInfo,
     LidarSafetyResult,
+    RgbdSafetyConfig,
+    RgbdSafetyFilter,
+    RgbdSafetyInfo,
+    RgbdSafetyResult,
     SectorClearances,
     compute_lidar_sector_clearances,
+    compute_rgbd_depth_clearances,
 )
 
 __all__ = [
+    "DepthCropClearances",
+    "RgbdSafetyConfig",
+    "RgbdSafetyFilter",
+    "RgbdSafetyInfo",
+    "RgbdSafetyResult",
+    "compute_rgbd_depth_clearances",
     "LidarSafetyConfig",
     "LidarSafetyFilter",
     "LidarSafetyInfo",
