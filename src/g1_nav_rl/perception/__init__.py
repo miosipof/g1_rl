@@ -37,3 +37,12 @@ __all__ = [
     "transform_point",
     "unproject_pixel_to_camera",
 ]
+
+try:
+    from .yolo_detector import YoloDetector, YoloDetectorConfig, filter_detections
+except Exception:  # optional ultralytics dependency may be unavailable
+    YoloDetector = None  # type: ignore
+    YoloDetectorConfig = None  # type: ignore
+    filter_detections = None  # type: ignore
+
+__all__ += ["YoloDetector", "YoloDetectorConfig", "filter_detections"]
