@@ -2,102 +2,300 @@
 
 ## Purpose
 
-This document summarizes the current navigation baseline developed for the Unitree G1 autonomy stack. The goal is not yet a full production planner. The goal is a clean, testable deterministic navigation layer that can be used as a reliable baseline before adding persistent mapping, replanning, RGB-D safety, dynamic obstacle handling, and learned policies.
+This document summarizes the current deterministic navigation stack for the Unitree G1 autonomy project.
 
-The current work has two complementary test paths:
+The current goal is intentionally limited:
 
-1. **Non-Isaac baseline:** `scripts/smoke_test_nav.py`
-   - Pure 2D occupancy-grid navigation test.
-   - Uses analytic scenario geometry.
-   - No Isaac Sim, no RayCaster, no USD scene.
-   - Best for validating A*, inflation margins, waypoint tracking logic, scenario definitions, and pass/fail criteria.
+```text
+Target2D(x, y) + robot pose + current occupancy grid
+    -> A* path
+    -> waypoint-following controller
+    -> MotionCommand(vx, vy, wz)
+```
 
-2. **Isaac/LiDAR baseline:** `scripts/smoke_test_nav_lidar.py`
-   - Isaac Lab / Isaac Sim scene with G1 proxy, target marker, obstacles, and RayCaster/LiDAR access.
-   - Uses the same planning philosophy as `smoke_test_nav.py`.
-   - Adds sensor-backed occupancy input and visualization in a fixed world frame.
-   - Best for validating the bridge from Isaac scene geometry and LiDAR observations into the deterministic navigation stack.
+The implementation is based on the behavior already validated in the smoke tests, especially `scripts/smoke_test_nav.py` and `scripts/smoke_test_nav_lidar.py`. The extracted modules are meant to be equivalent to the smoke-test navigation logic, not a new architecture.
 
 ---
 
 ## Current status
 
-We started with a more complex LiDAR/A* smoke test that mixed several behaviors:
+We now have three levels of validation.
 
-- global A* planning,
-- periodic replanning,
-- path shortcutting,
-- command smoothing,
-- local clearance safety,
-- escape behavior,
-- live LiDAR observations,
-- and Isaac/G1 proxy dynamics.
+### 1. Non-Isaac baseline
 
-That test was useful, but too many mechanisms interacted at once. Several failures were not caused by A* itself. They came from control-layer complications: shortcutting, insufficient margins, smoothing, command clipping, and local safety overrides fighting the planned trajectory.
+```text
+scripts/smoke_test_nav.py
+```
 
-To isolate the core stack, we built `smoke_test_nav.py`, a minimal deterministic 2D navigation test. It uses a one-shot inflated occupancy grid, one A* plan, and direct waypoint tracking. No replanning, no smoothing, no shortcutting, and no local escape behavior. This baseline succeeded on `front_box` with `--safety_margin 0.35`, reaching the target in roughly 966 steps while preserving positive obstacle clearance.
+This is the original clean deterministic baseline:
 
-We then created `smoke_test_nav_lidar.py` to bring the same minimal approach into Isaac Lab with G1 proxy motion and RayCaster/LiDAR access. The Isaac/LiDAR script now supports stable world-frame occupancy visualization, setup-derived obstacle contours, executed trajectory, swept safety zone, and an aggregate RayCaster mesh mode for multi-obstacle scenes.
+- analytic 2D scenarios,
+- scenario-derived occupancy grid,
+- A* planning,
+- obstacle inflation,
+- direct waypoint following,
+- no Isaac Sim,
+- no RayCaster,
+- no LiDAR.
+
+Known-good result:
+
+```text
+scenario: front_box
+safety_margin: 0.35
+target reached: True
+step: ~966
+```
+
+### 2. Isaac/LiDAR smoke test
+
+```text
+scripts/smoke_test_nav_lidar.py
+```
+
+This runs the same deterministic navigation logic in Isaac Lab / Isaac Sim with:
+
+- G1 command proxy,
+- RayCaster/LiDAR access,
+- target marker,
+- USD obstacle scene,
+- occupancy-grid construction from LiDAR / scenario / hybrid sources,
+- fixed world-frame visualization,
+- optional path viability checks and replanning.
+
+Current script version should report something like:
+
+```text
+smoke_test_nav_lidar_v11_phase2_nav_runtime
+```
+
+### 3. Extracted navigation modules
+
+The reusable navigation logic now lives under:
+
+```text
+src/g1_nav_rl/navigation/
+```
+
+The important files are:
+
+```text
+src/g1_nav_rl/navigation/simple_nav.py
+src/g1_nav_rl/navigation/runtime.py
+src/g1_nav_rl/navigation/__init__.py
+```
+
+The smoke tests still own Isaac, LiDAR, scene setup, visualization, and file output. The navigation modules own only target-to-command logic and runtime replanning decisions.
 
 ---
 
-## Core navigation algorithm
+## Current module responsibilities
 
-The canonical baseline algorithm is deliberately simple:
+### `simple_nav.py`
 
-1. Build a 2D occupancy grid.
-2. Inflate obstacles by:
+This is the Phase 1 extraction.
+
+It provides the minimal deterministic navigation core:
+
+```python
+Target2D
+Pose2D
+MotionCommand
+SimpleNavConfig
+SimpleNavigator
+```
+
+Core behavior:
+
+```text
+Target2D + Pose2D + body-frame occupancy grid
+    -> A* path in body frame
+    -> path converted to world frame
+    -> monotonic waypoint following
+    -> MotionCommand(vx, vy, wz)
+```
+
+It intentionally does **not** implement:
+
+- Isaac,
+- LiDAR access,
+- RGB-D,
+- YOLO,
+- persistent mapping,
+- local safety overrides,
+- shortcutting,
+- smoothing,
+- learned policy.
+
+Main API pattern:
+
+```python
+from g1_nav_rl.navigation import Pose2D, Target2D, SimpleNavigator
+
+navigator = SimpleNavigator(grid_cfg, astar_cfg, nav_cfg)
+
+plan = navigator.plan(
+    pose=Pose2D(x=0.0, y=0.0, yaw=0.0),
+    target=Target2D(x=4.0, y=0.0),
+    occupancy_grid=grid,
+)
+
+nav_cmd = navigator.command(current_pose, target)
+cmd = nav_cmd.command       # MotionCommand(vx, vy, wz)
+```
+
+Or one-step use:
+
+```python
+nav_cmd = navigator.step(
+    pose=current_pose,
+    target=target,
+    occupancy_grid=grid,
+)
+```
+
+`SimpleNavigator.step()` plans only when no current plan exists. It does not automatically replan.
+
+---
+
+### `runtime.py`
+
+This is the corrected Phase 2 extraction.
+
+It provides a small online wrapper around `SimpleNavigator`:
+
+```python
+NavRuntime
+NavRuntimeConfig
+NavRuntimeStep
+PathConflictResult
+```
+
+Core behavior:
+
+```text
+Target2D + Pose2D + current occupancy grid
+    -> keep current path
+    -> check whether the remaining path intersects current inflated occupancy
+    -> optionally replan if path is blocked or periodic replanning is enabled
+    -> emit MotionCommand(vx, vy, wz)
+```
+
+It intentionally does **not** own:
+
+- LiDAR acquisition,
+- occupancy-grid construction,
+- Isaac scene state,
+- RGB-D,
+- visualization,
+- real G1 command transport.
+
+Main API pattern:
+
+```python
+from g1_nav_rl.navigation import NavRuntime, NavRuntimeConfig
+
+runtime = NavRuntime(
+    navigator,
+    NavRuntimeConfig(
+        enable_replanning=True,
+        replan_every=25,
+        path_check_ignore_distance=0.25,
+        path_check_lookahead=2.0,
+        stop_if_replan_fails=False,
+    ),
+)
+
+step = runtime.step(
+    pose=current_pose,
+    target=target,
+    occupancy_grid=current_grid,
+    step_index=i,
+)
+
+cmd = step.command.command   # MotionCommand(vx, vy, wz)
+```
+
+---
+
+## Core algorithm
+
+The deterministic navigation algorithm is:
+
+1. Receive a world-frame target:
+
+   ```text
+   Target2D(x, y)
+   ```
+
+2. Receive the current world-frame planar robot pose:
+
+   ```text
+   Pose2D(x, y, yaw)
+   ```
+
+3. Receive a current body-frame occupancy grid.
+
+4. Inflate occupied cells by:
 
    ```text
    inflation_radius = robot_body_radius + safety_margin
    ```
 
-3. Convert the robot start pose and target position into grid cells.
-4. Run A* once on the inflated grid.
-5. Convert the A* grid-cell path back into world-frame waypoints.
-6. Track the path monotonically with a direct waypoint controller.
-7. Stop when the target is within the success radius.
-8. Fail if collision or safety-margin violation is detected when assertions are enabled.
+5. Convert the target from world frame into robot/body frame.
 
-Important baseline exclusions:
+6. Run A* from the robot origin `(0, 0)` to the target cell.
 
-- no replanning,
-- no path shortcutting,
-- no command smoothing,
-- no local escape controller,
-- no learned policy,
-- no dynamic obstacle handling.
+7. Convert the A* body-frame path back into world-frame waypoints.
 
-This gives a clean reference for later complexity.
+8. Follow waypoints monotonically.
+
+9. Convert the active waypoint into body-frame command:
+
+   ```text
+   vx = clipped(k_xy * waypoint_x_body)
+   vy = clipped(k_xy * waypoint_y_body)
+   wz = clipped(k_yaw * yaw_error_to_path_tangent)
+   ```
+
+10. Return:
+
+   ```text
+   MotionCommand(vx, vy, wz)
+   ```
+
+The baseline still avoids shortcutting, smoothing, and local escape behavior by default.
 
 ---
 
-## Controller behavior
+## Controller defaults
 
-The controller tracks the next path waypoint in the robot body frame and maps it to a velocity command:
-
-```text
-command = [vx, vy, wz]
-```
-
-Typical defaults:
+The default command behavior matches the smoke-test baseline:
 
 ```text
-max_vx = 0.30 m/s
-max_vy = 0.25 m/s
-max_wz = 0.60 rad/s
 waypoint_reached_radius = 0.12 m
-success radius ≈ hand_length = 0.75 m
-safety_margin = 0.35 m
+success_radius          = 0.75 m
+k_xy                    = 1.5
+k_yaw                   = 2.0
+max_vx                  = 0.30 m/s
+max_vy                  = 0.25 m/s
+max_wz                  = 0.60 rad/s
+allow_backward          = False
 ```
 
-By default, the Isaac/LiDAR script disables extra proxy command dynamics so that it stays close to the non-Isaac baseline. Use `--use_config_proxy_dynamics` only when explicitly testing configured proxy smoothing / acceleration behavior.
+Typical obstacle inflation:
+
+```text
+robot_body_radius = 0.34 m
+safety_margin     = 0.35 m
+inflation_radius  = 0.69 m
+```
 
 ---
 
 ## Occupancy sources in Isaac/LiDAR mode
 
-`smoke_test_nav_lidar.py` supports three practical planning-grid sources:
+`smoke_test_nav_lidar.py` supports:
 
 ```text
 --grid_source scenario
@@ -105,44 +303,29 @@ By default, the Isaac/LiDAR script disables extra proxy command dynamics so that
 --grid_source hybrid
 ```
 
-### `--grid_source scenario`
+### `scenario`
 
-Uses the known scenario obstacle footprints, equivalent in spirit to `smoke_test_nav.py`. This is not pure perception. It is useful for validating that the Isaac/G1 proxy controller and planner behave correctly when the 2D map is known.
+Uses known scenario footprints. This is closest to the original non-Isaac `smoke_test_nav.py` logic.
 
-### `--grid_source lidar`
+Use this to verify the planner/controller inside Isaac when the 2D map is known.
 
-Uses RayCaster/LiDAR hit points. This is closer to perception-based planning, but a single 2D scan only gives first-return surfaces. It does **not** know the full hidden obstacle volume behind a visible surface.
+### `lidar`
 
-### `--grid_source hybrid`
+Uses RayCaster/LiDAR returns.
 
-Combines LiDAR-derived cells with known scenario footprints. This is useful as an integration test while the pure LiDAR map is still being developed.
+This is closer to perception-based navigation, but pure 2D LiDAR gives first-return surfaces, not complete hidden obstacle volume.
 
----
+### `hybrid`
 
-## Important limitation: invisible obstacle volume
+Combines LiDAR-derived occupancy and scenario-derived footprints.
 
-Pure LiDAR mode currently observes only visible obstacle surfaces. For example, a wall may appear as a line of first returns, not as a full rectangle. A* therefore cannot infer the complete occupied region unless we add a conservative mapping model.
-
-The next mapping step should introduce:
-
-```text
-unknown / observed_free / observed_occupied / conservatively_occupied
-```
-
-and a persistent world-frame map with default obstacle thickness or surface extrusion. A future replanning layer should update this map periodically and replan when the current path intersects newly observed occupied space.
-
-Recommended future sequence:
-
-1. Persistent world-frame occupancy map, no replanning.
-2. Path-invalidity detection, no replanning.
-3. Event-driven replanning with cooldown.
-4. Later: shortcutting, smoothing, and local safety.
+This is currently the most stable full integration test mode.
 
 ---
 
-## Isaac/LiDAR visualization
+## Visualization in Isaac/LiDAR mode
 
-The current visualization saves one image per saved step:
+The current script saves one normal occupancy image per saved step:
 
 ```text
 outputs/nav_lidar/<scenario>/grid/occupancy_map_000000.png
@@ -150,118 +333,142 @@ outputs/nav_lidar/<scenario>/grid/occupancy_map_000100.png
 ...
 ```
 
-Each image is fixed in the world/start frame and shows:
+The image is fixed in the world/start frame and shows:
 
 ```text
 gray       = unknown
 white      = observed free
 dark       = occupied
-red dashed = real setup obstacle contour, not from LiDAR
+red dashed = real obstacle contour from scenario setup, not LiDAR
 green      = start point
 blue       = target
 yellow     = current robot position
-dark gray  = covered trajectory
+dark gray  = executed trajectory
 light gray = swept safety zone around executed trajectory
-orange     = current remaining A* plan
+orange     = current remaining plan
 ```
 
-This fixed-frame visualization replaced the earlier robot/body-frame-like debug images where obstacle shapes appeared to rotate or morph from step to step.
+The red dashed contour is deliberately drawn from the setup geometry. It is used to compare real obstacle footprint against LiDAR-derived occupancy.
 
 ---
 
-## RayCaster multi-obstacle fix
+## Multi-obstacle RayCaster handling
 
-`multi` initially crashed during Isaac `sim.reset()` when RayCaster received multiple mesh prim paths. The scene was valid before reset, but Isaac exited during RayCaster initialization.
+`multi` originally crashed during Isaac `sim.reset()` when RayCaster received multiple mesh prim paths.
 
-The script now supports:
+Current option:
 
 ```text
 --raycast_mesh_mode auto|actual|aggregate
 ```
 
-Default behavior:
+Default:
 
 ```text
 --raycast_mesh_mode auto
 ```
 
-In `auto`, multi-obstacle scenes use an aggregate raycast-only mesh. The real visual/collision obstacle meshes remain unchanged, but RayCaster targets a single combined mesh. This fixed `multi`.
-
-For debugging:
+Behavior:
 
 ```text
---raycast_mesh_mode actual
+actual    = RayCaster targets real obstacle meshes directly
+aggregate = script creates one raycast-only aggregate mesh
+auto      = uses aggregate when there is more than one obstacle
 ```
 
-reproduces direct multi-mesh targeting.
+For `multi`, use `auto` or `aggregate` unless specifically debugging RayCaster multi-mesh behavior.
 
 ---
 
-## Built-in scenarios
+## Test commands without Isaac
 
-Typical scenarios include:
+Run from the repository root.
+
+Set Python path:
+
+```bash
+export PYTHONPATH=src
+```
+
+### 1. Check the extracted `SimpleNavigator`
+
+This validates:
 
 ```text
-clear
-front_box
-offset_left
-offset_right
-wide_box
-long_box
-rotated_box
-round
-multi
-blocked_wall
+Target2D + Pose2D + occupancy grid -> A* path -> MotionCommand(vx, vy, wz)
 ```
 
-List scenarios:
+Command:
 
 ```bash
-python scripts/smoke_test_nav_lidar.py --list_scenarios
+PYTHONPATH=src python scripts/smoke_test_nav_module.py
 ```
 
-For non-Isaac tests, use the corresponding scenario list from `smoke_test_nav.py` if available:
+Expected output:
 
-```bash
-python scripts/smoke_test_nav.py --list_scenarios
+```text
+plan found=True
+target_reached=True
+commands=...
 ```
 
----
+### 2. Check the extracted `NavRuntime`
 
-# Test commands without Isaac
+This validates:
 
-These commands use the pure 2D deterministic baseline. Run from the repository root.
+```text
+Target2D + Pose2D + updated occupancy grid
+    -> keep path
+    -> detect blocked path
+    -> replan
+    -> MotionCommand(vx, vy, wz)
+```
 
-## Front-box known-good baseline
+Command:
 
 ```bash
-python scripts/smoke_test_nav.py \
+PYTHONPATH=src python scripts/smoke_test_nav_runtime.py
+```
+
+Expected output:
+
+```text
+initial plan found=True
+replan accepted count=1 reason=path_blocked
+runtime smoke test passed
+```
+
+### 3. Original non-Isaac navigation baseline
+
+Command:
+
+```bash
+PYTHONPATH=src python scripts/smoke_test_nav.py \
   --scenario front_box \
   --safety_margin 0.35 \
-  --max_steps 2000 \
-  --print_every 50 \
-  --save_every 100 \
+  --max_steps 1000 \
+  --print_every 100 \
+  --no_save_grid \
   --assert_planner \
   --assert_success \
   --assert_no_collision \
   --assert_margin
 ```
 
-Expected behavior:
+Expected output:
 
 ```text
-A* finds a path around the front box.
-The target is reached.
-Minimum clearance remains positive.
-The run writes a trace CSV and grid images.
+A* found=True
+target reached=True
+min scenario safety-margin slack > 0
 ```
 
-## Scenario sweep, standard margin
+### 4. Non-Isaac scenario sweep
 
 ```bash
 for SCENARIO in clear front_box offset_left offset_right wide_box long_box rotated_box round multi; do
   echo "=== $SCENARIO ==="
-  python scripts/smoke_test_nav.py \
+  PYTHONPATH=src python scripts/smoke_test_nav.py \
     --scenario "$SCENARIO" \
     --safety_margin 0.35 \
     --max_steps 2500 \
@@ -274,30 +481,12 @@ for SCENARIO in clear front_box offset_left offset_right wide_box long_box rotat
 done
 ```
 
-## Margin sensitivity on `front_box`
+### 5. Blocked-wall expected failure without Isaac
+
+Do not use `--assert_success` for blocked scenarios.
 
 ```bash
-for MARGIN in 0.25 0.30 0.35 0.40 0.45; do
-  echo "=== safety_margin=$MARGIN ==="
-  python scripts/smoke_test_nav.py \
-    --scenario front_box \
-    --safety_margin "$MARGIN" \
-    --max_steps 2500 \
-    --print_every 100 \
-    --save_every 200 \
-    --assert_planner \
-    --assert_success \
-    --assert_no_collision \
-    --assert_margin
-done
-```
-
-## Blocked-wall expected failure
-
-Use this to validate that the planner can correctly report no valid route when the map is blocked.
-
-```bash
-python scripts/smoke_test_nav.py \
+PYTHONPATH=src python scripts/smoke_test_nav.py \
   --scenario blocked_wall \
   --safety_margin 0.35 \
   --max_steps 1000 \
@@ -309,38 +498,108 @@ python scripts/smoke_test_nav.py \
 Expected behavior:
 
 ```text
-For blocked_wall, the correct outcome is no valid path or no target success.
-Do not combine this scenario with --assert_success.
+A* should report no valid path, or the target should not be reached.
 ```
 
 ---
 
-# Test commands with Isaac / Isaac Lab
+## Test commands with Isaac / Isaac Lab
 
-Activate the Isaac Lab environment first:
+Activate Isaac Lab first:
 
 ```bash
 conda activate isaaclab
+cd ~/g1_rl
+export PYTHONPATH=src
 ```
 
-Run from the repository root.
-
-## List Isaac/LiDAR scenarios
+### 1. List Isaac/LiDAR scenarios
 
 ```bash
 python scripts/smoke_test_nav_lidar.py --list_scenarios
 ```
 
-## Known-geometry mode inside Isaac
+### 2. Full pipeline, stable hybrid mode
 
-This validates Isaac/G1 proxy motion with scenario-derived occupancy, not pure LiDAR mapping.
+This is the recommended regression command for the current full pipeline:
+
+```text
+Target2D + Isaac G1 proxy pose + RayCaster LiDAR + occupancy grid
+    -> NavRuntime
+    -> SimpleNavigator
+    -> MotionCommand(vx, vy, wz)
+    -> G1 proxy motion
+```
+
+Command:
+
+```bash
+python scripts/smoke_test_nav_lidar.py \
+  --scenario front_box \
+  --grid_source hybrid \
+  --enable_replanning \
+  --replan_every 25 \
+  --path_check_lookahead 2.0 \
+  --path_check_ignore_distance 0.25 \
+  --safety_margin 0.35 \
+  --max_steps 1200 \
+  --print_every 50 \
+  --save_every 100 \
+  --assert_planner \
+  --assert_success \
+  --assert_no_collision \
+  --assert_margin
+```
+
+Expected behavior:
+
+```text
+script version: smoke_test_nav_lidar_v11_phase2_nav_runtime
+A* found=True
+target reached=True
+no collision
+min safety-margin slack > 0
+```
+
+### 3. Full pipeline, LiDAR-only mode
+
+```bash
+python scripts/smoke_test_nav_lidar.py \
+  --scenario front_box \
+  --grid_source lidar \
+  --enable_replanning \
+  --replan_every 25 \
+  --path_check_lookahead 2.0 \
+  --path_check_ignore_distance 0.25 \
+  --safety_margin 0.35 \
+  --max_steps 1200 \
+  --print_every 50 \
+  --save_every 100 \
+  --assert_planner \
+  --assert_success \
+  --assert_no_collision
+```
+
+Expected behavior:
+
+```text
+lidar valid hits > 0
+A* found=True
+target reached=True
+```
+
+Do not treat this as a complete proof of obstacle-volume reasoning. Pure LiDAR mode still sees first-return surfaces only.
+
+### 4. Known-geometry mode inside Isaac
+
+This is closest to the original non-Isaac baseline, but executed through the Isaac/G1 proxy loop.
 
 ```bash
 python scripts/smoke_test_nav_lidar.py \
   --scenario front_box \
   --grid_source scenario \
   --safety_margin 0.35 \
-  --max_steps 2000 \
+  --max_steps 1200 \
   --print_every 50 \
   --save_every 100 \
   --assert_planner \
@@ -349,56 +608,18 @@ python scripts/smoke_test_nav_lidar.py \
   --assert_margin
 ```
 
-Use this when checking whether the Isaac proxy/controller matches the non-Isaac baseline.
-
-## LiDAR-only mode
-
-This validates the RayCaster/LiDAR bridge and LiDAR-derived occupancy.
-
-```bash
-python scripts/smoke_test_nav_lidar.py \
-  --scenario front_box \
-  --grid_source lidar \
-  --safety_margin 0.35 \
-  --max_steps 2000 \
-  --print_every 50 \
-  --save_every 100 \
-  --assert_planner \
-  --assert_success \
-  --assert_no_collision
-```
-
-Do not over-interpret `--assert_margin` in pure LiDAR mode until conservative obstacle thickness and persistent mapping are implemented. A single first-return scan does not fully represent hidden obstacle volume.
-
-## Hybrid mode
-
-This combines LiDAR hits and scenario footprints. It is useful as an integration mode while pure LiDAR mapping is under development.
-
-```bash
-python scripts/smoke_test_nav_lidar.py \
-  --scenario front_box \
-  --grid_source hybrid \
-  --safety_margin 0.35 \
-  --max_steps 2000 \
-  --print_every 50 \
-  --save_every 100 \
-  --assert_planner \
-  --assert_success \
-  --assert_no_collision \
-  --assert_margin
-```
-
-## Multi-obstacle scene
-
-The current default should use aggregate RayCaster mesh mode automatically.
+### 5. Multi-obstacle scene
 
 ```bash
 python scripts/smoke_test_nav_lidar.py \
   --scenario multi \
   --grid_source lidar \
   --raycast_mesh_mode auto \
+  --enable_replanning \
+  --replan_every 25 \
+  --path_check_lookahead 2.0 \
   --safety_margin 0.35 \
-  --max_steps 2500 \
+  --max_steps 1800 \
   --print_every 50 \
   --save_every 100 \
   --assert_planner \
@@ -406,66 +627,76 @@ python scripts/smoke_test_nav_lidar.py \
   --assert_no_collision
 ```
 
-If debugging RayCaster multi-mesh behavior:
+Expected early log:
 
-```bash
-python scripts/smoke_test_nav_lidar.py \
-  --scenario multi \
-  --grid_source lidar \
-  --raycast_mesh_mode actual \
-  --safety_margin 0.35 \
-  --max_steps 20 \
-  --print_every 1
+```text
+RayCaster mesh mode: auto
+using aggregate=True
+RayCaster mesh prim paths: ['/World/envs/env_0/_RaycastAggregate/geometry/mesh']
 ```
 
-If `actual` crashes but `auto` or `aggregate` works, the issue is Isaac/RayCaster multi-mesh initialization, not scenario creation.
+Expected final behavior:
 
-## Blocked wall, LiDAR-only
+```text
+target reached=True
+no collision
+```
+
+### 6. Blocked-wall expected failure with Isaac
+
+Use this to check that the planner does not claim a valid route through a map-blocking wall.
 
 ```bash
 python scripts/smoke_test_nav_lidar.py \
   --scenario blocked_wall \
-  --grid_source lidar \
+  --grid_source hybrid \
+  --enable_replanning \
+  --replan_every 25 \
   --safety_margin 0.35 \
   --max_steps 200 \
-  --print_every 20 \
-  --save_every 20 \
+  --print_every 25 \
+  --save_every 50 \
   --assert_planner
 ```
 
 Expected behavior:
 
 ```text
-The wall is visible to RayCaster.
-A* should not find a valid path if the inflated wall blocks the planning map.
-Do not use --assert_success for blocked_wall.
+A* found=False
+target reached=False
 ```
 
-## Faster Isaac runs
+Do not use `--assert_success` for `blocked_wall`.
 
-The script can become slow when saving images frequently. For faster smoke tests:
+### 7. Faster full-pipeline check
+
+Saving PNGs is one of the slowest parts of the Isaac run. For speed:
 
 ```bash
 python scripts/smoke_test_nav_lidar.py \
   --scenario front_box \
-  --grid_source lidar \
+  --grid_source hybrid \
+  --enable_replanning \
+  --replan_every 50 \
   --safety_margin 0.35 \
-  --max_steps 2000 \
+  --max_steps 1200 \
   --print_every 100 \
-  --save_every 250 \
+  --save_every 100000 \
   --assert_planner \
   --assert_success \
   --assert_no_collision
 ```
 
-Or disable map image writing:
+Or disable grid images if the script supports it:
 
 ```bash
 python scripts/smoke_test_nav_lidar.py \
   --scenario front_box \
-  --grid_source lidar \
+  --grid_source hybrid \
+  --enable_replanning \
+  --replan_every 50 \
   --safety_margin 0.35 \
-  --max_steps 2000 \
+  --max_steps 1200 \
   --print_every 100 \
   --no_save_grid \
   --assert_planner \
@@ -475,15 +706,63 @@ python scripts/smoke_test_nav_lidar.py \
 
 ---
 
+## Scenario batch command with Isaac
+
+Reachable scenarios:
+
+```bash
+for SCENE in front_box offset_box multi gap_corridor; do
+  echo "=== $SCENE ==="
+  python scripts/smoke_test_nav_lidar.py \
+    --scenario "$SCENE" \
+    --grid_source hybrid \
+    --raycast_mesh_mode auto \
+    --enable_replanning \
+    --replan_every 25 \
+    --safety_margin 0.35 \
+    --max_steps 1800 \
+    --print_every 100 \
+    --save_every 300 \
+    --assert_planner \
+    --assert_success \
+    --assert_no_collision \
+    --assert_margin
+done
+```
+
+Keep expected-failure scenarios separate:
+
+```bash
+python scripts/smoke_test_nav_lidar.py \
+  --scenario blocked_wall \
+  --grid_source hybrid \
+  --raycast_mesh_mode auto \
+  --enable_replanning \
+  --replan_every 25 \
+  --safety_margin 0.35 \
+  --max_steps 200 \
+  --print_every 50 \
+  --save_every 100 \
+  --assert_planner
+```
+
+If a scenario name is not available in the current script, list available scenarios first:
+
+```bash
+python scripts/smoke_test_nav_lidar.py --list_scenarios
+```
+
+---
+
 ## Output files
 
-Non-Isaac baseline usually writes under:
+Non-Isaac baseline:
 
 ```text
 outputs/nav/<scenario>/
 ```
 
-Isaac/LiDAR baseline writes under:
+Isaac/LiDAR baseline:
 
 ```text
 outputs/nav_lidar/<scenario>/
@@ -498,20 +777,21 @@ occupancy_map_000100.png
 ...
 ```
 
-The trace CSV records pose, waypoint index, target distance, clearance metrics, command values, LiDAR validity, and occupied-cell counts.
+The trace CSV records pose, target distance, waypoint index, clearance metrics, command values, LiDAR validity, occupied-cell counts, and replanning-related information when enabled.
 
 ---
 
 ## Pass/fail criteria
 
-For normal reachable scenarios:
+For reachable scenarios:
 
 ```text
 A* found = True
 target reached = True
 collision detected = False
 minimum scenario edge clearance > 0
-minimum safety-margin slack >= -margin_tolerance
+minimum safety-margin slack >= 0, or within explicit tolerance
+commands remain finite
 ```
 
 For blocked scenarios:
@@ -521,30 +801,42 @@ A* found = False
 or target reached = False
 ```
 
-Do not require `--assert_success` on intentionally blocked scenarios.
+Do not combine blocked scenarios with `--assert_success`.
 
 ---
 
-## Known caveats
+## Known limitations
 
-1. Pure LiDAR mode currently sees first-return surfaces, not full obstacle volumes.
-2. Persistent mapping is not yet part of the canonical baseline.
-3. Replanning is intentionally disabled in the current minimal script.
+1. Pure LiDAR mode observes first-return surfaces, not full hidden obstacle volumes.
+2. There is not yet a persistent semantic/occupancy map with explicit unknown/free/occupied/conservative states.
+3. Replanning checks the current path against the current occupancy grid; it does not yet solve long-term mapping uncertainty.
 4. Hybrid mode is an integration aid, not a pure perception benchmark.
-5. Frequent image saving slows Isaac runs significantly.
-6. Multi-obstacle RayCaster scenes should use aggregate mesh mode unless debugging direct multi-mesh targeting.
+5. Frequent image saving significantly slows Isaac runs.
+6. `multi` should use `--raycast_mesh_mode auto` or `aggregate` unless debugging direct RayCaster multi-mesh behavior.
+7. No RGB-D safety, YOLO target acquisition, or learned policy is part of the current deterministic baseline.
 
 ---
 
-## Next planned navigation work
+## Recommended next step
 
-Recommended sequence:
+The next useful step is not another abstraction layer. The next useful step is a small persistent LiDAR map:
 
-1. Add persistent world-frame LiDAR occupancy map.
-2. Add conservative obstacle thickness for LiDAR hits.
-3. Track unknown / observed-free / occupied / conservatively occupied states explicitly.
-4. Add path invalidation checks against the updated map.
-5. Add event-driven replanning when the current path becomes inconsistent.
-6. Only after that reintroduce shortcutting, smoothing, local safety, or learned policies.
+```text
+instantaneous LiDAR observations
+    -> persistent world-frame occupancy state
+    -> observed free / observed occupied / unknown
+    -> conservative obstacle thickness around hits
+    -> path invalidation against persistent inflated occupancy
+```
 
-This keeps the deterministic baseline interpretable while moving toward a production-oriented autonomy stack for Unitree G1.
+This directly addresses the remaining real limitation: a single LiDAR scan exposes surfaces, not full obstacle volume.
+
+After that, add safety/stuck heuristics as a separate layer:
+
+```text
+nominal MotionCommand(vx, vy, wz)
+    -> LiDAR/RGB-D safety filter
+    -> final command
+```
+
+The deterministic planner should remain the reference backend even if an RL policy is later introduced behind the same `Target2D -> MotionCommand` interface.
