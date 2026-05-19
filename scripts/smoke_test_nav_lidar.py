@@ -47,7 +47,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-SCRIPT_VERSION = "smoke_test_nav_lidar_v11_phase2_nav_runtime"
+SCRIPT_VERSION = "smoke_test_nav_lidar_v13_phase4_side_clearance_safety"
 
 from isaaclab.app import AppLauncher  # noqa: E402
 
@@ -415,6 +415,24 @@ parser.add_argument("--max_vx", type=float, default=0.30)
 parser.add_argument("--max_vy", type=float, default=0.25)
 parser.add_argument("--max_wz", type=float, default=0.60)
 parser.add_argument("--allow_backward", action="store_true")
+
+# Phase-4 LiDAR-only safety filter. Disabled by default; when enabled it runs
+# after NavRuntime emits the nominal command and before the proxy receives it.
+parser.add_argument("--enable_safety", action="store_true", help="Enable LiDAR-based slow/stop/backup/sidestep/stuck command filter.")
+parser.add_argument("--safety_front_slow_distance", type=float, default=1.20)
+parser.add_argument("--safety_front_stop_distance", type=float, default=0.70)
+parser.add_argument("--safety_front_backup_distance", type=float, default=0.45)
+parser.add_argument("--safety_side_open_distance", type=float, default=0.90)
+parser.add_argument("--safety_side_slow_distance", type=float, default=0.90)
+parser.add_argument("--safety_side_stop_distance", type=float, default=0.65)
+parser.add_argument("--safety_side_critical_distance", type=float, default=0.45)
+parser.add_argument("--safety_clearance_percentile", type=float, default=0.10)
+parser.add_argument("--safety_backup_speed", type=float, default=0.12)
+parser.add_argument("--safety_backup_lateral_speed", type=float, default=0.06)
+parser.add_argument("--safety_sidestep_speed", type=float, default=0.12)
+parser.add_argument("--safety_slow_min_scale", type=float, default=0.25)
+parser.add_argument("--safety_stuck_window_steps", type=int, default=50)
+parser.add_argument("--safety_stuck_recovery_steps", type=int, default=30)
 parser.add_argument(
     "--use_config_proxy_dynamics",
     action="store_true",
@@ -477,6 +495,7 @@ from g1_nav_rl.navigation.simple_nav import (  # noqa: E402
     Target2D as NavTarget2D,
 )
 from g1_nav_rl.navigation.runtime import NavRuntime, NavRuntimeConfig  # noqa: E402
+from g1_nav_rl.navigation.safety import LidarSafetyConfig, LidarSafetyFilter  # noqa: E402
 from g1_nav_rl.robots.g1_command_proxy import (  # noqa: E402
     G1CommandProxy,
     G1CommandProxyLimits,
@@ -514,8 +533,17 @@ class StepRecord:
     vx: float
     vy: float
     wz: float
+    nominal_vx: float
+    nominal_vy: float
+    nominal_wz: float
     lidar_valid: int
     occupied_cells: int
+    safety_action: str = "disabled"
+    safety_front_clearance: float = math.inf
+    safety_left_clearance: float = math.inf
+    safety_right_clearance: float = math.inf
+    safety_override: bool = False
+    safety_scale: float = 1.0
 
 
 def load_yaml(path: str | Path) -> dict[str, Any]:
@@ -2029,6 +2057,20 @@ def print_step(
     print(f"grid edge clearance     : {record.grid_edge_clearance:.3f}  # raw LiDAR/footprint grid", flush=True)
     print(f"lidar valid hits        : {record.lidar_valid}", flush=True)
     print(f"occupied cells          : {record.occupied_cells}", flush=True)
+    print(
+        f"safety action          : {record.safety_action} "
+        f"(override={record.safety_override}, scale={record.safety_scale:.2f})",
+        flush=True,
+    )
+    print(
+        f"safety front/left/right: {record.safety_front_clearance:.3f} / "
+        f"{record.safety_left_clearance:.3f} / {record.safety_right_clearance:.3f}",
+        flush=True,
+    )
+    print(
+        f"nominal [vx, vy, wz]   : [{record.nominal_vx:.3f}, {record.nominal_vy:.3f}, {record.nominal_wz:.3f}]",
+        flush=True,
+    )
     print(f"command [vx, vy, wz]    : [{record.vx:.3f}, {record.vy:.3f}, {record.wz:.3f}]", flush=True)
     print(f"pose [x, y, yaw]        : [{record.x:.3f}, {record.y:.3f}, {record.yaw:.3f}]", flush=True)
 
@@ -2218,6 +2260,29 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
             stop_if_replan_fails=bool(args_cli.stop_if_replan_fails),
         ),
     )
+    safety_filter = LidarSafetyFilter(
+        LidarSafetyConfig(
+            enabled=bool(args_cli.enable_safety),
+            clearance_percentile=float(args_cli.safety_clearance_percentile),
+            max_clearance=float(lidar_obs_cfg.max_range),
+            front_slow_distance=float(args_cli.safety_front_slow_distance),
+            front_stop_distance=float(args_cli.safety_front_stop_distance),
+            front_backup_distance=float(args_cli.safety_front_backup_distance),
+            side_open_distance=float(args_cli.safety_side_open_distance),
+            side_slow_distance=float(args_cli.safety_side_slow_distance),
+            side_stop_distance=float(args_cli.safety_side_stop_distance),
+            side_critical_distance=float(args_cli.safety_side_critical_distance),
+            slow_min_scale=float(args_cli.safety_slow_min_scale),
+            backup_speed=float(args_cli.safety_backup_speed),
+            backup_lateral_speed=float(args_cli.safety_backup_lateral_speed),
+            sidestep_speed=float(args_cli.safety_sidestep_speed),
+            stuck_window_steps=int(args_cli.safety_stuck_window_steps),
+            stuck_recovery_steps=int(args_cli.safety_stuck_recovery_steps),
+            max_vx=float(args_cli.max_vx),
+            max_vy=float(args_cli.max_vy),
+            max_wz=float(args_cli.max_wz),
+        )
+    )
     nav_target = NavTarget2D(
         x=float(target_xy_w[0, 0].detach().cpu().item()),
         y=float(target_xy_w[0, 1].detach().cpu().item()),
@@ -2269,6 +2334,17 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
     print(
         f"[INFO]: replanning={'enabled' if args_cli.enable_replanning else 'disabled'}, "
         "shortcutting=disabled, command_smoothing=disabled, local_escape=disabled",
+        flush=True,
+    )
+    print(
+        f"[INFO]: lidar safety filter: {'enabled' if args_cli.enable_safety else 'disabled'} "
+        f"(slow={float(args_cli.safety_front_slow_distance):.2f}, "
+        f"stop={float(args_cli.safety_front_stop_distance):.2f}, "
+        f"backup={float(args_cli.safety_front_backup_distance):.2f}, "
+        f"side_open={float(args_cli.safety_side_open_distance):.2f}, "
+        f"side_slow={float(args_cli.safety_side_slow_distance):.2f}, "
+        f"side_stop={float(args_cli.safety_side_stop_distance):.2f}, "
+        f"side_critical={float(args_cli.safety_side_critical_distance):.2f})",
         flush=True,
     )
     print(
@@ -2381,6 +2457,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
     reached_step: int | None = None
     nonstraight_command_count = 0
     replan_count = 0
+    safety_override_count = 0
 
     waypoint_index = 1
     save_grid = not bool(args_cli.no_save_grid)
@@ -2423,8 +2500,9 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
         yaw = float(proxy.yaw[0].detach().cpu().item())
         target_distance = float(torch.linalg.norm(target_xy_w[0] - proxy.pos_w[0, 0:2]).detach().cpu().item())
 
+        current_nav_pose = NavPose2D(x=x, y=y, yaw=yaw)
         nav_step = nav_runtime.step(
-            NavPose2D(x=x, y=y, yaw=yaw),
+            current_nav_pose,
             nav_target,
             live_grid[0],
             step_index=step_idx,
@@ -2459,7 +2537,16 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
         waypoint_index = nav_command.waypoint_index
         waypoint_xy = nav_command.waypoint_xy_w if nav_command.waypoint_xy_w is not None else (x, y)
         tangent_yaw = nav_command.path_yaw
-        vx, vy, wz = nav_command.command.tuple
+        nominal_vx, nominal_vy, nominal_wz = nav_command.command.tuple
+        safety_result = safety_filter.apply_from_lidar_obs(
+            nav_command.command,
+            live_lidar_obs,
+            pose=current_nav_pose,
+            target=nav_target,
+            step_index=step_idx,
+        )
+        vx, vy, wz = safety_result.command.tuple
+        safety_info = safety_result.info
         waypoint_xy_b = nav_command.waypoint_xy_b if nav_command.waypoint_xy_b is not None else (0.0, 0.0)
 
         scenario_clearance = min_scenario_edge_clearance(x, y, OBSTACLES, body_radius)
@@ -2493,8 +2580,17 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
             vx=vx,
             vy=vy,
             wz=wz,
+            nominal_vx=nominal_vx,
+            nominal_vy=nominal_vy,
+            nominal_wz=nominal_wz,
             lidar_valid=live_valid_hits,
             occupied_cells=live_occupied,
+            safety_action=safety_info.action,
+            safety_front_clearance=safety_info.front_clearance,
+            safety_left_clearance=safety_info.left_clearance,
+            safety_right_clearance=safety_info.right_clearance,
+            safety_override=safety_info.override_active,
+            safety_scale=safety_info.scale,
         )
         records.append(record)
 
@@ -2545,6 +2641,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
 
         if abs(vy) > 0.05 or abs(wz) > 0.05:
             nonstraight_command_count += 1
+        if bool(safety_info.override_active):
+            safety_override_count += 1
 
         cmd = torch.tensor([[vx, vy, wz]], dtype=torch.float32, device=device).repeat(num_envs, 1)
         proxy.set_command(cmd)
@@ -2577,6 +2675,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene) -> 
     print(f"[INFO]: target reached: {target_reached} step={reached_step}", flush=True)
     print(f"[INFO]: nonstraight command count: {nonstraight_command_count}", flush=True)
     print(f"[INFO]: replan count: {replan_count}", flush=True)
+    print(f"[INFO]: safety override count: {safety_override_count}", flush=True)
     print(f"[INFO]: wrote trace: {csv_path}", flush=True)
     print("[INFO]: minimal nav + LiDAR smoke test complete.", flush=True)
 
