@@ -230,31 +230,61 @@ def _reconstruct_path(came_from: dict[Cell, Cell], current: Cell) -> list[Cell]:
     return path
 
 
-def _nearest_free_cell(start: Cell, occupied: torch.Tensor) -> Cell | None:
-    """Find the nearest free cell to ``start`` using BFS on the grid."""
+def _nearest_free_cell(start_cell: tuple[int, int], occupied: torch.Tensor) -> tuple[int, int] | None:
+    """Return the nearest free grid cell to ``start_cell`` using BFS.
+
+    ``occupied`` is expected to be a boolean/integer occupancy tensor with shape
+    ``[H, W]`` where True/non-zero means blocked.  This function is used when
+    the requested A* goal lies in inflated occupancy and goal relocation is
+    enabled.
+
+    Important implementation detail: do not iterate over a deque while appending
+    to it.  Python raises ``RuntimeError: deque mutated during iteration``.
+    Use the standard ``while queue: popleft()`` BFS pattern instead.
+    """
+    if occupied.ndim != 2:
+        raise ValueError(f"occupied must have shape [H, W], got {tuple(occupied.shape)}")
+
     height, width = int(occupied.shape[0]), int(occupied.shape[1])
-    if not is_cell_in_bounds(start, height=height, width=width):
+    start_row, start_col = int(start_cell[0]), int(start_cell[1])
+
+    def in_bounds(row: int, col: int) -> bool:
+        return 0 <= row < height and 0 <= col < width
+
+    def is_free(row: int, col: int) -> bool:
+        # .item() is explicit and works for bool/integer scalar tensors.
+        return not bool(occupied[row, col].item())
+
+    if not in_bounds(start_row, start_col):
         return None
-    if not bool(occupied[start[0], start[1]]):
-        return start
+    if is_free(start_row, start_col):
+        return (start_row, start_col)
 
     from collections import deque
 
-    queue: deque[Cell] = deque([start])
-    visited = {start}
-    for row, col in queue:
-        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)):
-            nxt = (row + dr, col + dc)
-            if nxt in visited:
-                continue
-            if not is_cell_in_bounds(nxt, height=height, width=width):
-                continue
-            if not bool(occupied[nxt[0], nxt[1]]):
-                return nxt
-            visited.add(nxt)
-            queue.append(nxt)
-    return None
+    queue: deque[tuple[int, int]] = deque([(start_row, start_col)])
+    visited: set[tuple[int, int]] = {(start_row, start_col)}
 
+    # 8-connected search keeps behavior consistent with diagonal A* grids and
+    # usually finds a nearby free target with fewer ring artifacts.
+    neighbors = (
+        (-1, 0), (1, 0), (0, -1), (0, 1),
+        (-1, -1), (-1, 1), (1, -1), (1, 1),
+    )
+
+    while queue:
+        row, col = queue.popleft()
+        for dr, dc in neighbors:
+            nr, nc = row + dr, col + dc
+            cell = (nr, nc)
+            if cell in visited or not in_bounds(nr, nc):
+                continue
+            if is_free(nr, nc):
+                return cell
+            visited.add(cell)
+            queue.append(cell)
+
+    return None
 
 def astar_grid_search(
     occupied: torch.Tensor,
