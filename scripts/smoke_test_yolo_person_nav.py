@@ -470,7 +470,8 @@ parser.add_argument("--target_source", choices=["auto", "yolo", "fallback"], def
 parser.add_argument("--target_class", type=str, default="person")
 parser.add_argument("--min_confidence", type=float, default=0.25)
 parser.add_argument("--selection_policy", type=str, default="nearest", choices=("nearest", "largest", "highest_confidence"))
-parser.add_argument("--fallback_synthetic_bbox", action="store_true", default=True, help="Use projected known person bbox if YOLO is unavailable/no detection.")
+parser.add_argument("--fallback_synthetic_bbox", dest="fallback_synthetic_bbox", action="store_true", default=True, help="Use projected known person bbox if YOLO is unavailable/no detection. Enabled by default.")
+parser.add_argument("--no_fallback_synthetic_bbox", dest="fallback_synthetic_bbox", action="store_false", help="Disable projected known-person fallback; useful for strict YOLO-only validation.")
 parser.add_argument("--synthetic_bbox_w", type=float, default=120.0)
 parser.add_argument("--synthetic_bbox_h", type=float, default=260.0)
 parser.add_argument("--synthetic_point_z", type=float, default=1.0)
@@ -564,8 +565,8 @@ from g1_nav_rl.perception.target_from_bbox import (  # noqa: E402
     unproject_pixel_to_camera,
     make_forward_camera_T_body_camera,
     pose2d_to_T_world_body,
-    select_detection_for_target,
 )
+from g1_nav_rl.perception.target_provider import BBoxTargetProvider, TargetProviderConfig  # noqa: E402
 from g1_nav_rl.robots.g1_command_proxy import (  # noqa: E402
     G1CommandProxy,
     G1CommandProxyLimits,
@@ -2604,6 +2605,39 @@ def run_yolo_if_requested(rgb_np: np.ndarray) -> list[Detection2D]:
         return []
 
 
+def make_bbox_target_provider() -> BBoxTargetProvider:
+    """Build the reusable target provider from this script's CLI arguments."""
+    return BBoxTargetProvider(
+        TargetProviderConfig(
+            target_source=str(args_cli.target_source),
+            target_class=str(args_cli.target_class),
+            min_confidence=float(args_cli.min_confidence),
+            selection_policy=str(args_cli.selection_policy),
+            fallback_enabled=bool(args_cli.fallback_synthetic_bbox),
+            assert_detection=bool(args_cli.assert_detection),
+            assert_target=bool(args_cli.assert_target),
+        )
+    )
+
+
+def select_perception_detection(
+    detections: list[Detection2D],
+    *,
+    intr: CameraIntrinsics,
+    T_world_camera: np.ndarray,
+) -> tuple[Detection2D | None, str, str]:
+    """Select YOLO/fallback detection using the reusable provider policy."""
+    provider = make_bbox_target_provider()
+    selected = provider.select(
+        detections=detections,
+        fallback_detection_factory=lambda: synthetic_person_bbox_from_projection(intr, T_world_camera),
+        depth_image=None,
+    )
+    if selected.detection is not None and selected.source == "synthetic_projection":
+        print(f"[INFO]: using fallback synthetic bbox: {tuple(round(v, 1) for v in selected.detection.bbox_xyxy)}", flush=True)
+    return selected.detection, selected.source, selected.reason
+
+
 def extract_perception_target(scene: InteractiveScene, proxy: G1CommandProxy) -> tuple[PointXY, dict[str, Any]]:
     """Run YOLO/fallback bbox + depth projection and return a world-frame Target2D."""
     print("[CKPT]: extract_perception_target: reading camera outputs", flush=True)
@@ -2640,32 +2674,13 @@ def extract_perception_target(scene: InteractiveScene, proxy: G1CommandProxy) ->
     detections = run_yolo_if_requested(rgb_np)
     print("[CKPT]: extract_perception_target: selecting detection", flush=True)
 
-    selected = None
-    source = "none"
-
-    # Important: when explicitly using fallback, do not call the generic selection helper.
-    # This keeps the first full-pipeline test equivalent to the earlier working
-    # smoke_test_yolo_person_target.py path: projected bbox + depth -> Target2D.
-    if str(args_cli.target_source) == "fallback":
-        print("[CKPT]: extract_perception_target: target_source=fallback, computing synthetic bbox directly", flush=True)
-        selected = synthetic_person_bbox_from_projection(intr, T_world_camera)
-        source = "synthetic_projection"
-        print(f"[INFO]: using fallback synthetic bbox: {tuple(round(v, 1) for v in selected.bbox_xyxy)}", flush=True)
-    else:
-        print(f"[CKPT]: extract_perception_target: selecting from {len(detections)} YOLO detections", flush=True)
-        selected = select_detection_for_target(
-            detections,
-            allowed_classes={str(args_cli.target_class)},
-            min_confidence=float(args_cli.min_confidence),
-            depth_image=None,
-            policy=str(args_cli.selection_policy),
-        )
-        source = "yolo"
-        if selected is None and bool(args_cli.fallback_synthetic_bbox):
-            print("[CKPT]: extract_perception_target: no YOLO target, computing fallback synthetic bbox", flush=True)
-            selected = synthetic_person_bbox_from_projection(intr, T_world_camera)
-            source = "synthetic_projection"
-            print(f"[INFO]: using fallback synthetic bbox: {tuple(round(v, 1) for v in selected.bbox_xyxy)}", flush=True)
+    print(f"[CKPT]: extract_perception_target: selecting from {len(detections)} detector detections", flush=True)
+    selected, source, selection_reason = select_perception_detection(
+        detections,
+        intr=intr,
+        T_world_camera=T_world_camera,
+    )
+    print(f"[CKPT]: extract_perception_target: provider source={source} reason={selection_reason}", flush=True)
     if selected is None:
         if bool(args_cli.assert_detection):
             raise RuntimeError("no YOLO/fallback person detection available")
@@ -2710,6 +2725,7 @@ def extract_perception_target(scene: InteractiveScene, proxy: G1CommandProxy) ->
         raise RuntimeError(f"perception object error {object_error:.3f} exceeds threshold {float(args_cli.assert_target_error):.3f}")
     meta = {
         "detection_source": source,
+        "selection_reason": selection_reason,
         "detections": [{"class_name": d.class_name, "confidence": d.confidence, "bbox_xyxy": list(d.bbox_xyxy)} for d in detections],
         "selected_detection": {"class_name": selected.class_name, "confidence": selected.confidence, "bbox_xyxy": list(selected.bbox_xyxy)},
         "depth_m": float(result.depth_m),
@@ -2816,29 +2832,15 @@ def extract_perception_target_from_cpu_snapshot(scene: InteractiveScene, sim: si
     print("[CKPT]: snapshot_target: running/selecting detection on RGB CPU snapshot", flush=True)
     detections = run_yolo_if_requested(rgb_np)
     print(f"[CKPT]: snapshot_target: run_yolo_if_requested returned {len(detections)} detections", flush=True)
-    selected = None
-    source = "none"
-    if str(args_cli.target_source) == "fallback":
-        print("[CKPT]: snapshot_target: target_source=fallback, computing synthetic bbox", flush=True)
-        selected = synthetic_person_bbox_from_projection(intr, T_world_camera)
-        source = "synthetic_projection"
-        print(f"[INFO]: using fallback synthetic bbox: {tuple(round(v, 1) for v in selected.bbox_xyxy)}", flush=True)
-    else:
-        # Do not pass the full depth image into selection; that would force a CPU
-        # depth readback.  For nearest policy, select_detection_for_target falls
-        # back to the largest bbox when depth_image is omitted.
-        selected = select_detection_for_target(
-            detections,
-            allowed_classes={str(args_cli.target_class)},
-            min_confidence=float(args_cli.min_confidence),
-            depth_image=None,
-            policy=str(args_cli.selection_policy),
-        )
-        source = "yolo"
-        if selected is None and bool(args_cli.fallback_synthetic_bbox):
-            selected = synthetic_person_bbox_from_projection(intr, T_world_camera)
-            source = "synthetic_projection"
-            print(f"[INFO]: using fallback synthetic bbox: {tuple(round(v, 1) for v in selected.bbox_xyxy)}", flush=True)
+    # Do not pass the full depth image into selection; that would force a CPU
+    # depth readback. For nearest policy, selection falls back to largest bbox
+    # when no selection-depth image is provided.
+    selected, source, selection_reason = select_perception_detection(
+        detections,
+        intr=intr,
+        T_world_camera=T_world_camera,
+    )
+    print(f"[CKPT]: snapshot_target: provider source={source} reason={selection_reason}", flush=True)
 
     if selected is None:
         if bool(args_cli.assert_detection):
@@ -2886,6 +2888,7 @@ def extract_perception_target_from_cpu_snapshot(scene: InteractiveScene, sim: si
     meta: dict[str, Any] = {
         "snapshot_mode": "cpu_rgb_bbox_plus_device_depth_scalar_once_before_navigation",
         "detection_source": source,
+        "selection_reason": selection_reason,
         "detections": [
             {"class_name": d.class_name, "confidence": float(d.confidence), "bbox_xyxy": [float(v) for v in d.bbox_xyxy]}
             for d in detections
