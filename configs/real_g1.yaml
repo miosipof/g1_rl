@@ -63,9 +63,9 @@ lidar:
 command_limits:
   # Initial real-robot limits are deliberately lower than Isaac smoke-test limits.
   vx_min: -0.05
-  vx_max: 0.10
+  vx_max: 0.50
   vy_min: -0.05
-  vy_max: 0.05
+  vy_max: 0.25
   wz_min: -0.20
   wz_max: 0.20
   max_linear_accel_mps2: 0.20

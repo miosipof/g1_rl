@@ -79,3 +79,20 @@ def test_low_speed_help_exposes_non_200_gate(monkeypatch, capsys) -> None:
     stdout = capsys.readouterr().out
     assert "--allow-non-200" in stdout
     assert "--expected-fsm-id" in stdout
+
+
+def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> None:
+    import real_g1_follow_detect_live  # noqa: WPS433
+
+    monkeypatch.setattr(sys, "argv", ["real_g1_follow_detect_live.py", "--help"])
+    try:
+        real_g1_follow_detect_live.main()
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:  # pragma: no cover - argparse help exits
+        raise AssertionError("expected argparse help SystemExit")
+    stdout = capsys.readouterr().out
+    assert "--yes-i-understand-this-moves-the-robot" in stdout
+    assert "--allow-synthetic-robot-state-motion" in stdout
+    assert "--allow-non-200" in stdout
+    assert "--redetect-every" in stdout
