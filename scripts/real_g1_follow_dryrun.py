@@ -20,9 +20,16 @@ import numpy as np
 
 from adapters import (
     Command2D,
+    ConstantVelocityPolicy,
     DryRunCommandSink,
     LidarFrame,
+    LidarDebugWriter,
+    LazyYoloDebugDetector,
     Pose2D,
+    RGBDDebugWriter,
+    Target2D,
+    LidarTargetNavPolicyRuntime,
+    LidarTargetNavPolicyRuntimeConfig,
     RealBridge,
     RealBridgeConfig,
     CompositeDryRunObservationProvider,
@@ -86,17 +93,6 @@ class SyntheticObservationProvider:
         )
 
 
-@dataclass
-class ConstantVelocityPolicy:
-    vx: float
-    vy: float
-    wz: float
-    source: str = "constant_velocity_policy"
-
-    def step(self, observation: RobotObservation) -> Command2D:
-        return Command2D(self.vx, self.vy, self.wz, timestamp_s=observation.timestamp_s, source=self.source)
-
-
 class _TimeoutRealSenseAdapter:
     """Small wrapper so RealSenseDryRunObservationProvider can use a timeout."""
 
@@ -106,6 +102,13 @@ class _TimeoutRealSenseAdapter:
 
     def read_frame(self):
         return self.adapter.read_frame(timeout_ms=self.timeout_ms)
+
+
+def cfg_to_default_grid_cfg():
+    # Import lazily so the dry-run script remains lightweight for non-target-nav use.
+    from g1_nav_rl.mapping.occupancy_grid import OccupancyGridCfg
+
+    return OccupancyGridCfg()
 
 
 def _result_to_dict(result: Any) -> dict[str, Any]:
@@ -139,9 +142,15 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=_default_config_path(), help="Adapter YAML config path.")
     parser.add_argument("--steps", type=int, default=5, help="Number of bridge iterations.")
     parser.add_argument("--dt", type=float, default=0.10, help="Sleep between iterations.")
-    parser.add_argument("--vx", type=float, default=0.05, help="Requested policy vx in m/s.")
-    parser.add_argument("--vy", type=float, default=0.0, help="Requested policy vy in m/s.")
-    parser.add_argument("--wz", type=float, default=0.0, help="Requested policy wz in rad/s.")
+    parser.add_argument("--policy", choices=("constant", "target-nav"), default="constant", help="Policy/runtime used to propose commands.")
+    parser.add_argument("--vx", type=float, default=0.05, help="Requested policy vx in m/s for --policy constant.")
+    parser.add_argument("--vy", type=float, default=0.0, help="Requested policy vy in m/s for --policy constant.")
+    parser.add_argument("--wz", type=float, default=0.0, help="Requested policy wz in rad/s for --policy constant.")
+    parser.add_argument("--target-x", type=float, default=2.0, help="Manual world-frame target x for --policy target-nav.")
+    parser.add_argument("--target-y", type=float, default=0.0, help="Manual world-frame target y for --policy target-nav.")
+    parser.add_argument("--target-nav-replan-every", type=int, default=0, help="Replan cadence for --policy target-nav; 0 disables periodic replanning.")
+    parser.add_argument("--target-nav-enable-replanning", action="store_true", help="Enable path conflict/periodic replanning in --policy target-nav.")
+    parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters for --policy target-nav.")
     parser.add_argument("--obstacle-front-m", type=float, default=None, help="Optional synthetic front obstacle distance.")
     parser.add_argument(
         "--observation-source",
@@ -173,6 +182,14 @@ def main() -> int:
     parser.add_argument("--livox-frame-time", type=float, default=0.20, help="Livox packet aggregation window.")
     parser.add_argument("--livox-frame-packets", type=int, default=120, help="Livox packet aggregation count.")
     parser.add_argument("--livox-timeout", type=float, default=2.0, help="Timeout waiting for live Livox frames.")
+    parser.add_argument("--save-lidar-debug", type=Path, default=None, help="Directory for LiDAR occupancy/debug artifacts; dry-run only.")
+    parser.add_argument("--save-rgbd-debug", type=Path, default=None, help="Directory for RGB-D snapshot/depth/YOLO debug artifacts; dry-run only.")
+    parser.add_argument("--rgbd-debug-yolo", action="store_true", help="Run YOLO on RGB-D debug snapshots and save detection overlays/metadata.")
+    parser.add_argument("--rgbd-debug-yolo-model", default="yolov8n.pt", help="YOLO model used for --rgbd-debug-yolo.")
+    parser.add_argument("--rgbd-debug-yolo-confidence", type=float, default=0.25, help="YOLO confidence threshold for RGB-D debug detection.")
+    parser.add_argument("--rgbd-debug-yolo-iou", type=float, default=0.45, help="YOLO IoU threshold for RGB-D debug detection.")
+    parser.add_argument("--rgbd-debug-yolo-device", default=None, help="Optional YOLO device for RGB-D debug detection, e.g. cuda:0 or cpu.")
+    parser.add_argument("--rgbd-debug-yolo-classes", default="person", help="Comma-separated classes to keep for RGB-D debug YOLO; use 'all' to keep every class.")
     parser.add_argument("--json-lines", action="store_true", help="Print one JSON object per step.")
     args = parser.parse_args()
 
@@ -184,6 +201,14 @@ def main() -> int:
         raise SystemExit("--realsense-timeout-ms must be > 0")
     if args.livox_timeout <= 0.0:
         raise SystemExit("--livox-timeout must be > 0")
+    if args.target_nav_replan_every < 0:
+        raise SystemExit("--target-nav-replan-every must be >= 0")
+    if args.target_nav_inflation < 0.0:
+        raise SystemExit("--target-nav-inflation must be >= 0")
+    if not (0.0 <= args.rgbd_debug_yolo_confidence <= 1.0):
+        raise SystemExit("--rgbd-debug-yolo-confidence must be in [0, 1]")
+    if not (0.0 <= args.rgbd_debug_yolo_iou <= 1.0):
+        raise SystemExit("--rgbd-debug-yolo-iou must be in [0, 1]")
 
     cfg = load_adapter_config(args.config)
     realsense_adapter: RealSenseRGBDAdapter | None = None
@@ -245,7 +270,18 @@ def main() -> int:
             include_synthetic_lidar_if_missing=False,
         )
 
-    policy = ConstantVelocityPolicy(args.vx, args.vy, args.wz)
+    if args.policy == "constant":
+        policy = ConstantVelocityPolicy(args.vx, args.vy, args.wz)
+    else:
+        policy_cfg = LidarTargetNavPolicyRuntimeConfig.from_runtime_config(
+            cfg,
+            target=Target2D(float(args.target_x), float(args.target_y)),
+            enable_replanning=bool(args.target_nav_enable_replanning or args.target_nav_replan_every > 0),
+            replan_every=int(args.target_nav_replan_every),
+            inflation_radius_m=float(args.target_nav_inflation),
+        )
+        policy = LidarTargetNavPolicyRuntime(policy_cfg)
+
     supervisor = SafetySupervisor.from_runtime_config(cfg)
     sink = DryRunCommandSink(name="dryrun_bridge_sink")
     bridge = RealBridge(
@@ -256,11 +292,33 @@ def main() -> int:
         config=RealBridgeConfig(name="real_g1_follow_dryrun", send_commands=True),
     )
 
+    lidar_debug_writer = None
+    if args.save_lidar_debug is not None:
+        debug_grid_cfg = policy.config.grid_cfg if isinstance(policy, LidarTargetNavPolicyRuntime) else cfg_to_default_grid_cfg()
+        lidar_debug_writer = LidarDebugWriter(args.save_lidar_debug, grid_cfg=debug_grid_cfg)
+
+    rgbd_debug_writer = RGBDDebugWriter(args.save_rgbd_debug) if args.save_rgbd_debug is not None else None
+    rgbd_debug_detector = None
+    if args.rgbd_debug_yolo:
+        allowed_classes = None if str(args.rgbd_debug_yolo_classes).strip().lower() == "all" else [
+            item.strip() for item in str(args.rgbd_debug_yolo_classes).split(",") if item.strip()
+        ]
+        rgbd_debug_detector = LazyYoloDebugDetector(
+            model=args.rgbd_debug_yolo_model,
+            confidence=float(args.rgbd_debug_yolo_confidence),
+            iou=float(args.rgbd_debug_yolo_iou),
+            device=args.rgbd_debug_yolo_device,
+            allowed_classes=allowed_classes,
+        )
+
     try:
         status = bridge.follow()
         if not args.json_lines:
             print(f"[INFO]: bridge command: follow -> {status.health.value}: {status.message}")
             print(f"[INFO]: observation_source={args.observation_source}")
+            print(f"[INFO]: policy={args.policy}")
+            if args.policy == "target-nav":
+                print(f"[INFO]: target-nav target=({args.target_x:.3f}, {args.target_y:.3f}) replan_every={args.target_nav_replan_every} inflation={args.target_nav_inflation:.3f}")
             if uses_realsense and not (uses_livox_npy or uses_livox_live):
                 print("[INFO]: using live RealSense RGB-D; LiDAR and robot state remain synthetic placeholders")
             elif (uses_livox_npy or uses_livox_live) and not uses_realsense:
@@ -269,11 +327,27 @@ def main() -> int:
                 print("[INFO]: using live RealSense RGB-D and Livox/MID-360 LiDAR source; robot state remains synthetic placeholder")
             if uses_livox_npy:
                 print(f"[INFO]: Livox .npy replay loop={args.loop_livox_npy}")
+            if lidar_debug_writer is not None:
+                print(f"[INFO]: LiDAR debug artifacts: {lidar_debug_writer.output_dir}")
+            if rgbd_debug_writer is not None:
+                print(f"[INFO]: RGB-D debug artifacts: {rgbd_debug_writer.output_dir}")
+            if rgbd_debug_detector is not None:
+                print(f"[INFO]: RGB-D debug YOLO enabled model={args.rgbd_debug_yolo_model!r} classes={args.rgbd_debug_yolo_classes!r}")
 
         exit_code = 0
         for i in range(args.steps):
             result = bridge.step()
+            debug_paths = None
+            if lidar_debug_writer is not None:
+                debug_paths = lidar_debug_writer.write_step(i, result, policy=policy if isinstance(policy, LidarTargetNavPolicyRuntime) else None)
+            rgbd_debug_paths = None
+            if rgbd_debug_writer is not None:
+                rgbd_debug_paths = rgbd_debug_writer.write_step(i, result, detector=rgbd_debug_detector)
             row = {"step": i, **_result_to_dict(result)}
+            if debug_paths:
+                row["lidar_debug"] = debug_paths
+            if rgbd_debug_paths:
+                row["rgbd_debug"] = rgbd_debug_paths
             if args.json_lines:
                 print(json.dumps(row, sort_keys=True))
             else:
