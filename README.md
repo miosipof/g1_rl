@@ -11,9 +11,9 @@ The current stack is intentionally deterministic and inspectable:
 
 ## Current milestone
 
-The repository has an Isaac Sim full-pipeline smoke test that performs one-shot RGB-D/YOLO person-target acquisition, freezes the target, and then runs live LiDAR obstacle-avoiding navigation toward that target.
+The repository has an Isaac Sim full-pipeline smoke test that performs initial RGB-D/YOLO person-target acquisition and then runs live LiDAR obstacle-avoiding navigation toward that target. The script now also supports simple periodic target re-detection inside the navigation loop.
 
-The one-shot freeze is deliberate: continuous RGB-D tensor handling inside the Isaac navigation loop previously caused CUDA/RTX synchronization instability. The next phase adds periodic target refresh using a small target-tracking state machine rather than embedding more logic into the large Isaac smoke script.
+By default, `smoke_test_yolo_person_nav.py` refreshes the target every 50 navigation steps with `--redetect_every 50`. Each refresh runs YOLO/fallback bbox selection, updates `TargetTracker`, and replans if a valid target update is accepted. Use `--redetect_every 0` to recover the older one-shot behavior.
 
 ## Important entry points
 
@@ -33,7 +33,7 @@ scripts/
   smoke_test_nav.py                     offline deterministic A* navigation
   smoke_test_nav_lidar.py               Isaac LiDAR navigation smoke test
   smoke_test_yolo_person_target.py      Isaac YOLO/RGB-D target extraction
-  smoke_test_yolo_person_nav.py         one-shot target + live LiDAR navigation
+  smoke_test_yolo_person_nav.py         initial target + periodic re-detection + live LiDAR navigation
   smoke_test_target_provider_tracker.py offline provider/tracker smoke test
 ```
 
@@ -52,12 +52,11 @@ Isaac scripts must be run inside the Isaac Lab / Omniverse environment.
 
 ## Next implementation phase
 
-Use `TargetTracker` for periodic target refresh:
+The current periodic re-detection is intentionally simple. Next steps:
 
-- every `N` simulator steps, capture a CPU RGB snapshot;
-- run YOLO or fallback bbox acquisition through `BBoxTargetProvider`;
-- update `TargetTracker` with the new target measurement;
-- pass `tracker.active_target` to `NavRuntime` and replan only when the target has moved enough;
-- during short occlusion, keep moving toward the last known target;
-- when state becomes `LOST`, stop or switch to a search behavior.
+- validate `--redetect_every 50` in Isaac on static and slowly moving person targets;
+- tune `--target_occlusion_grace_steps`, `--target_smoothing_alpha`, and `--target_max_jump_m`;
+- add moving-person scenarios and scripted person trajectories;
+- add search behavior for the `LOST` state instead of only stopping;
+- only after this baseline is stable, evaluate velocity prediction or recurrent filtering.
 

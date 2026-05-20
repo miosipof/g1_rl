@@ -1,12 +1,35 @@
 # Target Provider and Target Tracker
 
-This document describes the first cleanup/refactor pass for moving from one-shot person-target navigation to periodic autonomous target following.
+This document describes the perception-target layer used to move from one-shot person-target navigation toward simple target following.
 
-## Why this refactor exists
+## Current status
 
-`smoke_test_yolo_person_nav.py` reached the current full-pipeline milestone, but it is now too large to absorb the next phase safely. It mixes Isaac scene setup, RGB-D/YOLO, bbox projection, LiDAR occupancy, A* planning, replanning, safety filters, logging, and visualization.
+`smoke_test_yolo_person_nav.py` now has two target modes:
 
-The refactor extracts two reusable perception components:
+```text
+initial snapshot target
+periodic re-detection target refresh
+```
+
+At startup, the script still captures one RGB-D snapshot, runs YOLO/fallback bbox selection, projects the bbox to a `Target2D`, and creates the initial navigation target.
+
+During navigation, the script now performs a lightweight re-detection attempt every 50 steps by default:
+
+```bash
+--redetect_every 50
+```
+
+Each refresh reads the latest RGB-D camera output, runs YOLO/fallback bbox selection, estimates a new `Target2D`, passes it through `TargetTracker`, and replans if the accepted active target changed.
+
+To recover the previous one-shot behavior:
+
+```bash
+--redetect_every 0
+```
+
+## Reusable modules
+
+The refactor extracts two perception components:
 
 ```text
 src/g1_nav_rl/perception/target_provider.py
@@ -25,16 +48,16 @@ The Isaac script still owns Isaac-specific camera reads and the tensor-depth wor
 - class/confidence filtering and selection policy are centralized;
 - projection is delegated to a caller-supplied function, so the provider does not depend on Isaac, Torch, YOLO, or OpenCV.
 
-This keeps the existing Isaac-safe behavior intact: select a bbox first, then compute only the scalar depth needed for that bbox rather than copying the full depth image to CPU.
+This keeps the Isaac-safe behavior intact: select a bbox first, then compute only the scalar depth needed for that bbox rather than copying the full depth image to CPU.
 
 ## `target_tracker.py`
 
 `TargetTracker` is a deterministic state machine for periodic re-detection:
 
 ```text
-TRACKING          fresh target measurement accepted
-OCCLUDED_RECENT   no valid measurement, but last target is still usable
-LOST              no usable target remains
+TRACKING           fresh target measurement accepted
+OCCLUDED_RECENT    no valid measurement, but last target is still usable
+LOST               no usable target remains
 ```
 
 It provides:
@@ -45,6 +68,50 @@ It provides:
 - short occlusion grace through `occlusion_grace_steps`;
 - a stable `active_target` that navigation can consume.
 
+## Isaac script behavior
+
+The navigation loop now does this:
+
+```python
+if step > 0 and tracker.should_refresh(step):
+    maybe_target_xy, meta = extract_periodic_redetection_target(scene, proxy, step_idx=step)
+    measurement = None if maybe_target_xy is None else TargetMeasurement.from_xy(...)
+    tracker_update = tracker.update(step=step, measurement=measurement)
+
+    if tracker_update.active_target is None:
+        stop_robot()
+    elif tracker_update.accepted_measurement:
+        nav_target = tracker_update.active_target
+        nav_runtime.plan(current_pose, nav_target, live_grid)
+```
+
+So the current behavior is no longer strictly one-shot. It is now:
+
+```text
+initial detection -> navigate -> re-detect every 50 steps -> update/replan if target is valid -> keep last target through short occlusions -> stop if target becomes LOST
+```
+
+## Important CLI options
+
+```bash
+--redetect_every 50
+--target_occlusion_grace_steps 150
+--target_smoothing_alpha 0.35
+--target_max_jump_m 1.25
+```
+
+For strict YOLO validation without synthetic fallback:
+
+```bash
+--target_source yolo --no_fallback_synthetic_bbox
+```
+
+For deterministic geometry/fallback validation:
+
+```bash
+--target_source fallback --target_depth_source geometric
+```
+
 ## Offline check
 
 ```bash
@@ -52,31 +119,4 @@ PYTHONPATH=src python scripts/smoke_test_target_provider_tracker.py
 PYTHONPATH=src pytest -q tests
 ```
 
-## How to use in the next Isaac phase
-
-The next Isaac iteration should not run YOLO every simulator step. A safe first version is:
-
-```python
-tracker = TargetTracker(TargetTrackerConfig(refresh_period_steps=30, occlusion_grace_steps=90))
-
-for step in range(max_steps):
-    if tracker.should_refresh(step):
-        maybe_target_xy, meta = try_extract_target_snapshot()
-        measurement = None if maybe_target_xy is None else TargetMeasurement.from_xy(
-            maybe_target_xy,
-            step=step,
-            source=meta.get("detection_source", "unknown"),
-            metadata=meta,
-        )
-        tracker_update = tracker.update(step=step, measurement=measurement)
-    else:
-        tracker_update = tracker.update(step=step, measurement=None)
-
-    if tracker_update.active_target is None:
-        command = stop_command()
-    else:
-        nav_target = tracker_update.active_target
-        command = nav_runtime.step(..., target=nav_target, ...)
-```
-
-The first periodic version should update target only at low frequency and should replan only when the accepted target moves beyond a threshold. Continuous camera/depth readback should remain avoided until the periodic version is stable.
+The full periodic re-detection path still requires Isaac/RTX because it reads the live camera sensor from `smoke_test_yolo_person_nav.py`.

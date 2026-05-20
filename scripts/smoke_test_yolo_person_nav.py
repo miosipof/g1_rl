@@ -47,7 +47,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-SCRIPT_VERSION = "smoke_test_yolo_person_nav_v10_numpy_import_fallback_debug"
+SCRIPT_VERSION = "smoke_test_yolo_person_nav_v11_yolo_render_diagnostics"
 
 from isaaclab.app import AppLauncher  # noqa: E402
 
@@ -458,7 +458,7 @@ parser.add_argument("--person_x", type=float, default=None, help="World/env x fo
 parser.add_argument("--person_y", type=float, default=None, help="World/env y for the static person target. Default: scenario target y.")
 parser.add_argument("--person_yaw", type=float, default=3.141592653589793)
 parser.add_argument("--person_asset_usd", type=str, default="", help="Optional realistic human USD asset. If omitted, use a simple proxy humanoid.")
-parser.add_argument("--person_asset_reference_mode", type=str, default="payload", choices=("reference", "payload"))
+parser.add_argument("--person_asset_reference_mode", type=str, default="reference", choices=("reference", "payload"), help="How to compose the person USD. Default matches the perception-only YOLO smoke test; payload can hide/load lazily on some setups.")
 parser.add_argument("--person_asset_scale", type=float, default=1.0)
 parser.add_argument("--skip_person_asset_reference", action="store_true")
 parser.add_argument("--skip_yolo", action="store_true", help="Do not run YOLO; use fallback synthetic bbox if enabled.")
@@ -483,6 +483,12 @@ parser.add_argument("--target_depth_percentile", type=float, default=0.50)
 parser.add_argument("--stand_off", type=float, default=0.8, help="Meters to stop short of the detected person/object.")
 parser.add_argument("--perception_warmup_steps", type=int, default=5, help="Extra camera warmup frames before extracting the target.")
 parser.add_argument("--perception_camera_pose_source", choices=("fixed", "proxy"), default="fixed", help="Camera pose source for the initial perception target. fixed avoids CUDA proxy-pose reads; proxy tracks the live proxy pose but can synchronize GPU tensors.")
+parser.add_argument("--save_perception_images", action="store_true", help="Save initial and periodic RGB frames with YOLO/selected bboxes for detector/rendering diagnostics.")
+parser.add_argument("--perception_image_dir", type=str, default="", help="Directory for --save_perception_images. Default: outputs/yolo_person_nav/<scenario>/perception.")
+parser.add_argument("--redetect_every", type=int, default=50, help="Run a lightweight RGB-D/YOLO target refresh every N navigation steps. Use 0 to keep one-shot behavior.")
+parser.add_argument("--target_occlusion_grace_steps", type=int, default=150, help="Keep following the last target for this many steps after missed re-detections.")
+parser.add_argument("--target_smoothing_alpha", type=float, default=0.35, help="Low-pass update weight for accepted periodic target measurements.")
+parser.add_argument("--target_max_jump_m", type=float, default=1.25, help="Reject periodic target updates that jump farther than this distance in meters.")
 parser.add_argument("--skip_second_scene_reset", action="store_true", help="Do not call scene.reset() again inside run_simulator after main sim.reset(); useful for debugging heavy external assets.")
 parser.add_argument("--assert_detection", action="store_true")
 parser.add_argument("--assert_target", action="store_true")
@@ -567,6 +573,7 @@ from g1_nav_rl.perception.target_from_bbox import (  # noqa: E402
     pose2d_to_T_world_body,
 )
 from g1_nav_rl.perception.target_provider import BBoxTargetProvider, TargetProviderConfig  # noqa: E402
+from g1_nav_rl.perception.target_tracker import TargetMeasurement, TargetTracker, TargetTrackerConfig  # noqa: E402
 from g1_nav_rl.robots.g1_command_proxy import (  # noqa: E402
     G1CommandProxy,
     G1CommandProxyLimits,
@@ -1050,7 +1057,20 @@ def print_stage_prim_diagnostics(num_envs: int, *, label: str) -> None:
     paths = [
         resolve_template_path(CFG["lidar"]["prim_path"], env_id=0),
         resolve_template_path(CFG["target"]["prim_path"], env_id=0),
+        resolve_template_path(CFG["camera"]["prim_path"], env_id=0),
     ]
+    if bool(str(args_cli.person_asset_usd).strip()):
+        paths.extend([
+            "/World/envs/env_0/PersonAsset",
+            "/World/envs/env_0/PersonAsset/Model",
+        ])
+    else:
+        paths.extend([
+            "/World/envs/env_0/ProxyPersonTorso",
+            "/World/envs/env_0/ProxyPersonHead",
+            "/World/envs/env_0/ProxyPersonLegL",
+            "/World/envs/env_0/ProxyPersonLegR",
+        ])
     if USE_RAYCAST_AGGREGATE_MESH:
         paths.append(resolve_template_path(RAYCAST_AGGREGATE_PRIM_PATH, env_id=0))
         paths.append(resolve_template_path(RAYCAST_AGGREGATE_MESH_PRIM_PATH, env_id=0))
@@ -2348,6 +2368,11 @@ def add_referenced_person_asset() -> None:
     mode = str(args_cli.person_asset_reference_mode)
     if mode == "payload":
         model_prim.GetPayloads().AddPayload(usd_path)
+        try:
+            model_prim.Load()
+            print("[INFO]: explicitly loaded person payload prim", flush=True)
+        except Exception as exc:
+            print(f"[WARN]: could not explicitly load person payload prim: {exc}", flush=True)
     else:
         model_prim.GetReferences().AddReference(usd_path)
     print(f"[INFO]: Added person asset ({mode}): {usd_path} -> {model_path}; wrapper={wrapper_path}", flush=True)
@@ -2359,7 +2384,62 @@ def yolo_tensor_rgb_to_numpy(rgb: torch.Tensor) -> np.ndarray:
         if float(rgb0.max().item()) <= 1.0:
             rgb0 = rgb0 * 255.0
         rgb0 = rgb0.clamp(0, 255).to(torch.uint8)
-    return rgb0.numpy()
+    arr = rgb0.numpy()
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        raise ValueError(f"expected RGB tensor convertible to HxWx3, got shape={arr.shape}")
+    return np.ascontiguousarray(arr)
+
+
+def perception_image_dir() -> Path:
+    if str(args_cli.perception_image_dir).strip():
+        return Path(str(args_cli.perception_image_dir)).expanduser()
+    return PROJECT_ROOT / "outputs" / "yolo_person_nav" / str(args_cli.scenario) / "perception"
+
+
+def rgb_image_stats(rgb_np: np.ndarray) -> str:
+    arr = np.asarray(rgb_np)
+    if arr.size == 0:
+        return "empty"
+    ch_mean = arr.reshape(-1, arr.shape[-1]).mean(axis=0) if arr.ndim == 3 and arr.shape[-1] == 3 else []
+    ch = ",".join(f"{float(v):.1f}" for v in ch_mean)
+    return f"min={int(np.min(arr))} max={int(np.max(arr))} mean={float(np.mean(arr)):.1f} channel_mean=[{ch}]"
+
+
+def save_perception_debug_image(
+    rgb_np: np.ndarray,
+    *,
+    tag: str,
+    detections: Sequence[Detection2D] | None = None,
+    selected: Detection2D | None = None,
+    source: str = "",
+) -> None:
+    if not bool(args_cli.save_perception_images):
+        return
+    out_dir = perception_image_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_tag = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(tag))
+    raw_path = out_dir / f"{safe_tag}_rgb.png"
+    overlay_path = out_dir / f"{safe_tag}_overlay.png"
+    npy_path = out_dir / f"{safe_tag}_rgb.npy"
+    try:
+        np.save(npy_path, np.asarray(rgb_np, dtype=np.uint8))
+        from PIL import Image, ImageDraw
+
+        img = Image.fromarray(np.asarray(rgb_np, dtype=np.uint8)).convert("RGB")
+        img.save(raw_path)
+        draw = ImageDraw.Draw(img)
+        for det in detections or []:
+            x1, y1, x2, y2 = [float(v) for v in det.bbox_xyxy]
+            draw.rectangle((x1, y1, x2, y2), outline=(255, 255, 0), width=2)
+            draw.text((x1, max(0.0, y1 - 12.0)), f"{det.class_name} {float(det.confidence):.2f}", fill=(255, 255, 0))
+        if selected is not None:
+            x1, y1, x2, y2 = [float(v) for v in selected.bbox_xyxy]
+            draw.rectangle((x1, y1, x2, y2), outline=(255, 0, 0), width=3)
+            draw.text((x1, min(float(img.height - 12), max(0.0, y2 + 2.0))), f"selected {source}", fill=(255, 0, 0))
+        img.save(overlay_path)
+        print(f"[INFO]: saved perception debug image: {overlay_path}", flush=True)
+    except Exception as exc:
+        print(f"[WARN]: failed to save perception debug image {overlay_path}: {exc}", flush=True)
 
 
 def yolo_tensor_depth_to_numpy(depth: torch.Tensor) -> np.ndarray:
@@ -2522,13 +2602,28 @@ def compute_camera_intrinsics_from_cfg() -> CameraIntrinsics:
     return CameraIntrinsics(fx=fx, fy=fy, cx=0.5 * (width - 1), cy=0.5 * (height - 1), width=width, height=height)
 
 
-def T_world_camera_from_proxy(proxy: G1CommandProxy) -> np.ndarray:
-    # Live pose source. This reads CUDA tensors and can synchronize/block in headless RTX runs.
-    pose = NavPose2D(
+def proxy_nav_pose_2d(proxy: G1CommandProxy) -> NavPose2D:
+    """Return the proxy root pose using the pose fields exposed by G1CommandProxy.
+
+    Older drafts of this script used ``proxy.yaw_w``.  The current proxy class
+    exposes yaw as ``proxy.yaw`` while position remains ``proxy.pos_w``.
+    Keeping this accessor centralized prevents periodic perception refreshes from
+    depending on a stale attribute name.
+    """
+    yaw_tensor = getattr(proxy, "yaw", None)
+    if yaw_tensor is None:
+        # Compatibility fallback for any older proxy implementation.
+        yaw_tensor = getattr(proxy, "yaw_w")
+    return NavPose2D(
         float(proxy.pos_w[0, 0].detach().cpu().item()),
         float(proxy.pos_w[0, 1].detach().cpu().item()),
-        float(proxy.yaw_w[0].detach().cpu().item()),
+        float(yaw_tensor[0].detach().cpu().item()),
     )
+
+
+def T_world_camera_from_proxy(proxy: G1CommandProxy) -> np.ndarray:
+    # Live pose source. This reads CUDA tensors and can synchronize/block in headless RTX runs.
+    pose = proxy_nav_pose_2d(proxy)
     z = float(proxy.pos_w[0, 2].detach().cpu().item()) if proxy.pos_w.shape[-1] >= 3 else 0.0
     T_world_body = pose2d_to_T_world_body(pose, z=z)
     cam_pos = CFG["camera"]["offset"]["pos"]
@@ -2689,11 +2784,7 @@ def extract_perception_target(scene: InteractiveScene, proxy: G1CommandProxy) ->
     print("[CKPT]: extract_perception_target: projecting bbox+depth to Target2D", flush=True)
     if str(args_cli.perception_camera_pose_source) == "proxy":
         print("[CKPT]: extract_perception_target: reading proxy pose for target standoff", flush=True)
-        robot_pose_for_target = NavPose2D(
-            float(proxy.pos_w[0, 0].detach().cpu().item()),
-            float(proxy.pos_w[0, 1].detach().cpu().item()),
-            float(proxy.yaw_w[0].detach().cpu().item()),
-        )
+        robot_pose_for_target = proxy_nav_pose_2d(proxy)
     else:
         # Match the fixed initial camera transform. This avoids a second proxy CUDA
         # synchronization during the initial perception target extraction.
@@ -2818,6 +2909,8 @@ def extract_perception_target_from_cpu_snapshot(scene: InteractiveScene, sim: si
     print("[CKPT]: snapshot_target: copying RGB tensor to CPU numpy", flush=True)
     rgb_np = yolo_tensor_rgb_to_numpy(rgb)
     print(f"[CKPT]: snapshot_target: rgb_np shape={tuple(rgb_np.shape)} dtype={rgb_np.dtype}", flush=True)
+    print(f"[INFO]: snapshot_target RGB stats: {rgb_image_stats(rgb_np)}", flush=True)
+    save_perception_debug_image(rgb_np, tag="initial_before_yolo")
     print("[CKPT]: snapshot_target: keeping full depth tensor on device; no full depth CPU copy", flush=True)
 
     depth_min = float(args_cli.target_depth_min)
@@ -2841,6 +2934,7 @@ def extract_perception_target_from_cpu_snapshot(scene: InteractiveScene, sim: si
         T_world_camera=T_world_camera,
     )
     print(f"[CKPT]: snapshot_target: provider source={source} reason={selection_reason}", flush=True)
+    save_perception_debug_image(rgb_np, tag="initial_after_yolo", detections=detections, selected=selected, source=source)
 
     if selected is None:
         if bool(args_cli.assert_detection):
@@ -2924,6 +3018,126 @@ def extract_perception_target_from_cpu_snapshot(scene: InteractiveScene, sim: si
     print(f"  known_person_xy            : ({PERSON_X:.3f}, {PERSON_Y:.3f})", flush=True)
     print(f"  object_error_xy_m          : {object_error:.3f}", flush=True)
     return (float(target_result.target.x), float(target_result.target.y)), meta
+
+
+def extract_periodic_redetection_target(
+    scene: InteractiveScene,
+    proxy: G1CommandProxy,
+    *,
+    step_idx: int,
+) -> tuple[PointXY | None, dict[str, Any]]:
+    """Try one live RGB-D/YOLO refresh without advancing simulation.
+
+    This is intentionally lighter than the initial snapshot path: it reads the
+    latest camera frame already produced by the simulator loop, uses the live
+    proxy pose for camera/standoff geometry, and returns ``None`` on ordinary
+    missed detections so the target tracker can apply occlusion grace.
+    """
+    meta: dict[str, Any] = {
+        "mode": "periodic_redetection",
+        "step": int(step_idx),
+        "target_valid": False,
+    }
+    try:
+        camera = scene["camera"]
+        rgb = camera.data.output.get("rgb")
+        depth = camera.data.output.get("distance_to_image_plane")
+        if rgb is None or depth is None:
+            meta.update({"reason": "camera_outputs_missing", "rgb_missing": rgb is None, "depth_missing": depth is None})
+            return None, meta
+
+        rgb_np = yolo_tensor_rgb_to_numpy(rgb)
+        print(f"[INFO]: periodic RGB stats at step={int(step_idx)}: {rgb_image_stats(rgb_np)}", flush=True)
+        save_perception_debug_image(rgb_np, tag=f"redetect_{int(step_idx):06d}_before_yolo")
+        intr = compute_camera_intrinsics_from_cfg()
+        T_world_camera = T_world_camera_from_proxy(proxy)
+        detections = run_yolo_if_requested(rgb_np)
+        selected, source, selection_reason = select_perception_detection(
+            detections,
+            intr=intr,
+            T_world_camera=T_world_camera,
+        )
+        meta.update(
+            {
+                "detection_source": source,
+                "selection_reason": selection_reason,
+                "detections": [
+                    {"class_name": d.class_name, "confidence": float(d.confidence), "bbox_xyxy": [float(v) for v in d.bbox_xyxy]}
+                    for d in detections
+                ],
+            }
+        )
+        save_perception_debug_image(
+            rgb_np,
+            tag=f"redetect_{int(step_idx):06d}_after_yolo",
+            detections=detections,
+            selected=selected,
+            source=source,
+        )
+        if selected is None:
+            meta.update({"reason": "no_detection"})
+            return None, meta
+
+        robot_pose = proxy_nav_pose_2d(proxy)
+        cfg = TargetFromBBoxConfig(
+            depth_min_m=float(args_cli.target_depth_min),
+            depth_max_m=float(args_cli.target_depth_max),
+            bbox_center_crop_frac=float(args_cli.target_crop_frac),
+            depth_percentile=float(args_cli.target_depth_percentile),
+            stand_off_distance_m=float(args_cli.stand_off),
+        )
+        depth_source = str(args_cli.target_depth_source)
+        if depth_source == "auto":
+            depth_source = "geometric" if source == "synthetic_projection" else "bbox"
+        if depth_source == "geometric":
+            target_result = known_person_geometry_to_target2d(
+                detection=selected,
+                intrinsics=intr,
+                T_world_camera=T_world_camera,
+                robot_pose=robot_pose,
+                config=cfg,
+            )
+        else:
+            target_result = bbox_depth_tensor_to_target2d(
+                detection=selected,
+                depth=depth,
+                intrinsics=intr,
+                T_world_camera=T_world_camera,
+                robot_pose=robot_pose,
+                config=cfg,
+            )
+        if target_result is None:
+            meta.update({"reason": "target_projection_failed"})
+            return None, meta
+
+        target_xy = (float(target_result.target.x), float(target_result.target.y))
+        object_error = math.hypot(float(target_result.object_xy_w[0]) - float(PERSON_X), float(target_result.object_xy_w[1]) - float(PERSON_Y))
+        meta.update(
+            {
+                "target_valid": True,
+                "reason": "ok",
+                "selected_detection": {
+                    "class_name": selected.class_name,
+                    "confidence": float(selected.confidence),
+                    "bbox_xyxy": [float(v) for v in selected.bbox_xyxy],
+                },
+                "target": {
+                    "depth_m": float(target_result.depth_m),
+                    "depth_source": str(getattr(target_result, "depth_source", depth_source)),
+                    "object_xy_w": [float(target_result.object_xy_w[0]), float(target_result.object_xy_w[1])],
+                    "target_xy_w": [target_xy[0], target_xy[1]],
+                    "object_error_xy_m": float(object_error),
+                    "used_stand_off": bool(target_result.used_stand_off),
+                    "valid_depth_pixels": int(getattr(target_result, "valid_depth_pixels", -1)),
+                    "depth_crop_xyxy": list(getattr(target_result, "depth_crop_xyxy", ())),
+                },
+            }
+        )
+        return target_xy, meta
+    except Exception as exc:
+        meta.update({"reason": "exception", "exception_type": type(exc).__name__, "exception": str(exc)})
+        print(f"[WARN]: periodic target re-detection failed at step={int(step_idx)}: {type(exc).__name__}: {exc}", flush=True)
+        return None, meta
 
 
 def build_rgbd_depth_observation(scene: InteractiveScene) -> torch.Tensor | None:
@@ -3092,6 +3306,19 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
         x=float(target_xy_w[0, 0].detach().cpu().item()),
         y=float(target_xy_w[0, 1].detach().cpu().item()),
     )
+    target_tracker = TargetTracker(
+        TargetTrackerConfig(
+            refresh_period_steps=max(1, int(args_cli.redetect_every)) if int(args_cli.redetect_every) > 0 else 1,
+            occlusion_grace_steps=max(0, int(args_cli.target_occlusion_grace_steps)),
+            smoothing_alpha=float(args_cli.target_smoothing_alpha),
+            max_jump_m=float(args_cli.target_max_jump_m),
+        )
+    )
+    target_tracker.update(step=0, measurement=(float(nav_target.x), float(nav_target.y)))
+    target_redetect_count = 0
+    target_redetect_success_count = 0
+    target_redetect_missed_count = 0
+    target_tracker_lost_step: int | None = None
     nav_start_pose = NavPose2D(
         x=start_xy_w[0],
         y=start_xy_w[1],
@@ -3175,6 +3402,15 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
     )
     print(f"[INFO]: proxy dynamics: {'YAML config' if args_cli.use_config_proxy_dynamics else 'direct baseline mode'}", flush=True)
     print(f"[INFO]: max_steps={args_cli.max_steps}, print_every={args_cli.print_every}, save_every={args_cli.save_every}", flush=True)
+    print(
+        f"[INFO]: periodic target re-detection: "
+        f"{'enabled' if int(args_cli.redetect_every) > 0 else 'disabled'} "
+        f"(every={int(args_cli.redetect_every)} steps, "
+        f"occlusion_grace={int(args_cli.target_occlusion_grace_steps)}, "
+        f"smoothing_alpha={float(args_cli.target_smoothing_alpha):.2f}, "
+        f"max_jump={float(args_cli.target_max_jump_m):.2f} m)",
+        flush=True,
+    )
     for i, obs in enumerate(OBSTACLES):
         print(
             f"  obstacle[{i}]: shape={obs.get('shape')} pos={obs.get('pos')} "
@@ -3322,9 +3558,68 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
         x = float(proxy.pos_w[0, 0].detach().cpu().item())
         y = float(proxy.pos_w[0, 1].detach().cpu().item())
         yaw = float(proxy.yaw[0].detach().cpu().item())
+        current_nav_pose = NavPose2D(x=x, y=y, yaw=yaw)
+
+        if int(args_cli.redetect_every) > 0 and step_idx > 0 and target_tracker.should_refresh(step_idx):
+            target_redetect_count += 1
+            measured_xy, redetect_meta = extract_periodic_redetection_target(scene, proxy, step_idx=step_idx)
+            if measured_xy is None:
+                target_redetect_missed_count += 1
+                tracker_update = target_tracker.update(step=step_idx, measurement=None)
+            else:
+                target_redetect_success_count += 1
+                measurement = TargetMeasurement.from_xy(
+                    measured_xy,
+                    step=step_idx,
+                    confidence=float(redetect_meta.get("selected_detection", {}).get("confidence", 1.0)),
+                    source=str(redetect_meta.get("detection_source", "unknown")),
+                    metadata=redetect_meta,
+                )
+                tracker_update = target_tracker.update(step=step_idx, measurement=measurement)
+
+            if tracker_update.active_target is None:
+                target_tracker_lost_step = step_idx
+                print(
+                    f"[WARN]: target tracker LOST at step={step_idx}; "
+                    f"reason={tracker_update.reason}, redetect_meta={redetect_meta}",
+                    flush=True,
+                )
+                proxy.set_command(torch.zeros((num_envs, 3), dtype=torch.float32, device=device))
+                break
+
+            old_target_xy = (float(nav_target.x), float(nav_target.y))
+            nav_target = NavTarget2D(
+                x=float(tracker_update.active_target.x),
+                y=float(tracker_update.active_target.y),
+            )
+            target_xy_w = torch.tensor([[float(nav_target.x), float(nav_target.y)]], dtype=torch.float32, device=device)
+            target_xy_w_env0 = (float(nav_target.x), float(nav_target.y))
+            target_shift = math.hypot(float(nav_target.x) - old_target_xy[0], float(nav_target.y) - old_target_xy[1])
+
+            if tracker_update.accepted_measurement and target_shift > 1.0e-6:
+                forced_plan = nav_runtime.plan(current_nav_pose, nav_target, live_grid[0]).plan
+                path_xy_w = nav_runtime.current_path_xy_w()
+                print(
+                    f"[INFO]: target re-detected at step={step_idx}: "
+                    f"state={tracker_update.state.value}, reason={tracker_update.reason}, "
+                    f"source={redetect_meta.get('detection_source', 'unknown')}, "
+                    f"raw_xy={tuple(round(v, 3) for v in measured_xy)}, "
+                    f"active_xy=({nav_target.x:.3f}, {nav_target.y:.3f}), "
+                    f"shift={target_shift:.3f}, "
+                    f"plan_found={forced_plan.found}, waypoints={len(forced_plan.path_xy_w)}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[INFO]: target refresh at step={step_idx}: "
+                    f"state={tracker_update.state.value}, reason={tracker_update.reason}, "
+                    f"active_xy=({nav_target.x:.3f}, {nav_target.y:.3f}), "
+                    f"redetect_valid={measured_xy is not None}",
+                    flush=True,
+                )
+
         target_distance = float(torch.linalg.norm(target_xy_w[0] - proxy.pos_w[0, 0:2]).detach().cpu().item())
 
-        current_nav_pose = NavPose2D(x=x, y=y, yaw=yaw)
         nav_step = nav_runtime.step(
             current_nav_pose,
             nav_target,
@@ -3517,6 +3812,12 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
     print(f"[INFO]: replan count: {replan_count}", flush=True)
     print(f"[INFO]: safety override count: {safety_override_count}", flush=True)
     print(f"[INFO]: RGB-D safety override count: {rgbd_safety_override_count}", flush=True)
+    print(
+        f"[INFO]: target re-detection count/success/missed: "
+        f"{target_redetect_count} / {target_redetect_success_count} / {target_redetect_missed_count}",
+        flush=True,
+    )
+    print(f"[INFO]: target tracker lost step: {target_tracker_lost_step}", flush=True)
     print(f"[INFO]: wrote trace: {csv_path}", flush=True)
     print("[INFO]: YOLO/person target + LiDAR navigation smoke test complete.", flush=True)
 
@@ -3557,6 +3858,10 @@ def main() -> None:
     print(f"[INFO]: scenario: {args_cli.scenario}", flush=True)
     print(f"[INFO]: person target root xy: ({PERSON_X:.3f}, {PERSON_Y:.3f})", flush=True)
     print(f"[INFO]: person source: {str(args_cli.person_asset_usd).strip() or 'proxy_humanoid'}", flush=True)
+    if bool(str(args_cli.person_asset_usd).strip()):
+        print(f"[INFO]: person asset composition mode: {args_cli.person_asset_reference_mode}", flush=True)
+    if bool(args_cli.save_perception_images):
+        print(f"[INFO]: perception debug image dir: {perception_image_dir()}", flush=True)
     print(f"[INFO]: requested grid source: {GRID_SOURCE}", flush=True)
     print(
         f"[INFO]: RayCaster mesh mode: {RAYCAST_MESH_MODE} "
