@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Run the high-level bridge in dry-run mode.
+
+Default mode uses synthetic observations and is fully hardware-free. RealSense
+and Livox/MID-360 sources can be enabled independently for dry-run bridge
+validation. Commands are still logged only through ``DryRunCommandSink``; no
+robot motion is possible from this script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from adapters import (
+    Command2D,
+    DryRunCommandSink,
+    LidarFrame,
+    Pose2D,
+    RealBridge,
+    RealBridgeConfig,
+    CompositeDryRunObservationProvider,
+    RealSenseDryRunObservationProvider,
+    RealSenseRGBDAdapter,
+    RealSenseRGBDAdapterConfig,
+    RobotObservation,
+    RobotState,
+    load_adapter_config,
+)
+from adapters.safety_supervisor import SafetySupervisor
+from adapters.real_livox import LivoxAdapterConfig, NpyLivoxReplayAdapter, UnitreeVibesLivox2Adapter, UnitreeVibesLivox2AdapterConfig
+
+
+def _default_config_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "configs" / "real_g1.yaml"
+
+
+@dataclass
+class SyntheticObservationProvider:
+    """Minimal observation provider used until live real adapters are wired."""
+
+    config: Any
+    clock: Any = time.monotonic
+    x: float = 0.0
+    y: float = 0.0
+    yaw: float = 0.0
+    obstacle_front_m: float | None = None
+
+    def read_observation(self) -> RobotObservation:
+        now_s = float(self.clock())
+        pose = Pose2D(self.x, self.y, self.yaw)
+        robot_state = RobotState(
+            timestamp_s=now_s,
+            pose=pose,
+            mode="synthetic_dryrun",
+            battery_percent=100.0,
+            is_estopped=False,
+            is_faulted=False,
+            details={"synthetic": True},
+        )
+
+        if self.obstacle_front_m is None:
+            points = np.array([[2.0, 1.1, 0.35], [3.0, -1.2, 0.45]], dtype=np.float32)
+        else:
+            points = np.array([[float(self.obstacle_front_m), 0.0, 0.35]], dtype=np.float32)
+
+        lidar = LidarFrame(
+            timestamp_s=now_s,
+            points_body_xyz=points,
+            source_frame_id=self.config.lidar.source_frame_id,
+            T_body_lidar=self.config.lidar.T_body_lidar,
+            metadata={"synthetic": True},
+        )
+        return RobotObservation(
+            timestamp_s=now_s,
+            pose=pose,
+            lidar=lidar,
+            robot_state=robot_state,
+            metadata={"source": "SyntheticObservationProvider"},
+        )
+
+
+@dataclass
+class ConstantVelocityPolicy:
+    vx: float
+    vy: float
+    wz: float
+    source: str = "constant_velocity_policy"
+
+    def step(self, observation: RobotObservation) -> Command2D:
+        return Command2D(self.vx, self.vy, self.wz, timestamp_s=observation.timestamp_s, source=self.source)
+
+
+class _TimeoutRealSenseAdapter:
+    """Small wrapper so RealSenseDryRunObservationProvider can use a timeout."""
+
+    def __init__(self, adapter: RealSenseRGBDAdapter, *, timeout_ms: int) -> None:
+        self.adapter = adapter
+        self.timeout_ms = int(timeout_ms)
+
+    def read_frame(self):
+        return self.adapter.read_frame(timeout_ms=self.timeout_ms)
+
+
+def _result_to_dict(result: Any) -> dict[str, Any]:
+    decision = result.safety_decision
+    command_result = result.command_result
+    obs = result.observation
+    return {
+        "mode": result.mode.value,
+        "action": result.action,
+        "status_health": result.status.health.value,
+        "status_message": result.status.message,
+        "proposed_command": None if result.proposed_command is None else list(result.proposed_command.tuple),
+        "safe_command": None if decision is None else list(decision.command.tuple),
+        "safety_reasons": [] if decision is None else list(decision.reasons),
+        "safety_warnings": [] if decision is None else list(decision.warnings),
+        "command_accepted": None if command_result is None else command_result.accepted,
+        "observation_source": None if obs is None else obs.metadata.get("source"),
+        "has_rgbd": None if obs is None else obs.has_rgbd,
+        "has_lidar": None if obs is None else obs.has_lidar,
+        "has_robot_state": None if obs is None else obs.robot_state is not None,
+        "sensor_ages_s": None if obs is None else obs.sensor_ages_s(),
+        "rgbd_shape": None if obs is None or obs.rgbd is None else [obs.rgbd.height, obs.rgbd.width, 3],
+        "rgbd_live": None if obs is None else obs.metadata.get("rgbd_live", False),
+        "lidar_synthetic": None if obs is None else obs.metadata.get("lidar_synthetic", obs.lidar is not None),
+        "robot_state_synthetic": None if obs is None else obs.metadata.get("robot_state_synthetic", obs.robot_state is not None),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=_default_config_path(), help="Adapter YAML config path.")
+    parser.add_argument("--steps", type=int, default=5, help="Number of bridge iterations.")
+    parser.add_argument("--dt", type=float, default=0.10, help="Sleep between iterations.")
+    parser.add_argument("--vx", type=float, default=0.05, help="Requested policy vx in m/s.")
+    parser.add_argument("--vy", type=float, default=0.0, help="Requested policy vy in m/s.")
+    parser.add_argument("--wz", type=float, default=0.0, help="Requested policy wz in rad/s.")
+    parser.add_argument("--obstacle-front-m", type=float, default=None, help="Optional synthetic front obstacle distance.")
+    parser.add_argument(
+        "--observation-source",
+        choices=("synthetic", "realsense", "livox-npy", "livox-live-vibes", "realsense-livox-npy", "realsense-livox-live-vibes"),
+        default="synthetic",
+        help="Observation provider. Real-sensor modes remain dry-run and never send robot motion.",
+    )
+    parser.add_argument("--realsense-serial", default=None, help="Optional RealSense serial number.")
+    parser.add_argument("--realsense-timeout-ms", type=int, default=1000, help="RealSense wait_for_frames timeout.")
+    parser.add_argument("--no-realsense-spatial-filter", action="store_true", help="Disable RealSense spatial filter.")
+    parser.add_argument("--no-realsense-temporal-filter", action="store_true", help="Disable RealSense temporal filter.")
+    parser.add_argument("--livox-npy-path", type=Path, default=None, help=".npy with Nx3 or FxNx3 Livox-frame points for replay modes.")
+    parser.add_argument(
+        "--loop-livox-npy",
+        dest="loop_livox_npy",
+        action="store_true",
+        default=True,
+        help="Loop Livox .npy replay if steps exceed frames. Enabled by default for multi-step dry-runs.",
+    )
+    parser.add_argument(
+        "--no-loop-livox-npy",
+        dest="loop_livox_npy",
+        action="store_false",
+        help="Disable Livox .npy looping and fail when replay frames are exhausted.",
+    )
+    parser.add_argument("--unitree-vibes-dir", default=None, help="Path to unitree_g1_vibes repo for live-vibes LiDAR mode.")
+    parser.add_argument("--livox-config", default=None, help="Livox-SDK2 JSON config path for live-vibes LiDAR mode.")
+    parser.add_argument("--host-ip", default=None, help="Host IP passed to Livox2 in live-vibes LiDAR mode.")
+    parser.add_argument("--livox-frame-time", type=float, default=0.20, help="Livox packet aggregation window.")
+    parser.add_argument("--livox-frame-packets", type=int, default=120, help="Livox packet aggregation count.")
+    parser.add_argument("--livox-timeout", type=float, default=2.0, help="Timeout waiting for live Livox frames.")
+    parser.add_argument("--json-lines", action="store_true", help="Print one JSON object per step.")
+    args = parser.parse_args()
+
+    if args.steps < 1:
+        raise SystemExit("--steps must be >= 1")
+    if args.dt < 0.0:
+        raise SystemExit("--dt must be non-negative")
+    if args.realsense_timeout_ms <= 0:
+        raise SystemExit("--realsense-timeout-ms must be > 0")
+    if args.livox_timeout <= 0.0:
+        raise SystemExit("--livox-timeout must be > 0")
+
+    cfg = load_adapter_config(args.config)
+    realsense_adapter: RealSenseRGBDAdapter | None = None
+    livox_adapter: Any | None = None
+
+    uses_realsense = args.observation_source in {"realsense", "realsense-livox-npy", "realsense-livox-live-vibes"}
+    uses_livox_npy = args.observation_source in {"livox-npy", "realsense-livox-npy"}
+    uses_livox_live = args.observation_source in {"livox-live-vibes", "realsense-livox-live-vibes"}
+
+    rgbd_source = None
+    if uses_realsense:
+        rs_cfg = RealSenseRGBDAdapterConfig.from_camera_config(
+            cfg.camera,
+            serial_number=args.realsense_serial,
+            use_spatial_filter=not args.no_realsense_spatial_filter,
+            use_temporal_filter=not args.no_realsense_temporal_filter,
+        )
+        realsense_adapter = RealSenseRGBDAdapter(rs_cfg)
+        realsense_adapter.start()
+        rgbd_source = _TimeoutRealSenseAdapter(realsense_adapter, timeout_ms=args.realsense_timeout_ms)
+
+    lidar_source = None
+    if uses_livox_npy:
+        if args.livox_npy_path is None:
+            raise SystemExit("--livox-npy-path is required for livox-npy modes")
+        lidar_source = NpyLivoxReplayAdapter(
+            args.livox_npy_path,
+            LivoxAdapterConfig.from_lidar_config(cfg.lidar),
+            loop=args.loop_livox_npy,
+        )
+    elif uses_livox_live:
+        if not args.livox_config:
+            raise SystemExit("--livox-config is required for live-vibes LiDAR modes")
+        if not args.host_ip:
+            raise SystemExit("--host-ip is required for live-vibes LiDAR modes")
+        livox_adapter = UnitreeVibesLivox2Adapter(
+            UnitreeVibesLivox2AdapterConfig(
+                livox_config_path=args.livox_config,
+                host_ip=args.host_ip,
+                adapter_config=LivoxAdapterConfig.from_lidar_config(cfg.lidar),
+                unitree_vibes_dir=args.unitree_vibes_dir,
+                frame_time_s=args.livox_frame_time,
+                frame_packets=args.livox_frame_packets,
+                read_timeout_s=args.livox_timeout,
+            )
+        )
+        livox_adapter.start()
+        lidar_source = livox_adapter
+
+    if args.observation_source == "synthetic":
+        provider = SyntheticObservationProvider(config=cfg, obstacle_front_m=args.obstacle_front_m)
+    elif args.observation_source == "realsense":
+        provider = RealSenseDryRunObservationProvider(rgbd_adapter=rgbd_source, config=cfg)
+    else:
+        provider = CompositeDryRunObservationProvider(
+            config=cfg,
+            rgbd_adapter=rgbd_source,
+            lidar_adapter=lidar_source,
+            include_synthetic_lidar_if_missing=False,
+        )
+
+    policy = ConstantVelocityPolicy(args.vx, args.vy, args.wz)
+    supervisor = SafetySupervisor.from_runtime_config(cfg)
+    sink = DryRunCommandSink(name="dryrun_bridge_sink")
+    bridge = RealBridge(
+        observation_provider=provider,
+        policy_runtime=policy,
+        safety_supervisor=supervisor,
+        command_sink=sink,
+        config=RealBridgeConfig(name="real_g1_follow_dryrun", send_commands=True),
+    )
+
+    try:
+        status = bridge.follow()
+        if not args.json_lines:
+            print(f"[INFO]: bridge command: follow -> {status.health.value}: {status.message}")
+            print(f"[INFO]: observation_source={args.observation_source}")
+            if uses_realsense and not (uses_livox_npy or uses_livox_live):
+                print("[INFO]: using live RealSense RGB-D; LiDAR and robot state remain synthetic placeholders")
+            elif (uses_livox_npy or uses_livox_live) and not uses_realsense:
+                print("[INFO]: using Livox/MID-360 LiDAR source; robot state remains synthetic placeholder")
+            elif uses_realsense and (uses_livox_npy or uses_livox_live):
+                print("[INFO]: using live RealSense RGB-D and Livox/MID-360 LiDAR source; robot state remains synthetic placeholder")
+            if uses_livox_npy:
+                print(f"[INFO]: Livox .npy replay loop={args.loop_livox_npy}")
+
+        exit_code = 0
+        for i in range(args.steps):
+            result = bridge.step()
+            row = {"step": i, **_result_to_dict(result)}
+            if args.json_lines:
+                print(json.dumps(row, sort_keys=True))
+            else:
+                print(
+                    f"[INFO]: step={i} mode={row['mode']} action={row['action']} "
+                    f"health={row['status_health']} proposed={row['proposed_command']} safe={row['safe_command']} "
+                    f"accepted={row['command_accepted']} has_rgbd={row['has_rgbd']} "
+                    f"reasons={row['safety_reasons']} warnings={row['safety_warnings']}"
+                )
+            if result.status.health.value == "fault":
+                exit_code = 1
+            if args.dt > 0.0 and i + 1 < args.steps:
+                time.sleep(args.dt)
+
+        stop_status = bridge.stop()
+        if not args.json_lines:
+            print(f"[INFO]: bridge command: stop -> {stop_status.health.value}: {stop_status.message}")
+            print(f"[INFO]: dry-run commands logged: {len(sink.sent_commands)} stop_count={sink.stop_count}")
+        return exit_code
+    finally:
+        if realsense_adapter is not None:
+            realsense_adapter.stop()
+        if livox_adapter is not None and hasattr(livox_adapter, "stop"):
+            livox_adapter.stop()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
