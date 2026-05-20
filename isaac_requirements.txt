@@ -1,0 +1,42 @@
+# Isaac / simulation environment
+# Tested with Isaac Sim 5.1.0 and IsaacLab from source.
+
+-e git+https://github.com/isaac-sim/IsaacLab.git@3e73d6dd79080fd7632488c061052a6edd52e230#egg=isaaclab&subdirectory=source/isaaclab
+-e git+https://github.com/isaac-sim/IsaacLab.git@3e73d6dd79080fd7632488c061052a6edd52e230#egg=isaaclab_assets&subdirectory=source/isaaclab_assets
+-e git+https://github.com/isaac-sim/IsaacLab.git@3e73d6dd79080fd7632488c061052a6edd52e230#egg=isaaclab_contrib&subdirectory=source/isaaclab_contrib
+-e git+https://github.com/isaac-sim/IsaacLab.git@3e73d6dd79080fd7632488c061052a6edd52e230#egg=isaaclab_mimic&subdirectory=source/isaaclab_mimic
+-e git+https://github.com/isaac-sim/IsaacLab.git@3e73d6dd79080fd7632488c061052a6edd52e230#egg=isaaclab_rl&subdirectory=source/isaaclab_rl
+-e git+https://github.com/isaac-sim/IsaacLab.git@3e73d6dd79080fd7632488c061052a6edd52e230#egg=isaaclab_tasks&subdirectory=source/isaaclab_tasks
+
+isaacsim==5.1.0.0
+isaacsim-app==5.1.0.0
+isaacsim-core==5.1.0.0
+isaacsim-sensor==5.1.0.0
+isaacsim-asset==5.1.0.0
+isaacsim-robot==5.1.0.0
+isaacsim-robot-motion==5.1.0.0
+isaacsim-utils==5.1.0.0
+isaacsim-gui==5.1.0.0
+isaacsim-replicator==5.1.0.0
+isaacsim-rl==5.1.0.0
+isaacsim-storage==5.1.0.0
+
+# Core numerics / config / debugging
+numpy==1.26.0
+PyYAML==6.0.2
+scipy==1.15.3
+matplotlib==3.10.3
+pillow==11.3.0
+pytransform3d==3.15.0
+trimesh==4.5.1
+
+# Perception
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+ultralytics==8.4.51
+ultralytics-thop==2.0.19
+opencv-python-headless==4.11.0.86
+
+# Testing
+pytest==9.0.3
+pytest-mock==3.15.1

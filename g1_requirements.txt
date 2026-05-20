@@ -1,0 +1,31 @@
+# Real G1 / Jetson / hardware-side requirements
+
+# Core
+numpy==1.26.0
+PyYAML==6.0.2
+pillow==11.3.0
+matplotlib==3.10.3
+pytransform3d==3.15.0
+scipy==1.15.3
+python-dotenv==1.2.2
+tqdm==4.67.3
+kiss-icp
+ctypeslib2
+
+# Computer vision
+opencv-python-headless==4.11.0.86
+open3d==0.16.0
+
+# RealSense RGB-D
+pyrealsense2==2.57.7.10387
+
+# YOLO / perception
+ultralytics==8.4.51
+ultralytics-thop==2.0.19
+
+# Testing
+pytest==9.0.3
+pytest-mock==3.15.1
+
+
+
