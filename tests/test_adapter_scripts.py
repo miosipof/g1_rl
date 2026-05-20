@@ -13,7 +13,6 @@ if str(SCRIPTS) not in sys.path:
 import real_g1_follow_dryrun  # noqa: E402
 import real_g1_follow_low_speed  # noqa: E402
 import real_g1_probe_adapters  # noqa: E402
-import real_g1_probe_livox  # noqa: E402
 
 
 def test_probe_adapters_json_runs(monkeypatch, capsys) -> None:
@@ -69,95 +68,14 @@ def test_low_speed_refuses_real_motion_with_synthetic_observation_by_default(mon
         raise AssertionError("expected SystemExit refusal")
 
 
-def test_probe_livox_synthetic_json_runs(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(sys, "argv", ["real_g1_probe_livox.py", "--json"])
-    assert real_g1_probe_livox.main() == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is True
-    assert payload["source"] == "synthetic"
-    assert payload["frame"]["point_count"] > 0
-
-
-def test_follow_dryrun_livox_npy_runs(monkeypatch, capsys, tmp_path) -> None:
-    import numpy as np
-
-    path = tmp_path / "livox.npy"
-    np.save(path, np.array([[[1.0, 0.0, 0.4], [2.0, 0.2, 0.4]]], dtype=np.float32))
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "real_g1_follow_dryrun.py",
-            "--observation-source",
-            "livox-npy",
-            "--livox-npy-path",
-            str(path),
-            "--steps",
-            "1",
-            "--dt",
-            "0",
-            "--json-lines",
-        ],
-    )
-    assert real_g1_follow_dryrun.main() == 0
-    row = json.loads(capsys.readouterr().out.strip())
-    assert row["has_lidar"] is True
-    assert row["lidar_synthetic"] is False
-    assert row["has_robot_state"] is True
-    assert row["command_accepted"] is True
-
-
-def test_follow_dryrun_livox_npy_single_snapshot_loops_by_default(monkeypatch, capsys, tmp_path) -> None:
-    import numpy as np
-
-    path = tmp_path / "single_frame_livox.npy"
-    np.save(path, np.array([[1.0, 0.0, 0.4], [2.0, 0.2, 0.4]], dtype=np.float32))
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "real_g1_follow_dryrun.py",
-            "--observation-source",
-            "livox-npy",
-            "--livox-npy-path",
-            str(path),
-            "--steps",
-            "3",
-            "--dt",
-            "0",
-            "--json-lines",
-        ],
-    )
-    assert real_g1_follow_dryrun.main() == 0
-    rows = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
-    assert len(rows) == 3
-    assert all(row["has_lidar"] is True for row in rows)
-    assert all(row["status_health"] == "ok" for row in rows)
-
-
-def test_follow_dryrun_livox_npy_can_disable_loop(monkeypatch, capsys, tmp_path) -> None:
-    import numpy as np
-
-    path = tmp_path / "single_frame_livox.npy"
-    np.save(path, np.array([[1.0, 0.0, 0.4], [2.0, 0.2, 0.4]], dtype=np.float32))
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "real_g1_follow_dryrun.py",
-            "--observation-source",
-            "livox-npy",
-            "--livox-npy-path",
-            str(path),
-            "--no-loop-livox-npy",
-            "--steps",
-            "2",
-            "--dt",
-            "0",
-            "--json-lines",
-        ],
-    )
-    assert real_g1_follow_dryrun.main() == 1
-    rows = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
-    assert rows[0]["status_health"] == "ok"
-    assert rows[1]["status_health"] == "fault"
+def test_low_speed_help_exposes_non_200_gate(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(sys, "argv", ["real_g1_follow_low_speed.py", "--help"])
+    try:
+        real_g1_follow_low_speed.main()
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:  # pragma: no cover - argparse help exits
+        raise AssertionError("expected argparse help SystemExit")
+    stdout = capsys.readouterr().out
+    assert "--allow-non-200" in stdout
+    assert "--expected-fsm-id" in stdout

@@ -15,6 +15,7 @@ before using this for real target following.
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,29 @@ def main() -> int:
     parser.add_argument("--wz", type=float, default=0.0, help="Requested low-speed wz in rad/s.")
     parser.add_argument("--obstacle-front-m", type=float, default=None, help="Optional synthetic front obstacle distance.")
     parser.add_argument(
+        "--expected-fsm-id",
+        type=int,
+        default=200,
+        help="Expected Unitree loco fsm_id for real motion. Default: 200. Use 501 for the current G1 session if validated.",
+    )
+    parser.add_argument(
+        "--allow-non-200",
+        action="store_true",
+        help="Allow real motion when fsm_id is not 200 by disabling the fsm_id equality gate. The blocked fsm_mode gate remains active.",
+    )
+    parser.add_argument(
+        "--state-samples",
+        type=int,
+        default=3,
+        help="Number of Unitree loco state samples to read before each real command.",
+    )
+    parser.add_argument(
+        "--state-interval-s",
+        type=float,
+        default=0.05,
+        help="Delay between Unitree loco state samples used by the motion gate.",
+    )
+    parser.add_argument(
         "--yes-i-understand-this-moves-the-robot",
         action="store_true",
         help="Disable dry-run and allow Unitree Move commands. Use only in a clear test area.",
@@ -57,6 +81,10 @@ def main() -> int:
         raise SystemExit("--steps must be >= 1")
     if args.dt < 0.0:
         raise SystemExit("--dt must be non-negative")
+    if args.state_samples < 1:
+        raise SystemExit("--state-samples must be >= 1")
+    if args.state_interval_s < 0.0:
+        raise SystemExit("--state-interval-s must be non-negative")
 
     real_motion = bool(args.yes_i_understand_this_moves_the_robot)
     if real_motion and not args.allow_synthetic_observation_motion:
@@ -69,8 +97,20 @@ def main() -> int:
     provider = SyntheticObservationProvider(config=cfg, obstacle_front_m=args.obstacle_front_m)
     policy = ConstantVelocityPolicy(args.vx, args.vy, args.wz, source="low_speed_constant_policy")
     supervisor = SafetySupervisor.from_runtime_config(cfg)
+    # Match unitree_g1_vibes/g1_loco_nudge_test.py behavior while making
+    # the gate explicit.  On the current robot we observed fsm_id=501, so
+    # --allow-non-200 disables only the fsm_id equality check; fsm_mode blocks
+    # and the low-speed command limiter remain active.
+    require_fsm_id = None if args.allow_non_200 else int(args.expected_fsm_id)
     sink = UnitreeLocoAdapter(
-        config=UnitreeLocoAdapterConfig(iface=args.iface, dry_run=not real_motion, require_arm=True),
+        config=UnitreeLocoAdapterConfig(
+            iface=args.iface,
+            dry_run=not real_motion,
+            require_arm=True,
+            require_fsm_id=require_fsm_id,
+            state_samples=args.state_samples,
+            state_interval_s=args.state_interval_s,
+        ),
         command_limits=cfg.command_limits,
     )
 
@@ -78,10 +118,13 @@ def main() -> int:
     print(f"[INFO]: config={args.config}")
     print(f"[INFO]: iface={args.iface}")
     print(f"[INFO]: real_motion={real_motion}")
+    print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
     if not real_motion:
         print("[INFO]: dry-run mode: no Unitree Move command will be sent")
     else:
         print("[WARN]: REAL MOTION ENABLED; keep an operator ready to stop the robot")
+        if args.allow_non_200:
+            print("[WARN]: --allow-non-200 enabled: fsm_id equality gate is disabled; fsm_mode gate and command limits remain active")
 
     bridge = RealBridge(
         observation_provider=provider,
@@ -99,14 +142,25 @@ def main() -> int:
         for i in range(args.steps):
             result = bridge.step()
             row: dict[str, Any] = _result_to_dict(result)
+            command_status = None if result.command_result is None else result.command_result.status
+            command_health = None if command_status is None else command_status.health.value
+            command_message = None if command_status is None else command_status.message
+            command_details = {} if command_status is None else dict(command_status.details)
             print(
                 f"[INFO]: step={i} mode={row['mode']} action={row['action']} "
                 f"health={row['status_health']} proposed={row['proposed_command']} safe={row['safe_command']} "
-                f"accepted={row['command_accepted']} reasons={row['safety_reasons']} warnings={row['safety_warnings']}"
+                f"accepted={row['command_accepted']} command_health={command_health} "
+                f"command_message={command_message!r} reasons={row['safety_reasons']} warnings={row['safety_warnings']}"
             )
+            if command_details:
+                print(f"[INFO]: command_details={json.dumps(command_details, sort_keys=True, default=str)}")
             if result.status.health.value == "fault":
                 exit_code = 1
                 break
+            if result.command_result is not None and not result.command_result.accepted:
+                exit_code = 1
+                if real_motion:
+                    break
             if args.dt > 0.0 and i + 1 < args.steps:
                 time.sleep(args.dt)
     finally:
