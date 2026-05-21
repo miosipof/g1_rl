@@ -41,6 +41,9 @@ def main() -> int:
     parser.add_argument("--vx", type=float, default=0.03, help="Requested low-speed vx in m/s.")
     parser.add_argument("--vy", type=float, default=0.0, help="Requested low-speed vy in m/s.")
     parser.add_argument("--wz", type=float, default=0.0, help="Requested low-speed wz in rad/s.")
+    parser.add_argument("--command-vx-scale", type=float, default=1.0, help="Final vx scale/sign applied before Unitree Move().")
+    parser.add_argument("--command-vy-scale", type=float, default=1.0, help="Final vy scale/sign applied before Unitree Move().")
+    parser.add_argument("--command-wz-scale", type=float, default=1.0, help="Final wz scale/sign applied before Unitree Move(); use -1 if yaw sign is inverted.")
     parser.add_argument("--obstacle-front-m", type=float, default=None, help="Optional synthetic front obstacle distance.")
     parser.add_argument(
         "--expected-fsm-id",
@@ -108,6 +111,9 @@ def main() -> int:
             dry_run=not real_motion,
             require_arm=True,
             require_fsm_id=require_fsm_id,
+            command_vx_scale=args.command_vx_scale,
+            command_vy_scale=args.command_vy_scale,
+            command_wz_scale=args.command_wz_scale,
             state_samples=args.state_samples,
             state_interval_s=args.state_interval_s,
         ),
@@ -119,6 +125,7 @@ def main() -> int:
     print(f"[INFO]: iface={args.iface}")
     print(f"[INFO]: real_motion={real_motion}")
     print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
+    print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
     if not real_motion:
         print("[INFO]: dry-run mode: no Unitree Move command will be sent")
     else:

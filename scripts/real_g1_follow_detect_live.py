@@ -424,6 +424,9 @@ def main() -> int:
     parser.add_argument("--allow-non-200", action="store_true", help="Disable fsm_id equality gate; fsm_mode gate remains active.")
     parser.add_argument("--state-samples", type=int, default=3, help="Unitree loco state samples per command.")
     parser.add_argument("--state-interval-s", type=float, default=0.05, help="Delay between state samples.")
+    parser.add_argument("--command-vx-scale", type=float, default=1.0, help="Final vx scale/sign applied before Unitree Move().")
+    parser.add_argument("--command-vy-scale", type=float, default=1.0, help="Final vy scale/sign applied before Unitree Move().")
+    parser.add_argument("--command-wz-scale", type=float, default=1.0, help="Final wz scale/sign applied before Unitree Move(); use -1 if yaw sign is inverted.")
     parser.add_argument("--yes-i-understand-this-moves-the-robot", action="store_true", help="Enable real Unitree Move commands.")
     parser.add_argument("--allow-synthetic-robot-state-motion", action="store_true", help="Required for real motion until real RobotState provider is implemented.")
     args = parser.parse_args()
@@ -525,6 +528,9 @@ def main() -> int:
             dry_run=not real_motion,
             require_arm=True,
             require_fsm_id=require_fsm_id,
+            command_vx_scale=args.command_vx_scale,
+            command_vy_scale=args.command_vy_scale,
+            command_wz_scale=args.command_wz_scale,
             state_samples=args.state_samples,
             state_interval_s=args.state_interval_s,
         ),
@@ -547,6 +553,7 @@ def main() -> int:
     print(f"[INFO]: real_motion={real_motion}")
     print(f"[INFO]: yolo_model={args.yolo_model!r} yolo_device={args.yolo_device!r} redetect_every={args.redetect_every}")
     print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
+    print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
     if args.save_lidar_debug:
         print(f"[INFO]: LiDAR debug artifacts: {args.save_lidar_debug}")
     if args.save_rgbd_debug:

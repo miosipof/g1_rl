@@ -130,6 +130,33 @@ def test_unitree_adapter_requires_arm_and_clips_before_send() -> None:
     assert client.moves[-1][0] == pytest.approx((0.10, -0.03, 0.20))
 
 
+
+
+def test_unitree_adapter_applies_final_sdk_command_mapping() -> None:
+    client = _FakeClient()
+    adapter = UnitreeLocoAdapter(
+        config=UnitreeLocoAdapterConfig(
+            require_arm=False,
+            require_fsm_id=200,
+            blocked_fsm_modes=(2,),
+            command_vx_scale=1.0,
+            command_vy_scale=-1.0,
+            command_wz_scale=-1.0,
+        ),
+        command_limits=_limits(),
+        client=client,
+        state_reader=lambda _: {"fsm_id": 200, "fsm_mode": 0},
+        clock=lambda: 11.0,
+    )
+
+    accepted = adapter.send_command(Command2D(0.08, 0.02, 0.10, timestamp_s=2.0))
+    assert accepted.ok
+    assert accepted.command.tuple == pytest.approx((0.08, -0.02, -0.10))
+    assert client.moves[-1][0] == pytest.approx((0.08, -0.02, -0.10))
+    assert accepted.status.details["clipped_command"] == {"vx": 0.08, "vy": 0.02, "wz": 0.10}
+    assert accepted.status.details["sdk_command"] == {"vx": 0.08, "vy": -0.02, "wz": -0.10}
+
+
 def test_unitree_adapter_state_gate_rejects_bad_state_but_stop_bypasses_gate() -> None:
     client = _FakeClient()
     adapter = UnitreeLocoAdapter(

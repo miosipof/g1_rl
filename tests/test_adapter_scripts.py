@@ -79,6 +79,7 @@ def test_low_speed_help_exposes_non_200_gate(monkeypatch, capsys) -> None:
     stdout = capsys.readouterr().out
     assert "--allow-non-200" in stdout
     assert "--expected-fsm-id" in stdout
+    assert "--command-wz-scale" in stdout
 
 
 def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> None:
@@ -96,3 +97,4 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--allow-synthetic-robot-state-motion" in stdout
     assert "--allow-non-200" in stdout
     assert "--redetect-every" in stdout
+    assert "--command-wz-scale" in stdout

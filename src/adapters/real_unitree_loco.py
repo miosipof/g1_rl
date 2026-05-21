@@ -46,6 +46,9 @@ class UnitreeLocoAdapterConfig:
     require_arm: bool = True
     require_fsm_id: int | None = 200
     blocked_fsm_modes: tuple[int, ...] = (2,)
+    command_vx_scale: float = 1.0
+    command_vy_scale: float = 1.0
+    command_wz_scale: float = 1.0
     state_samples: int = 1
     state_interval_s: float = 0.05
     stop_on_close: bool = True
@@ -61,6 +64,11 @@ class UnitreeLocoAdapterConfig:
             raise ValueError("state_samples must be >= 1")
         if self.state_interval_s < 0.0 or not math.isfinite(self.state_interval_s):
             raise ValueError("state_interval_s must be non-negative and finite")
+        for name in ("command_vx_scale", "command_vy_scale", "command_wz_scale"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or abs(value) > 10.0:
+                raise ValueError(f"{name} must be finite with |scale| <= 10")
+            object.__setattr__(self, name, value)
         object.__setattr__(self, "blocked_fsm_modes", tuple(int(v) for v in self.blocked_fsm_modes))
 
 
@@ -114,6 +122,34 @@ def call_move_with_sdk_compat(client: Any, command: Command2D) -> Any:
             return move(command.vx, command.vy, command.wz, continuous_move=True)
         except TypeError:
             return move(command.vx, command.vy, command.wz)
+
+
+def map_command_for_sdk(command: Command2D, config: UnitreeLocoAdapterConfig) -> Command2D:
+    """Apply final sim-to-real command mapping before calling Unitree ``Move``.
+
+    The policy/safety stack uses the project convention ``vx`` forward, ``vy``
+    left, and ``wz`` positive yaw.  Real robots can differ in sign conventions
+    or scaling.  These scale factors are deliberately applied at the final
+    command-sink boundary, after high-level safety clipping, so they can be
+    calibrated without changing planner/perception code.
+    """
+
+    return Command2D(
+        vx=float(command.vx) * float(config.command_vx_scale),
+        vy=float(command.vy) * float(config.command_vy_scale),
+        wz=float(command.wz) * float(config.command_wz_scale),
+        timestamp_s=command.timestamp_s,
+        source=f"{command.source}|unitree_sdk_mapped",
+        metadata=dict(command.metadata)
+        | {
+            "unitree_command_mapping": {
+                "vx_scale": config.command_vx_scale,
+                "vy_scale": config.command_vy_scale,
+                "wz_scale": config.command_wz_scale,
+            },
+            "pre_mapping_command": {"vx": command.vx, "vy": command.vy, "wz": command.wz},
+        },
+    )
 
 
 def call_stop_move(client: Any) -> Any:
@@ -419,10 +455,11 @@ class UnitreeLocoAdapter:
         """Send a bounded command to the real or dry-run command sink."""
 
         clipped = self.command_limits.clip(command) if self.command_limits is not None else command
-        self.command_log.append(clipped)
+        sdk_command = map_command_for_sdk(clipped, self.config)
+        self.command_log.append(sdk_command)
 
         if self.config.require_arm and not self._armed:
-            return self._reject(clipped, "adapter is not armed", health=AdapterHealth.DEGRADED)
+            return self._reject(sdk_command, "adapter is not armed", health=AdapterHealth.DEGRADED)
 
         if not self.connected:
             status = self.connect()
@@ -434,14 +471,14 @@ class UnitreeLocoAdapter:
                 ok, reasons, samples = self.check_state_gate()
             except Exception as exc:
                 return self._reject(
-                    clipped,
+                    sdk_command,
                     f"state gate read failed: {exc!r}",
                     health=AdapterHealth.FAULT,
                     details={"exception_type": type(exc).__name__, "exception": repr(exc)},
                 )
             if not ok:
                 return self._reject(
-                    clipped,
+                    sdk_command,
                     "state gate rejected motion",
                     health=AdapterHealth.DEGRADED,
                     details={"reasons": reasons, "samples": [dict(s) for s in samples]},
@@ -449,28 +486,38 @@ class UnitreeLocoAdapter:
 
         if self.config.dry_run:
             assert self._dry_sink is not None
-            return self._dry_sink.send(clipped)
+            return self._dry_sink.send(sdk_command)
 
         if self._client is None:
-            return self._reject(clipped, "Unitree client unavailable", health=AdapterHealth.FAULT)
+            return self._reject(sdk_command, "Unitree client unavailable", health=AdapterHealth.FAULT)
 
         try:
-            code = call_move_with_sdk_compat(self._client, clipped)
+            code = call_move_with_sdk_compat(self._client, sdk_command)
             return AdapterCommandResult(
                 accepted=True,
-                command=clipped,
+                command=sdk_command,
                 status=AdapterStatus(
                     name="unitree_loco",
                     health=AdapterHealth.OK,
-                    timestamp_s=clipped.timestamp_s if clipped.timestamp_s is not None else self._clock(),
+                    timestamp_s=sdk_command.timestamp_s if sdk_command.timestamp_s is not None else self._clock(),
                     message="Move command sent",
-                    details={"code": code, "dry_run": False},
+                    details={
+                        "code": code,
+                        "dry_run": False,
+                        "clipped_command": {"vx": clipped.vx, "vy": clipped.vy, "wz": clipped.wz},
+                        "sdk_command": {"vx": sdk_command.vx, "vy": sdk_command.vy, "wz": sdk_command.wz},
+                        "command_mapping": {
+                            "vx_scale": self.config.command_vx_scale,
+                            "vy_scale": self.config.command_vy_scale,
+                            "wz_scale": self.config.command_wz_scale,
+                        },
+                    },
                 ),
             )
         except Exception as exc:
             return AdapterCommandResult(
                 accepted=False,
-                command=clipped,
+                command=sdk_command,
                 status=AdapterStatus(
                     name="unitree_loco",
                     health=AdapterHealth.FAULT,
@@ -564,6 +611,7 @@ __all__ = [
     "UnitreeLocoAdapter",
     "UnitreeLocoAdapterConfig",
     "call_move_with_sdk_compat",
+    "map_command_for_sdk",
     "call_stop_move",
     "gate_loco_state",
     "load_loco_api_constants",
