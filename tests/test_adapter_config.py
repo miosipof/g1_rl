@@ -17,7 +17,12 @@ def test_load_real_g1_config_profile() -> None:
     assert cfg.camera.intrinsics is None
     assert cfg.camera.T_body_camera.target_frame == "body"
     assert cfg.lidar.T_body_lidar.target_frame == "body"
-    assert cfg.command_limits.vx_max <= 0.10
+    # real_g1.yaml is the single active real-robot profile.
+    # It now reflects the empirically tested G1 motion envelope rather than
+    # the original ultra-conservative 0.10 m/s cap. Command clipping remains
+    # tested separately in test_command_limits_clip_command().
+    assert 0.0 < cfg.command_limits.vx_max <= 0.50
+    assert 0.0 < cfg.command_limits.vy_max <= 0.25
     assert cfg.watchdog.stop_on_stale_lidar
     assert cfg.perception.target_class == "person"
     assert cfg.safety.require_operator_enable
