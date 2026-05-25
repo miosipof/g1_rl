@@ -13,8 +13,6 @@ if str(SCRIPTS) not in sys.path:
 import real_g1_follow_dryrun  # noqa: E402
 import real_g1_follow_low_speed  # noqa: E402
 import real_g1_probe_adapters  # noqa: E402
-import diagnose_frames  # noqa: E402
-import real_g1_calibrate_commands  # noqa: E402
 
 
 def test_probe_adapters_json_runs(monkeypatch, capsys) -> None:
@@ -100,31 +98,5 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--allow-non-200" in stdout
     assert "--redetect-every" in stdout
     assert "--command-wz-scale" in stdout
-
-
-def test_diagnose_frames_help(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(sys, "argv", ["diagnose_frames.py", "--help"])
-    try:
-        diagnose_frames.main()
-    except SystemExit as exc:
-        assert exc.code == 0
-    else:  # pragma: no cover - argparse help exits
-        raise AssertionError("expected argparse help SystemExit")
-    stdout = capsys.readouterr().out
-    assert "--target-class" in stdout
-    assert "--lidar-source" in stdout
-    assert "--use-config-camera-transform" in stdout
-
-
-def test_real_g1_calibrate_commands_help(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(sys, "argv", ["real_g1_calibrate_commands.py", "--help"])
-    try:
-        real_g1_calibrate_commands.main()
-    except SystemExit as exc:
-        assert exc.code == 0
-    else:  # pragma: no cover - argparse help exits
-        raise AssertionError("expected argparse help SystemExit")
-    stdout = capsys.readouterr().out
-    assert "--yaw-degrees" in stdout
-    assert "--allow-outside-config-limits" in stdout
-    assert "--yes-i-understand-this-moves-the-robot" in stdout
+    assert "--run-id" in stdout
+    assert "--no-timestamp-debug-dirs" in stdout

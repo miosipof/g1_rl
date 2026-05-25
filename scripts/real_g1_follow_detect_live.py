@@ -45,6 +45,9 @@ from adapters import (
     RealSenseRGBDAdapterConfig,
     RobotObservation,
     Target2D,
+    make_run_id,
+    timestamped_output_dir,
+    write_run_info,
     UnitreeLocoAdapter,
     UnitreeLocoAdapterConfig,
     load_adapter_config,
@@ -123,6 +126,7 @@ class DetectTargetObservationProvider:
         depth_crop_frac: float,
         depth_percentile: float,
         use_forward_camera_convention: bool = True,
+        rgbd_body_exclusion_box: Any | None = None,
     ) -> None:
         self.base_provider = base_provider
         self.target_class = str(target_class)
@@ -131,6 +135,7 @@ class DetectTargetObservationProvider:
         self.smoothing_alpha = float(smoothing_alpha)
         self.max_jump_m = float(max_jump_m)
         self.use_forward_camera_convention = bool(use_forward_camera_convention)
+        self.rgbd_body_exclusion_box = rgbd_body_exclusion_box
         self.target_cfg = TargetFromBBoxConfig(
             depth_min_m=float(depth_min_m),
             depth_max_m=float(depth_max_m),
@@ -229,6 +234,17 @@ class DetectTargetObservationProvider:
                 active_target=None if self.active_target is None else self.active_target.xy,
                 detection_count=len(detections),
                 selected_detection=selected_dict,
+            )
+        if self.rgbd_body_exclusion_box is not None and self.rgbd_body_exclusion_box.contains_point(result.point_world):
+            return None, detections, TargetTrackingStatus(
+                state="occluded_recent" if self.active_target is not None else "lost",
+                reason="rgbd_body_exclusion",
+                active_target=None if self.active_target is None else self.active_target.xy,
+                raw_target=result.target.xy,
+                detection_count=len(detections),
+                selected_detection=selected_dict,
+                target_depth_m=float(result.depth_m),
+                object_xy_b=result.object_xy_w,
             )
         return result.target, detections, TargetTrackingStatus(
             state="tracking",
@@ -417,8 +433,10 @@ def main() -> int:
     parser.add_argument("--target-nav-replan-every", type=int, default=0, help="Replan cadence; 0 disables periodic replanning.")
     parser.add_argument("--target-nav-enable-replanning", action="store_true", help="Enable target-nav replanning.")
     parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters.")
-    parser.add_argument("--save-lidar-debug", type=Path, default=None, help="Directory for LiDAR occupancy/debug artifacts.")
-    parser.add_argument("--save-rgbd-debug", type=Path, default=None, help="Directory for RGB-D snapshot/YOLO debug artifacts.")
+    parser.add_argument("--save-lidar-debug", type=Path, default=None, help="Base directory for LiDAR occupancy/debug artifacts. A timestamped run subdir is added by default.")
+    parser.add_argument("--save-rgbd-debug", type=Path, default=None, help="Base directory for RGB-D snapshot/YOLO debug artifacts. A timestamped run subdir is added by default.")
+    parser.add_argument("--run-id", default=None, help="Optional run id used for timestamped debug subdirectories.")
+    parser.add_argument("--no-timestamp-debug-dirs", action="store_true", help="Write debug artifacts directly into the requested directories instead of a run_<timestamp> subdir.")
     parser.add_argument("--json-lines", action="store_true", help="Print one JSON object per step.")
     parser.add_argument("--expected-fsm-id", type=int, default=200, help="Expected Unitree loco fsm_id for motion.")
     parser.add_argument("--allow-non-200", action="store_true", help="Disable fsm_id equality gate; fsm_mode gate remains active.")
@@ -508,6 +526,7 @@ def main() -> int:
         depth_crop_frac=args.depth_crop_frac,
         depth_percentile=args.depth_percentile,
         use_forward_camera_convention=not args.use_config_camera_transform,
+        rgbd_body_exclusion_box=cfg.camera.body_exclusion_box,
     )
 
     nav_policy = LidarTargetNavPolicyRuntime(
@@ -544,8 +563,26 @@ def main() -> int:
         config=RealBridgeConfig(name="real_g1_follow_detect_live", send_commands=True, auto_disarm_sink_on_stop=True),
     )
 
-    lidar_writer = LidarDebugWriter(args.save_lidar_debug, grid_cfg=nav_policy.config.grid_cfg) if args.save_lidar_debug else None
-    rgbd_writer = RGBDDebugWriter(args.save_rgbd_debug) if args.save_rgbd_debug else None
+    run_id = args.run_id or make_run_id()
+    timestamp_debug_dirs = not bool(args.no_timestamp_debug_dirs)
+    lidar_debug_dir = timestamped_output_dir(args.save_lidar_debug, run_id=run_id, enabled=timestamp_debug_dirs)
+    rgbd_debug_dir = timestamped_output_dir(args.save_rgbd_debug, run_id=run_id, enabled=timestamp_debug_dirs)
+    lidar_writer = LidarDebugWriter(lidar_debug_dir, grid_cfg=nav_policy.config.grid_cfg) if lidar_debug_dir else None
+    rgbd_writer = RGBDDebugWriter(rgbd_debug_dir) if rgbd_debug_dir else None
+    run_info = {
+        "run_id": run_id,
+        "timestamped_debug_dirs": timestamp_debug_dirs,
+        "script": "real_g1_follow_detect_live.py",
+        "config": str(args.config),
+        "target_class": str(args.target_class),
+        "real_motion": real_motion,
+        "body_exclusion": {
+            "camera": None if cfg.camera.body_exclusion_box is None else cfg.camera.body_exclusion_box.to_dict(),
+            "lidar": None if cfg.lidar.body_exclusion_box is None else cfg.lidar.body_exclusion_box.to_dict(),
+        },
+    }
+    write_run_info(lidar_debug_dir, run_info)
+    write_run_info(rgbd_debug_dir, run_info)
 
     print("[INFO]: live detect-and-follow bridge starting")
     print(f"[INFO]: config={args.config}")
@@ -554,10 +591,11 @@ def main() -> int:
     print(f"[INFO]: yolo_model={args.yolo_model!r} yolo_device={args.yolo_device!r} redetect_every={args.redetect_every}")
     print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
     print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
-    if args.save_lidar_debug:
-        print(f"[INFO]: LiDAR debug artifacts: {args.save_lidar_debug}")
-    if args.save_rgbd_debug:
-        print(f"[INFO]: RGB-D debug artifacts: {args.save_rgbd_debug}")
+    print(f"[INFO]: run_id={run_id}")
+    if lidar_debug_dir:
+        print(f"[INFO]: LiDAR debug artifacts: {lidar_debug_dir}")
+    if rgbd_debug_dir:
+        print(f"[INFO]: RGB-D debug artifacts: {rgbd_debug_dir}")
     if not real_motion:
         print("[INFO]: dry-run mode: no Unitree Move command will be sent")
     else:

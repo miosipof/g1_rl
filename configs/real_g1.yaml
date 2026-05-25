@@ -37,6 +37,18 @@ camera:
       - [0.0, 0.0, 1.0, 0.35]
       - [0.0, 0.0, 0.0, 1.00]
 
+  # Body-frame self/near-field exclusion for RGB-D target projection.
+  # A YOLO detection whose projected 3D point falls inside this box is ignored.
+  # Body convention: x forward, y left, z up.
+  body_exclusion_box:
+    enabled: true
+    x_min: -0.50
+    x_max: 0.45
+    y_min: -0.50
+    y_max: 0.50
+    z_min: -0.25
+    z_max: 1.40
+
 lidar:
   enabled: true
   source_frame_id: livox_lidar
@@ -59,6 +71,18 @@ lidar:
   z_min_m: 0.05
   z_max_m: 1.30
   max_points: 20000
+
+  # Body-frame self/near-field exclusion for Livox points before occupancy/safety.
+  # This removes points from the robot body, operator contact near the torso,
+  # and near-zero forward artifacts that caused spurious front_obstacle_stop.
+  body_exclusion_box:
+    enabled: true
+    x_min: -0.60
+    x_max: 0.25
+    y_min: -0.45
+    y_max: 0.45
+    z_min: -0.25
+    z_max: 1.40
 
 command_limits:
   # Initial real-robot limits are deliberately lower than Isaac smoke-test limits.

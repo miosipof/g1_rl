@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import math
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -23,6 +23,74 @@ from .types import CameraIntrinsics, Command2D, Transform3D
 
 
 Number = int | float
+
+
+@dataclass(frozen=True)
+class BodyExclusionBox:
+    """Axis-aligned body-frame exclusion box for self/near-field points.
+
+    Coordinates are in the robot body frame: x forward, y left, z up. Points
+    inside the inclusive box are treated as robot/self artifacts and ignored by
+    the corresponding adapter/filter.
+    """
+
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    z_min: float
+    z_max: float
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any] | None, *, name: str) -> "BodyExclusionBox | None":
+        if data is None:
+            return None
+        data = _mapping(data, name)
+        if not bool(data.get("enabled", True)):
+            return None
+        box = cls(
+            x_min=_number(data.get("x_min", -0.50), f"{name}.x_min"),
+            x_max=_number(data.get("x_max", 0.20), f"{name}.x_max"),
+            y_min=_number(data.get("y_min", -0.45), f"{name}.y_min"),
+            y_max=_number(data.get("y_max", 0.45), f"{name}.y_max"),
+            z_min=_number(data.get("z_min", -0.25), f"{name}.z_min"),
+            z_max=_number(data.get("z_max", 1.30), f"{name}.z_max"),
+        )
+        box.validate(name=name)
+        return box
+
+    def validate(self, *, name: str = "body_exclusion_box") -> None:
+        _check_bounds(self.x_min, self.x_max, f"{name}.x")
+        _check_bounds(self.y_min, self.y_max, f"{name}.y")
+        _check_bounds(self.z_min, self.z_max, f"{name}.z")
+
+    def contains_points(self, points_xyz: np.ndarray) -> np.ndarray:
+        points = np.asarray(points_xyz, dtype=np.float32)
+        if points.ndim == 1:
+            points = points.reshape(1, -1)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"points_xyz must have shape Nx3, got {points.shape}")
+        return (
+            (points[:, 0] >= self.x_min)
+            & (points[:, 0] <= self.x_max)
+            & (points[:, 1] >= self.y_min)
+            & (points[:, 1] <= self.y_max)
+            & (points[:, 2] >= self.z_min)
+            & (points[:, 2] <= self.z_max)
+        )
+
+    def contains_point(self, point_xyz: Sequence[float]) -> bool:
+        return bool(self.contains_points(np.asarray(point_xyz, dtype=np.float32).reshape(1, 3))[0])
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "x_min": float(self.x_min),
+            "x_max": float(self.x_max),
+            "y_min": float(self.y_min),
+            "y_max": float(self.y_max),
+            "z_min": float(self.z_min),
+            "z_max": float(self.z_max),
+        }
 
 
 @dataclass(frozen=True)
@@ -44,6 +112,7 @@ class CameraConfig:
     depth_scale_m_per_unit: float | None
     intrinsics: CameraIntrinsics | None
     T_body_camera: Transform3D
+    body_exclusion_box: BodyExclusionBox | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -92,6 +161,7 @@ class CameraConfig:
             depth_scale_m_per_unit=depth_scale,
             intrinsics=intrinsics,
             T_body_camera=transform,
+            body_exclusion_box=BodyExclusionBox.from_dict(data.get("body_exclusion_box"), name="camera.body_exclusion_box"),
             metadata=dict(data.get("metadata", {})),
         )
 
@@ -115,6 +185,7 @@ class LidarConfig:
     z_max_m: float
     max_points: int | None
     T_body_lidar: Transform3D
+    body_exclusion_box: BodyExclusionBox | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -154,6 +225,7 @@ class LidarConfig:
             z_max_m=z_max,
             max_points=max_points,
             T_body_lidar=transform,
+            body_exclusion_box=BodyExclusionBox.from_dict(data.get("body_exclusion_box"), name="lidar.body_exclusion_box"),
             metadata=dict(data.get("metadata", {})),
         )
 

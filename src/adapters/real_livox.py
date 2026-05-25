@@ -19,7 +19,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .config import LidarConfig
+from .config import BodyExclusionBox, LidarConfig
 from .types import LidarFrame, Pose2D, Transform3D
 
 
@@ -45,6 +45,7 @@ class LivoxAdapterConfig:
             target_frame="body",
         )
     )
+    body_exclusion_box: BodyExclusionBox | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -59,6 +60,7 @@ class LivoxAdapterConfig:
             z_max_m=config.z_max_m,
             max_points=config.max_points,
             T_body_lidar=config.T_body_lidar,
+            body_exclusion_box=config.body_exclusion_box,
             metadata=dict(config.metadata),
         )
 
@@ -109,6 +111,7 @@ def filter_body_lidar_points(
     z_min_m: float,
     z_max_m: float,
     max_points: int | None = None,
+    body_exclusion_box: BodyExclusionBox | None = None,
 ) -> np.ndarray:
     """Filter body-frame LiDAR points for 2D navigation occupancy."""
 
@@ -129,6 +132,8 @@ def filter_body_lidar_points(
         & (points[:, 2] >= float(z_min_m))
         & (points[:, 2] <= float(z_max_m))
     )
+    if body_exclusion_box is not None:
+        keep = keep & ~body_exclusion_box.contains_points(points)
     out = points[keep].astype(np.float32, copy=False)
     if max_points is not None and int(max_points) > 0 and out.shape[0] > int(max_points):
         # Deterministic decimation keeps tests reproducible and avoids hidden RNG.
@@ -149,6 +154,7 @@ def make_lidar_frame_from_livox_points(
     z_min_m: float = 0.05,
     z_max_m: float = 1.30,
     max_points: int | None = None,
+    body_exclusion_box: BodyExclusionBox | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> LidarFrame:
     """Normalize raw/corrected Livox points into a body-frame LidarFrame."""
@@ -162,6 +168,7 @@ def make_lidar_frame_from_livox_points(
         z_min_m=z_min_m,
         z_max_m=z_max_m,
         max_points=max_points,
+        body_exclusion_box=body_exclusion_box,
     )
     return LidarFrame(
         timestamp_s=float(timestamp_s),
@@ -175,6 +182,7 @@ def make_lidar_frame_from_livox_points(
             "raw_points": int(as_points_xyz(points_lidar_xyz, name="points_lidar_xyz").shape[0]),
             "corrected_points": int(corrected.shape[0]),
             "filtered_points": int(filtered.shape[0]),
+            "body_exclusion_box": None if body_exclusion_box is None else body_exclusion_box.to_dict(),
         },
     )
 
@@ -197,6 +205,7 @@ def make_lidar_frame_from_config(
         z_min_m=config.z_min_m,
         z_max_m=config.z_max_m,
         max_points=config.max_points,
+        body_exclusion_box=config.body_exclusion_box,
         metadata={**dict(config.metadata), **dict(metadata or {})},
     )
 

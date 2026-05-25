@@ -39,6 +39,9 @@ from adapters import (
     RobotObservation,
     RobotState,
     load_adapter_config,
+    make_run_id,
+    timestamped_output_dir,
+    write_run_info,
 )
 from adapters.safety_supervisor import SafetySupervisor
 from adapters.real_livox import LivoxAdapterConfig, NpyLivoxReplayAdapter, UnitreeVibesLivox2Adapter, UnitreeVibesLivox2AdapterConfig
@@ -182,8 +185,10 @@ def main() -> int:
     parser.add_argument("--livox-frame-time", type=float, default=0.20, help="Livox packet aggregation window.")
     parser.add_argument("--livox-frame-packets", type=int, default=120, help="Livox packet aggregation count.")
     parser.add_argument("--livox-timeout", type=float, default=2.0, help="Timeout waiting for live Livox frames.")
-    parser.add_argument("--save-lidar-debug", type=Path, default=None, help="Directory for LiDAR occupancy/debug artifacts; dry-run only.")
-    parser.add_argument("--save-rgbd-debug", type=Path, default=None, help="Directory for RGB-D snapshot/depth/YOLO debug artifacts; dry-run only.")
+    parser.add_argument("--save-lidar-debug", type=Path, default=None, help="Base directory for LiDAR occupancy/debug artifacts; a timestamped run subdir is added by default.")
+    parser.add_argument("--save-rgbd-debug", type=Path, default=None, help="Base directory for RGB-D snapshot/depth/YOLO debug artifacts; a timestamped run subdir is added by default.")
+    parser.add_argument("--run-id", default=None, help="Optional run id used for timestamped debug subdirectories.")
+    parser.add_argument("--no-timestamp-debug-dirs", action="store_true", help="Write debug artifacts directly into requested directories instead of a run_<timestamp> subdir.")
     parser.add_argument("--rgbd-debug-yolo", action="store_true", help="Run YOLO on RGB-D debug snapshots and save detection overlays/metadata.")
     parser.add_argument("--rgbd-debug-yolo-model", default="yolov8n.pt", help="YOLO model used for --rgbd-debug-yolo.")
     parser.add_argument("--rgbd-debug-yolo-confidence", type=float, default=0.25, help="YOLO confidence threshold for RGB-D debug detection.")
@@ -292,12 +297,31 @@ def main() -> int:
         config=RealBridgeConfig(name="real_g1_follow_dryrun", send_commands=True),
     )
 
-    lidar_debug_writer = None
-    if args.save_lidar_debug is not None:
-        debug_grid_cfg = policy.config.grid_cfg if isinstance(policy, LidarTargetNavPolicyRuntime) else cfg_to_default_grid_cfg()
-        lidar_debug_writer = LidarDebugWriter(args.save_lidar_debug, grid_cfg=debug_grid_cfg)
+    run_id = args.run_id or make_run_id()
+    timestamp_debug_dirs = not bool(args.no_timestamp_debug_dirs)
+    lidar_debug_dir = timestamped_output_dir(args.save_lidar_debug, run_id=run_id, enabled=timestamp_debug_dirs)
+    rgbd_debug_dir = timestamped_output_dir(args.save_rgbd_debug, run_id=run_id, enabled=timestamp_debug_dirs)
 
-    rgbd_debug_writer = RGBDDebugWriter(args.save_rgbd_debug) if args.save_rgbd_debug is not None else None
+    lidar_debug_writer = None
+    if lidar_debug_dir is not None:
+        debug_grid_cfg = policy.config.grid_cfg if isinstance(policy, LidarTargetNavPolicyRuntime) else cfg_to_default_grid_cfg()
+        lidar_debug_writer = LidarDebugWriter(lidar_debug_dir, grid_cfg=debug_grid_cfg)
+
+    rgbd_debug_writer = RGBDDebugWriter(rgbd_debug_dir) if rgbd_debug_dir is not None else None
+    run_info = {
+        "run_id": run_id,
+        "timestamped_debug_dirs": timestamp_debug_dirs,
+        "script": "real_g1_follow_dryrun.py",
+        "config": str(args.config),
+        "observation_source": str(args.observation_source),
+        "policy": str(args.policy),
+        "body_exclusion": {
+            "camera": None if cfg.camera.body_exclusion_box is None else cfg.camera.body_exclusion_box.to_dict(),
+            "lidar": None if cfg.lidar.body_exclusion_box is None else cfg.lidar.body_exclusion_box.to_dict(),
+        },
+    }
+    write_run_info(lidar_debug_dir, run_info)
+    write_run_info(rgbd_debug_dir, run_info)
     rgbd_debug_detector = None
     if args.rgbd_debug_yolo:
         allowed_classes = None if str(args.rgbd_debug_yolo_classes).strip().lower() == "all" else [
@@ -328,8 +352,11 @@ def main() -> int:
             if uses_livox_npy:
                 print(f"[INFO]: Livox .npy replay loop={args.loop_livox_npy}")
             if lidar_debug_writer is not None:
+                print(f"[INFO]: run_id={run_id}")
                 print(f"[INFO]: LiDAR debug artifacts: {lidar_debug_writer.output_dir}")
             if rgbd_debug_writer is not None:
+                if lidar_debug_writer is None:
+                    print(f"[INFO]: run_id={run_id}")
                 print(f"[INFO]: RGB-D debug artifacts: {rgbd_debug_writer.output_dir}")
             if rgbd_debug_detector is not None:
                 print(f"[INFO]: RGB-D debug YOLO enabled model={args.rgbd_debug_yolo_model!r} classes={args.rgbd_debug_yolo_classes!r}")

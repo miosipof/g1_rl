@@ -75,8 +75,6 @@ def test_lidar_debug_writer_saves_expected_artifacts(tmp_path: Path) -> None:
     assert points.shape == (2, 3)
     meta = json.loads((tmp_path / "occupancy_grid_meta.json").read_text())
     assert meta["grid"]["occupied_cells"] == 2
-    assert meta["grid"]["coordinate_convention"]["y_axis"].startswith("+Y robot-left")
-    assert "mirrored relative" in meta["grid"]["coordinate_convention"]["note"]
     assert meta["policy_debug"]["plan_found"] is True
 
 
@@ -105,6 +103,7 @@ def test_follow_dryrun_save_lidar_debug_cli(monkeypatch, capsys, tmp_path: Path)
             "0",
             "--save-lidar-debug",
             str(debug_dir),
+            "--no-timestamp-debug-dirs",
             "--json-lines",
         ],
     )

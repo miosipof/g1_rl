@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 import pytest
 
-from adapters import AdapterRuntimeConfig, Command2D, load_adapter_config
+from adapters import AdapterRuntimeConfig, BodyExclusionBox, Command2D, load_adapter_config
 from adapters.config import CommandLimitsConfig, LidarConfig
 
 
@@ -92,3 +94,17 @@ def test_config_from_dict_allows_runtime_intrinsics() -> None:
     assert cfg.camera.intrinsics is None
     assert cfg.camera.width == 320
     assert cfg.camera.T_body_camera.source_frame == "camera_color_optical"
+
+
+def test_real_g1_body_exclusion_boxes_load() -> None:
+    cfg = load_adapter_config(Path("configs/real_g1.yaml"))
+    assert cfg.lidar.body_exclusion_box is not None
+    assert cfg.camera.body_exclusion_box is not None
+    assert cfg.lidar.body_exclusion_box.contains_point((0.01, 0.0, 0.5))
+    assert not cfg.lidar.body_exclusion_box.contains_point((1.0, 0.0, 0.5))
+
+
+def test_body_exclusion_box_validation_and_mask() -> None:
+    box = BodyExclusionBox(x_min=-0.1, x_max=0.2, y_min=-0.3, y_max=0.3, z_min=0.0, z_max=1.0)
+    mask = box.contains_points(np.array([[0.0, 0.0, 0.5], [0.5, 0.0, 0.5]], dtype=np.float32))
+    assert mask.tolist() == [True, False]
