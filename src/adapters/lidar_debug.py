@@ -102,6 +102,86 @@ def _draw_polyline_cells(
         last = (row, col)
 
 
+
+
+def _draw_line_cells(
+    image: np.ndarray,
+    start_xy_b: PointXY,
+    end_xy_b: PointXY,
+    cfg: OccupancyGridCfg,
+    *,
+    color: tuple[int, int, int],
+    radius: int = 1,
+) -> None:
+    """Draw a line between two body-frame points in occupancy-image cells."""
+
+    r0, c0 = xy_to_grid_cell(start_xy_b, cfg)
+    r1, c1 = xy_to_grid_cell(end_xy_b, cfg)
+    steps = max(abs(r1 - r0), abs(c1 - c0), 1)
+    for i in range(steps + 1):
+        t = float(i) / float(steps)
+        rr = int(round(r0 + t * (r1 - r0)))
+        cc = int(round(c0 + t * (c1 - c0)))
+        if 0 <= rr < cfg.height and 0 <= cc < cfg.width:
+            _draw_cell(image, rr, cc, color, radius=radius)
+
+
+def _axis_extent(cfg: OccupancyGridCfg, preferred_m: float = 1.0) -> float:
+    """Pick an axis-overlay length that fits the configured local grid."""
+
+    positive_x = max(0.0, float(cfg.x_max) - 0.05)
+    positive_y = max(0.0, float(cfg.y_max) - 0.05)
+    negative_y = max(0.0, -float(cfg.y_min) - 0.05)
+    return max(0.10, min(float(preferred_m), positive_x, positive_y, negative_y))
+
+
+def _draw_axis_overlay(image: np.ndarray, cfg: OccupancyGridCfg) -> None:
+    """Draw explicit body-frame axes to prevent left/right misreads.
+
+    Occupancy debug images are top-down maps, not camera images:
+    top = +X forward; image-right = +Y robot-left.
+    """
+
+    length = _axis_extent(cfg)
+    origin = (0.0, 0.0)
+    # +X forward goes upward in the image because grid rows are x_max -> x_min.
+    _draw_line_cells(image, origin, (length, 0.0), cfg, color=(220, 40, 40), radius=1)
+    # +Y robot-left goes to image-right because columns are y_min -> y_max.
+    _draw_line_cells(image, origin, (0.0, length), cfg, color=(155, 60, 220), radius=1)
+    _draw_line_cells(image, origin, (0.0, -length), cfg, color=(90, 90, 90), radius=1)
+
+    r_x, c_x = xy_to_grid_cell((length, 0.0), cfg)
+    r_yp, c_yp = xy_to_grid_cell((0.0, length), cfg)
+    r_yn, c_yn = xy_to_grid_cell((0.0, -length), cfg)
+    if 0 <= r_x < cfg.height and 0 <= c_x < cfg.width:
+        _draw_cell(image, r_x, c_x, (220, 40, 40), radius=3)
+    if 0 <= r_yp < cfg.height and 0 <= c_yp < cfg.width:
+        _draw_cell(image, r_yp, c_yp, (155, 60, 220), radius=3)
+    if 0 <= r_yn < cfg.height and 0 <= c_yn < cfg.width:
+        _draw_cell(image, r_yn, c_yn, (90, 90, 90), radius=2)
+
+
+def _annotate_debug_image(image: np.ndarray, lines: Sequence[str]) -> np.ndarray:
+    """Add a small text legend without requiring custom fonts."""
+
+    try:
+        from PIL import Image, ImageDraw
+
+        pil = Image.fromarray(image, mode="RGB")
+        draw = ImageDraw.Draw(pil)
+        x0, y0 = 4, 4
+        line_h = 12
+        width = max(130, max(len(line) for line in lines) * 6 + 8)
+        height = len(lines) * line_h + 8
+        draw.rectangle([0, 0, min(width, pil.width - 1), min(height, pil.height - 1)], fill=(255, 255, 255))
+        for i, line in enumerate(lines):
+            draw.text((x0, y0 + i * line_h), line, fill=(0, 0, 0))
+        return np.asarray(pil, dtype=np.uint8)
+    except Exception:
+        # Axis pixels remain even if text rendering is unavailable.
+        return image
+
+
 def save_occupancy_debug_image(
     path: str | Path,
     occupancy_grid: torch.Tensor | np.ndarray,
@@ -109,6 +189,7 @@ def save_occupancy_debug_image(
     grid_cfg: OccupancyGridCfg,
     plan_xy_b: Sequence[PointXY] | None = None,
     target_xy_b: PointXY | None = None,
+    show_axes: bool = True,
 ) -> None:
     """Save a PNG visualizing occupancy plus optional plan/target overlays.
 
@@ -117,7 +198,14 @@ def save_occupancy_debug_image(
       - dark cells: occupied cells;
       - blue polyline: current planned path in body frame;
       - green square: target in body frame;
-      - orange square: robot origin.
+      - orange square: robot origin;
+      - red axis: +X forward;
+      - purple axis: +Y robot-left.
+
+    Important: this is a top-down robot/body map, not a camera image.  Because
+    image columns increase left-to-right while body +Y is robot-left, robot-left
+    appears on the right side of this PNG.  That can look mirrored relative to a
+    forward-facing RGB camera view, where visual-left is image-left.
     """
 
     image = _grid_to_uint8_rgb(occupancy_grid)
@@ -130,6 +218,16 @@ def save_occupancy_debug_image(
     origin = xy_to_grid_cell((0.0, 0.0), grid_cfg)
     if 0 <= origin[0] < grid_cfg.height and 0 <= origin[1] < grid_cfg.width:
         _draw_cell(image, origin[0], origin[1], (245, 160, 30), radius=2)
+    if show_axes:
+        _draw_axis_overlay(image, grid_cfg)
+        image = _annotate_debug_image(
+            image,
+            [
+                "top=+X FWD",
+                "right=+Y LEFT",
+                "left=-Y RIGHT",
+            ],
+        )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -279,6 +377,13 @@ class LidarDebugWriter:
                     "y_max": self.grid_cfg.y_max,
                     "resolution": self.grid_cfg.resolution,
                     "occupied_cells": int((occupancy_grid > 0.0).sum().item()),
+                    "coordinate_convention": {
+                        "frame": "body",
+                        "x_axis": "+X forward; displayed toward image top",
+                        "y_axis": "+Y robot-left; displayed toward image right",
+                        "z_axis": "+Z up; not shown in 2D occupancy image",
+                        "note": "Occupancy image is top-down and can look mirrored relative to forward RGB camera images.",
+                    },
                 },
                 "policy_debug": policy_debug,
                 "proposed_command": None if proposed is None else proposed.tuple,
