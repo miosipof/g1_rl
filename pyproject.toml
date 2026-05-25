@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "g1-rl"
+version = "0.1.0"
+description = "Simulation-to-real autonomy utilities for Unitree G1 navigation and target following."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Robotica Autonoma" }
+]
+license = { text = "Proprietary" }
+keywords = ["unitree", "g1", "navigation", "isaac-sim", "robotics"]
+
+# Keep base dependencies intentionally small so editable installation does not
+# disturb the Isaac or Jetson SDK environments. Use requirements/*.txt or the
+# existing isaac_requirements.txt / g1_requirements.txt files for full env setup.
+dependencies = [
+  "numpy>=1.26",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0",
+  "pytest-mock>=3.15",
+]
+real = [
+  "pyrealsense2>=2.57",
+  "opencv-python-headless>=4.11",
+  "pillow>=11.0",
+  "matplotlib>=3.10",
+  "ultralytics>=8.4",
+]
+debug = [
+  "pillow>=11.0",
+  "matplotlib>=3.10",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["g1_nav_rl*", "adapters*"]
+exclude = ["utils*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
