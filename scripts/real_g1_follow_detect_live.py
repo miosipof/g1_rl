@@ -32,6 +32,9 @@ import numpy as np
 
 from adapters import (
     Command2D,
+    CommandOdometryConfig,
+    CommandOdometryEstimator,
+    CommandOdometryObservationProvider,
     CompositeDryRunObservationProvider,
     DryRunCommandSink,
     LidarDebugWriter,
@@ -433,6 +436,9 @@ def main() -> int:
     parser.add_argument("--target-nav-replan-every", type=int, default=0, help="Replan cadence; 0 disables periodic replanning.")
     parser.add_argument("--target-nav-enable-replanning", action="store_true", help="Enable target-nav replanning.")
     parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters.")
+    parser.add_argument("--enable-command-odometry", action="store_true", help="Inject simple command-integrated pose into observations for short-horizon real tests.")
+    parser.add_argument("--command-odom-max-dt", type=float, default=2.0, help="Maximum dt integrated by command odometry per update; use <=0 to disable the cap.")
+    parser.add_argument("--command-odom-target-frame", choices=("body", "world"), default="body", help="Frame of target hints before command-odometry injection. Current live detector emits body-frame hints.")
     parser.add_argument("--save-lidar-debug", type=Path, default=None, help="Base directory for LiDAR occupancy/debug artifacts. A timestamped run subdir is added by default.")
     parser.add_argument("--save-rgbd-debug", type=Path, default=None, help="Base directory for RGB-D snapshot/YOLO debug artifacts. A timestamped run subdir is added by default.")
     parser.add_argument("--run-id", default=None, help="Optional run id used for timestamped debug subdirectories.")
@@ -469,6 +475,8 @@ def main() -> int:
         raise SystemExit("--state-samples must be >= 1")
     if args.state_interval_s < 0.0:
         raise SystemExit("--state-interval-s must be non-negative")
+    if args.command_odom_max_dt == 0.0:
+        raise SystemExit("--command-odom-max-dt must be positive, negative, or omitted; use <0 to disable the cap")
 
     real_motion = bool(args.yes_i_understand_this_moves_the_robot)
     if real_motion and not args.allow_synthetic_robot_state_motion:
@@ -528,6 +536,16 @@ def main() -> int:
         use_forward_camera_convention=not args.use_config_camera_transform,
         rgbd_body_exclusion_box=cfg.camera.body_exclusion_box,
     )
+    odom_provider = None
+    observation_provider = target_provider
+    if args.enable_command_odometry:
+        max_dt = None if args.command_odom_max_dt < 0.0 else float(args.command_odom_max_dt)
+        odom_provider = CommandOdometryObservationProvider(
+            base_provider=target_provider,
+            estimator=CommandOdometryEstimator(CommandOdometryConfig(max_dt_s=max_dt)),
+            target_hint_frame=args.command_odom_target_frame,
+        )
+        observation_provider = odom_provider
 
     nav_policy = LidarTargetNavPolicyRuntime(
         LidarTargetNavPolicyRuntimeConfig.from_runtime_config(
@@ -556,7 +574,7 @@ def main() -> int:
         command_limits=cfg.command_limits,
     )
     bridge = RealBridge(
-        observation_provider=target_provider,
+        observation_provider=observation_provider,
         policy_runtime=policy,
         safety_supervisor=supervisor,
         command_sink=sink,
@@ -580,6 +598,11 @@ def main() -> int:
             "camera": None if cfg.camera.body_exclusion_box is None else cfg.camera.body_exclusion_box.to_dict(),
             "lidar": None if cfg.lidar.body_exclusion_box is None else cfg.lidar.body_exclusion_box.to_dict(),
         },
+        "command_odometry": {
+            "enabled": bool(args.enable_command_odometry),
+            "target_hint_frame": str(args.command_odom_target_frame),
+            "max_dt_s": None if args.command_odom_max_dt < 0.0 else float(args.command_odom_max_dt),
+        },
     }
     write_run_info(lidar_debug_dir, run_info)
     write_run_info(rgbd_debug_dir, run_info)
@@ -591,6 +614,7 @@ def main() -> int:
     print(f"[INFO]: yolo_model={args.yolo_model!r} yolo_device={args.yolo_device!r} redetect_every={args.redetect_every}")
     print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
     print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
+    print(f"[INFO]: command odometry: enabled={bool(args.enable_command_odometry)} target_frame={args.command_odom_target_frame} max_dt={None if args.command_odom_max_dt < 0.0 else args.command_odom_max_dt}")
     print(f"[INFO]: run_id={run_id}")
     if lidar_debug_dir:
         print(f"[INFO]: LiDAR debug artifacts: {lidar_debug_dir}")
@@ -612,6 +636,8 @@ def main() -> int:
     try:
         for i in range(args.steps):
             result = bridge.step()
+            if odom_provider is not None:
+                odom_provider.update_from_bridge_result(result)
             row = _result_to_dict(result)
             tracking = {} if result.observation is None else dict(result.observation.metadata.get("target_tracking", {}))
             command_status = None if result.command_result is None else result.command_result.status
@@ -637,6 +663,7 @@ def main() -> int:
                 "command_health": command_health,
                 "command_message": command_message,
                 "command_details": command_details,
+                "command_odometry": None if odom_provider is None else odom_provider.snapshot().to_dict(),
             }
             if args.json_lines:
                 print(json.dumps(payload, sort_keys=True, default=_json_default))
@@ -662,6 +689,8 @@ def main() -> int:
                 time.sleep(args.dt)
     finally:
         stop_status = bridge.stop()
+        if odom_provider is not None:
+            odom_provider.set_stop(source="script_final_stop")
         print(f"[INFO]: bridge command: stop -> {stop_status.health.value}: {stop_status.message}")
         sink.close()
         livox_adapter.stop()

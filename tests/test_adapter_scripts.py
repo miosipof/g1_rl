@@ -100,3 +100,5 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--command-wz-scale" in stdout
     assert "--run-id" in stdout
     assert "--no-timestamp-debug-dirs" in stdout
+    assert "--enable-command-odometry" in stdout
+    assert "--command-odom-target-frame" in stdout

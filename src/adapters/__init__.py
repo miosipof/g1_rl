@@ -119,6 +119,14 @@ from .rgbd_debug import (
     save_rgb_image,
 )
 
+
+from .command_odometry import (
+    CommandOdometryConfig,
+    CommandOdometryEstimator,
+    CommandOdometryObservationProvider,
+    CommandOdometrySnapshot,
+)
+
 from .run_dirs import (
     make_run_id,
     timestamped_output_dir,
@@ -174,6 +182,10 @@ __all__ = [
     "occupancy_grid_from_lidar_frame",
     "occupancy_grid_from_observation",
     "pose_from_observation",
+    "CommandOdometryConfig",
+    "CommandOdometryEstimator",
+    "CommandOdometryObservationProvider",
+    "CommandOdometrySnapshot",
     "Command2D",
     "CommandLimitsConfig",
     "IsaacAdapterSkeleton",
