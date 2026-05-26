@@ -125,8 +125,8 @@ safety:
   stop_on_estop: true
   stop_on_robot_fault: true
   min_battery_percent: 20.0
-  obstacle_stop_distance_m: 0.15
-  obstacle_slow_distance_m: 0.30
+  obstacle_stop_distance_m: 0.20
+  obstacle_slow_distance_m: 0.40
 
 metadata:
   notes:

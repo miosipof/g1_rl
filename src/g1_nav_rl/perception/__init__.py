@@ -56,6 +56,12 @@ __all__ = [
     "target_xy_with_standoff",
     "transform_point",
     "unproject_pixel_to_camera",
+    "DetectionStreamProjectionConfig",
+    "camera_to_body_matrix_for_frame",
+    "depth_valid_ratio_in_bbox",
+    "detection_passes_basic_filters",
+    "detection_to_track",
+    "make_detection_stream_frame_from_detections",
 ]
 
 try:
@@ -66,3 +72,12 @@ except Exception:  # optional ultralytics dependency may be unavailable
     filter_detections = None  # type: ignore
 
 __all__ += ["YoloDetector", "YoloDetectorConfig", "filter_detections"]
+
+from .detection_stream_producer import (
+    DetectionStreamProjectionConfig,
+    camera_to_body_matrix_for_frame,
+    depth_valid_ratio_in_bbox,
+    detection_passes_basic_filters,
+    detection_to_track,
+    make_detection_stream_frame_from_detections,
+)
