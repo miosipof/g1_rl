@@ -79,7 +79,17 @@ class MotionCommand:
 
 @dataclass(frozen=True)
 class SimpleNavConfig:
-    """Controller parameters matching ``smoke_test_nav_lidar.py`` defaults."""
+    """Controller parameters matching ``smoke_test_nav_lidar.py`` defaults.
+
+    ``command_mode`` controls how a selected A* waypoint becomes a body-frame
+    velocity command:
+
+    - ``"holonomic"`` keeps the original controller: x error drives ``vx``,
+      y error drives ``vy``, and path tangent drives ``wz``.
+    - ``"heading_aligned"`` is intended for real G1 tests: the robot yaw is
+      driven toward the waypoint/velocity bearing, forward velocity is softly
+      reduced when the bearing is large, and lateral velocity is damped.
+    """
 
     waypoint_reached_radius: float = 0.12
     k_xy: float = 1.5
@@ -89,6 +99,9 @@ class SimpleNavConfig:
     max_wz: float = 0.60
     allow_backward: bool = False
     success_radius: float = 0.75
+    command_mode: str = "holonomic"
+    heading_lateral_scale: float = 0.20
+    heading_min_vx_scale: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -117,6 +130,10 @@ class NavigationCommand:
     waypoint_xy_b: PointXY | None
     target_distance: float
     path_yaw: float
+    command_mode: str = "holonomic"
+    bearing_error: float | None = None
+    heading_alignment_scale: float | None = None
+    raw_command: MotionCommand | None = None
 
 
 @dataclass(frozen=True)
@@ -202,7 +219,7 @@ def command_to_waypoint(
     path_yaw: float,
     cfg: SimpleNavConfig,
 ) -> tuple[MotionCommand, PointXY]:
-    """Map a world-frame waypoint to the same direct ``[vx, vy, wz]`` controller.
+    """Map a world-frame waypoint to the original holonomic controller.
 
     This is equivalent to ``command_to_waypoint`` in ``smoke_test_nav_lidar.py``.
     """
@@ -213,6 +230,37 @@ def command_to_waypoint(
     yaw_error = angle_wrap(float(path_yaw) - pose.yaw)
     wz = clip(float(cfg.k_yaw) * yaw_error, -float(cfg.max_wz), float(cfg.max_wz))
     return MotionCommand(vx, vy, wz), (x_b, y_b)
+
+
+def command_to_waypoint_heading_aligned(
+    pose: Pose2D,
+    waypoint_xy_w: PointXY,
+    cfg: SimpleNavConfig,
+) -> tuple[MotionCommand, PointXY, float, float, MotionCommand]:
+    """Map a waypoint to a real-G1-friendly heading-aligned command.
+
+    The controller prefers ``vx + wz`` over lateral strafing.  The desired yaw
+    rate is based on the bearing to the current waypoint in body frame, not only
+    the A* path tangent.  Forward speed is softly reduced as the bearing grows,
+    while lateral velocity remains available but damped by
+    ``heading_lateral_scale``.
+    """
+    x_b, y_b = world_to_body_xy(waypoint_xy_w, pose)
+    distance = math.hypot(x_b, y_b)
+    bearing = angle_wrap(math.atan2(y_b, x_b)) if distance > 1.0e-9 else 0.0
+    cos_scale = max(0.0, math.cos(bearing))
+    alignment_scale = max(float(cfg.heading_min_vx_scale), cos_scale)
+    min_vx = -float(cfg.max_vx) if bool(cfg.allow_backward) else 0.0
+    raw_vx = float(cfg.k_xy) * distance * alignment_scale
+    raw_vy = float(cfg.k_xy) * y_b * float(cfg.heading_lateral_scale)
+    raw_wz = float(cfg.k_yaw) * bearing
+    raw = MotionCommand(raw_vx, raw_vy, raw_wz)
+    cmd = MotionCommand(
+        clip(raw_vx, min_vx, float(cfg.max_vx)),
+        clip(raw_vy, -float(cfg.max_vy), float(cfg.max_vy)),
+        clip(raw_wz, -float(cfg.max_wz), float(cfg.max_wz)),
+    )
+    return cmd, (x_b, y_b), bearing, alignment_scale, raw
 
 
 def integrate_body_command(pose: Pose2D, command: MotionCommand, dt: float) -> Pose2D:
@@ -361,7 +409,22 @@ class SimpleNavigator:
         )
         waypoint_xy_w = path[self.waypoint_index]
         tangent_yaw = path_tangent_yaw(path, self.waypoint_index, pose.yaw)
-        command, waypoint_xy_b = command_to_waypoint(pose, waypoint_xy_w, tangent_yaw, self.config)
+        command_mode = str(self.config.command_mode).replace("-", "_")
+        bearing_error: float | None = None
+        heading_alignment_scale: float | None = None
+        raw_command: MotionCommand | None = None
+        if command_mode == "heading_aligned":
+            command, waypoint_xy_b, bearing_error, heading_alignment_scale, raw_command = command_to_waypoint_heading_aligned(
+                pose, waypoint_xy_w, self.config
+            )
+        elif command_mode == "holonomic":
+            command, waypoint_xy_b = command_to_waypoint(pose, waypoint_xy_w, tangent_yaw, self.config)
+            yaw_error = angle_wrap(float(tangent_yaw) - pose.yaw)
+            bearing_error = yaw_error
+            heading_alignment_scale = 1.0
+            raw_command = command
+        else:
+            raise ValueError(f"Unsupported SimpleNavConfig.command_mode: {self.config.command_mode!r}")
 
         if target_reached:
             command = MotionCommand(0.0, 0.0, 0.0)
@@ -374,6 +437,10 @@ class SimpleNavigator:
             waypoint_xy_b=waypoint_xy_b,
             target_distance=target_distance,
             path_yaw=tangent_yaw,
+            command_mode=command_mode,
+            bearing_error=bearing_error,
+            heading_alignment_scale=heading_alignment_scale,
+            raw_command=raw_command,
         )
 
     def step(

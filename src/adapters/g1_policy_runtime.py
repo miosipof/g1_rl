@@ -83,6 +83,9 @@ class LidarTargetNavPolicyRuntimeConfig:
         max_vx: float | None = None,
         max_vy: float | None = None,
         max_wz: float | None = None,
+        command_mode: str = "holonomic",
+        heading_lateral_scale: float = 0.20,
+        heading_min_vx_scale: float = 0.25,
     ) -> "LidarTargetNavPolicyRuntimeConfig":
         """Build a conservative navigation config from the real adapter config.
 
@@ -97,6 +100,9 @@ class LidarTargetNavPolicyRuntimeConfig:
             max_vy=float(max_vy if max_vy is not None else max(abs(limits.vy_min), abs(limits.vy_max))),
             max_wz=float(max_wz if max_wz is not None else max(abs(limits.wz_min), abs(limits.wz_max))),
             allow_backward=False,
+            command_mode=str(command_mode).replace("-", "_"),
+            heading_lateral_scale=float(heading_lateral_scale),
+            heading_min_vx_scale=float(heading_min_vx_scale),
         )
         astar_cfg = GridAStarCfg(
             inflation_radius=float(inflation_radius_m if inflation_radius_m is not None else 0.35),
@@ -125,6 +131,13 @@ class LidarTargetNavDebug:
     replan_count: int
     path_blocked: bool
     command: tuple[float, float, float]
+    command_mode: str = "holonomic"
+    waypoint_xy_b: tuple[float, float] | None = None
+    waypoint_xy_w: tuple[float, float] | None = None
+    path_yaw: float | None = None
+    bearing_error: float | None = None
+    heading_alignment_scale: float | None = None
+    raw_command: tuple[float, float, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +154,13 @@ class LidarTargetNavDebug:
             "replan_count": self.replan_count,
             "path_blocked": self.path_blocked,
             "command": list(self.command),
+            "command_mode": self.command_mode,
+            "waypoint_xy_b": None if self.waypoint_xy_b is None else list(self.waypoint_xy_b),
+            "waypoint_xy_w": None if self.waypoint_xy_w is None else list(self.waypoint_xy_w),
+            "path_yaw": self.path_yaw,
+            "bearing_error": self.bearing_error,
+            "heading_alignment_scale": self.heading_alignment_scale,
+            "raw_command": None if self.raw_command is None else list(self.raw_command),
         }
 
 
@@ -290,6 +310,13 @@ def make_lidar_nav_debug(
         replan_count=int(runtime_step.replan_count),
         path_blocked=bool(runtime_step.path_conflict.blocked),
         command=tuple(float(v) for v in command_tuple),
+        command_mode=str(nav_cmd.command_mode),
+        waypoint_xy_b=None if nav_cmd.waypoint_xy_b is None else tuple(float(v) for v in nav_cmd.waypoint_xy_b),
+        waypoint_xy_w=None if nav_cmd.waypoint_xy_w is None else tuple(float(v) for v in nav_cmd.waypoint_xy_w),
+        path_yaw=float(nav_cmd.path_yaw),
+        bearing_error=None if nav_cmd.bearing_error is None else float(nav_cmd.bearing_error),
+        heading_alignment_scale=None if nav_cmd.heading_alignment_scale is None else float(nav_cmd.heading_alignment_scale),
+        raw_command=None if nav_cmd.raw_command is None else tuple(float(v) for v in nav_cmd.raw_command.tuple),
     )
 
 

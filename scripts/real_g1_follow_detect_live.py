@@ -437,6 +437,9 @@ def main() -> int:
     parser.add_argument("--target-nav-replan-every", type=int, default=0, help="Replan cadence; 0 disables periodic replanning.")
     parser.add_argument("--target-nav-enable-replanning", action="store_true", help="Enable target-nav replanning.")
     parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters.")
+    parser.add_argument("--target-nav-command-mode", choices=("holonomic", "heading_aligned"), default="holonomic", help="Waypoint-to-command controller. heading_aligned prefers vx+wz and damps vy for real G1 tests.")
+    parser.add_argument("--heading-lateral-scale", type=float, default=0.20, help="Policy-level lateral damping used by --target-nav-command-mode heading_aligned.")
+    parser.add_argument("--heading-min-vx-scale", type=float, default=0.25, help="Minimum forward scale used by heading_aligned mode when bearing error is large.")
     parser.add_argument("--enable-command-odometry", action="store_true", help="Inject simple command-integrated pose into observations for short-horizon real tests.")
     parser.add_argument("--command-odom-max-dt", type=float, default=2.0, help="Maximum dt integrated by command odometry per update; use <=0 to disable the cap.")
     parser.add_argument("--command-odom-target-frame", choices=("body", "world"), default="body", help="Frame of fresh target hints before command-odometry injection/propagation. Current live detector emits body-frame hints.")
@@ -557,6 +560,9 @@ def main() -> int:
             enable_replanning=args.target_nav_enable_replanning,
             replan_every=args.target_nav_replan_every,
             inflation_radius_m=args.target_nav_inflation,
+            command_mode=args.target_nav_command_mode,
+            heading_lateral_scale=float(args.heading_lateral_scale),
+            heading_min_vx_scale=float(args.heading_min_vx_scale),
         )
     )
     policy = StopUnlessTargetPolicy(nav_policy)
@@ -607,6 +613,11 @@ def main() -> int:
             "target_propagation_enabled": bool(args.enable_command_odometry and not args.disable_target_propagation),
             "max_dt_s": None if args.command_odom_max_dt < 0.0 else float(args.command_odom_max_dt),
         },
+        "target_nav_command": {
+            "mode": str(args.target_nav_command_mode),
+            "heading_lateral_scale": float(args.heading_lateral_scale),
+            "heading_min_vx_scale": float(args.heading_min_vx_scale),
+        },
     }
     write_run_info(lidar_debug_dir, run_info)
     write_run_info(rgbd_debug_dir, run_info)
@@ -618,6 +629,7 @@ def main() -> int:
     print(f"[INFO]: yolo_model={args.yolo_model!r} yolo_device={args.yolo_device!r} redetect_every={args.redetect_every}")
     print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
     print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
+    print(f"[INFO]: target-nav command: mode={args.target_nav_command_mode} heading_lateral_scale={args.heading_lateral_scale} heading_min_vx_scale={args.heading_min_vx_scale}")
     print(f"[INFO]: command odometry: enabled={bool(args.enable_command_odometry)} target_frame={args.command_odom_target_frame} target_propagation={bool(args.enable_command_odometry and not args.disable_target_propagation)} max_dt={None if args.command_odom_max_dt < 0.0 else args.command_odom_max_dt}")
     print(f"[INFO]: run_id={run_id}")
     if lidar_debug_dir:

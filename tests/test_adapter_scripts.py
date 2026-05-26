@@ -103,3 +103,5 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--enable-command-odometry" in stdout
     assert "--command-odom-target-frame" in stdout
     assert "--disable-target-propagation" in stdout
+    assert "--target-nav-command-mode" in stdout
+    assert "--heading-lateral-scale" in stdout
