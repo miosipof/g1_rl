@@ -106,6 +106,9 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--disable-target-propagation" in stdout
     assert "--target-nav-command-mode" in stdout
     assert "--heading-lateral-scale" in stdout
+    assert "--heading-lookahead-m" in stdout
+    assert "--heading-rotate-in-place-angle-rad" in stdout
+    assert "--target-nav-max-wz" in stdout
 
 
 def test_isaac_stream_compare_script_help_exposes_stream_flags() -> None:

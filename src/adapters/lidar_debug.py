@@ -363,6 +363,7 @@ class LidarDebugWriter:
             "waypoint_y_b": "" if policy_debug is None or getattr(policy_debug, "waypoint_xy_b", None) is None else f"{float(policy_debug.waypoint_xy_b[1]):.6f}",
             "bearing_error": "" if policy_debug is None or getattr(policy_debug, "bearing_error", None) is None else f"{float(policy_debug.bearing_error):.6f}",
             "heading_alignment_scale": "" if policy_debug is None or getattr(policy_debug, "heading_alignment_scale", None) is None else f"{float(policy_debug.heading_alignment_scale):.6f}",
+            "heading_turn_in_place": "" if policy_debug is None else bool(getattr(policy_debug, "heading_turn_in_place", False)),
             "raw_vx": "" if policy_debug is None or getattr(policy_debug, "raw_command", None) is None else f"{float(policy_debug.raw_command[0]):.6f}",
             "raw_vy": "" if policy_debug is None or getattr(policy_debug, "raw_command", None) is None else f"{float(policy_debug.raw_command[1]):.6f}",
             "raw_wz": "" if policy_debug is None or getattr(policy_debug, "raw_command", None) is None else f"{float(policy_debug.raw_command[2]):.6f}",

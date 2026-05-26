@@ -154,7 +154,13 @@ def main() -> int:
     parser.add_argument("--target-nav-replan-every", type=int, default=0, help="Replan cadence for --policy target-nav; 0 disables periodic replanning.")
     parser.add_argument("--target-nav-enable-replanning", action="store_true", help="Enable path conflict/periodic replanning in --policy target-nav.")
     parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters for --policy target-nav.")
+    parser.add_argument("--target-nav-max-wz", type=float, default=None, help="Override target-nav policy max yaw rate before final Unitree command scaling.")
     parser.add_argument("--target-nav-command-mode", choices=("holonomic", "heading_aligned"), default="holonomic", help="Waypoint-to-command controller for --policy target-nav. heading_aligned prefers vx+wz and damps vy.")
+    parser.add_argument("--heading-lookahead-m", type=float, default=0.60, help="Path lookahead distance used by heading_aligned mode to smooth local grid-cell turns.")
+    parser.add_argument("--heading-slow-angle-rad", type=float, default=0.35, help="Bearing error above which heading_aligned starts reducing vx/vy.")
+    parser.add_argument("--heading-rotate-in-place-angle-rad", type=float, default=0.80, help="Bearing error above which heading_aligned commands turn-first behavior.")
+    parser.add_argument("--heading-rotate-vx-scale", type=float, default=0.0, help="Forward scale during turn-first heading alignment.")
+    parser.add_argument("--heading-rotate-lateral-scale", type=float, default=0.0, help="Lateral scale during turn-first heading alignment.")
     parser.add_argument("--heading-lateral-scale", type=float, default=0.20, help="Policy-level lateral damping used by --target-nav-command-mode heading_aligned.")
     parser.add_argument("--heading-min-vx-scale", type=float, default=0.25, help="Minimum forward scale used by heading_aligned mode when bearing error is large.")
     parser.add_argument("--obstacle-front-m", type=float, default=None, help="Optional synthetic front obstacle distance.")
@@ -213,6 +219,16 @@ def main() -> int:
         raise SystemExit("--target-nav-replan-every must be >= 0")
     if args.target_nav_inflation < 0.0:
         raise SystemExit("--target-nav-inflation must be >= 0")
+    if args.target_nav_max_wz is not None and args.target_nav_max_wz <= 0.0:
+        raise SystemExit("--target-nav-max-wz must be positive when provided")
+    if args.heading_lookahead_m < 0.0:
+        raise SystemExit("--heading-lookahead-m must be >= 0")
+    if args.heading_slow_angle_rad < 0.0:
+        raise SystemExit("--heading-slow-angle-rad must be >= 0")
+    if args.heading_rotate_in_place_angle_rad < args.heading_slow_angle_rad:
+        raise SystemExit("--heading-rotate-in-place-angle-rad must be >= --heading-slow-angle-rad")
+    if args.heading_rotate_vx_scale < 0.0 or args.heading_rotate_lateral_scale < 0.0:
+        raise SystemExit("--heading-rotate-vx-scale and --heading-rotate-lateral-scale must be >= 0")
     if not (0.0 <= args.rgbd_debug_yolo_confidence <= 1.0):
         raise SystemExit("--rgbd-debug-yolo-confidence must be in [0, 1]")
     if not (0.0 <= args.rgbd_debug_yolo_iou <= 1.0):

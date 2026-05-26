@@ -437,7 +437,13 @@ def main() -> int:
     parser.add_argument("--target-nav-replan-every", type=int, default=0, help="Replan cadence; 0 disables periodic replanning.")
     parser.add_argument("--target-nav-enable-replanning", action="store_true", help="Enable target-nav replanning.")
     parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters.")
+    parser.add_argument("--target-nav-max-wz", type=float, default=None, help="Override target-nav policy max yaw rate before final Unitree command scaling.")
     parser.add_argument("--target-nav-command-mode", choices=("holonomic", "heading_aligned"), default="holonomic", help="Waypoint-to-command controller. heading_aligned prefers vx+wz and damps vy for real G1 tests.")
+    parser.add_argument("--heading-lookahead-m", type=float, default=0.60, help="Path lookahead distance used by heading_aligned mode to smooth local grid-cell turns.")
+    parser.add_argument("--heading-slow-angle-rad", type=float, default=0.35, help="Bearing error above which heading_aligned starts reducing vx/vy.")
+    parser.add_argument("--heading-rotate-in-place-angle-rad", type=float, default=0.80, help="Bearing error above which heading_aligned commands turn-first behavior.")
+    parser.add_argument("--heading-rotate-vx-scale", type=float, default=0.0, help="Forward scale during turn-first heading alignment.")
+    parser.add_argument("--heading-rotate-lateral-scale", type=float, default=0.0, help="Lateral scale during turn-first heading alignment.")
     parser.add_argument("--heading-lateral-scale", type=float, default=0.20, help="Policy-level lateral damping used by --target-nav-command-mode heading_aligned.")
     parser.add_argument("--heading-min-vx-scale", type=float, default=0.25, help="Minimum forward scale used by heading_aligned mode when bearing error is large.")
     parser.add_argument("--enable-command-odometry", action="store_true", help="Inject simple command-integrated pose into observations for short-horizon real tests.")
@@ -476,6 +482,20 @@ def main() -> int:
         raise SystemExit("--realsense-timeout-ms must be > 0")
     if args.livox_timeout <= 0.0:
         raise SystemExit("--livox-timeout must be > 0")
+    if args.target_nav_replan_every < 0:
+        raise SystemExit("--target-nav-replan-every must be >= 0")
+    if args.target_nav_inflation < 0.0:
+        raise SystemExit("--target-nav-inflation must be >= 0")
+    if args.target_nav_max_wz is not None and args.target_nav_max_wz <= 0.0:
+        raise SystemExit("--target-nav-max-wz must be positive when provided")
+    if args.heading_lookahead_m < 0.0:
+        raise SystemExit("--heading-lookahead-m must be >= 0")
+    if args.heading_slow_angle_rad < 0.0:
+        raise SystemExit("--heading-slow-angle-rad must be >= 0")
+    if args.heading_rotate_in_place_angle_rad < args.heading_slow_angle_rad:
+        raise SystemExit("--heading-rotate-in-place-angle-rad must be >= --heading-slow-angle-rad")
+    if args.heading_rotate_vx_scale < 0.0 or args.heading_rotate_lateral_scale < 0.0:
+        raise SystemExit("--heading-rotate-vx-scale and --heading-rotate-lateral-scale must be >= 0")
     if args.state_samples < 1:
         raise SystemExit("--state-samples must be >= 1")
     if args.state_interval_s < 0.0:
@@ -560,9 +580,15 @@ def main() -> int:
             enable_replanning=args.target_nav_enable_replanning,
             replan_every=args.target_nav_replan_every,
             inflation_radius_m=args.target_nav_inflation,
+            max_wz=args.target_nav_max_wz,
             command_mode=args.target_nav_command_mode,
             heading_lateral_scale=float(args.heading_lateral_scale),
             heading_min_vx_scale=float(args.heading_min_vx_scale),
+            heading_slow_angle_rad=float(args.heading_slow_angle_rad),
+            heading_rotate_in_place_angle_rad=float(args.heading_rotate_in_place_angle_rad),
+            heading_rotate_vx_scale=float(args.heading_rotate_vx_scale),
+            heading_rotate_lateral_scale=float(args.heading_rotate_lateral_scale),
+            path_lookahead_m=float(args.heading_lookahead_m),
         )
     )
     policy = StopUnlessTargetPolicy(nav_policy)
@@ -617,6 +643,12 @@ def main() -> int:
             "mode": str(args.target_nav_command_mode),
             "heading_lateral_scale": float(args.heading_lateral_scale),
             "heading_min_vx_scale": float(args.heading_min_vx_scale),
+            "heading_lookahead_m": float(args.heading_lookahead_m),
+            "heading_slow_angle_rad": float(args.heading_slow_angle_rad),
+            "heading_rotate_in_place_angle_rad": float(args.heading_rotate_in_place_angle_rad),
+            "heading_rotate_vx_scale": float(args.heading_rotate_vx_scale),
+            "heading_rotate_lateral_scale": float(args.heading_rotate_lateral_scale),
+            "target_nav_max_wz": None if args.target_nav_max_wz is None else float(args.target_nav_max_wz),
         },
     }
     write_run_info(lidar_debug_dir, run_info)
@@ -629,7 +661,7 @@ def main() -> int:
     print(f"[INFO]: yolo_model={args.yolo_model!r} yolo_device={args.yolo_device!r} redetect_every={args.redetect_every}")
     print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
     print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
-    print(f"[INFO]: target-nav command: mode={args.target_nav_command_mode} heading_lateral_scale={args.heading_lateral_scale} heading_min_vx_scale={args.heading_min_vx_scale}")
+    print(f"[INFO]: target-nav command: mode={args.target_nav_command_mode} heading_lateral_scale={args.heading_lateral_scale} heading_min_vx_scale={args.heading_min_vx_scale} lookahead={args.heading_lookahead_m} slow_angle={args.heading_slow_angle_rad} rotate_angle={args.heading_rotate_in_place_angle_rad} max_wz={args.target_nav_max_wz}")
     print(f"[INFO]: command odometry: enabled={bool(args.enable_command_odometry)} target_frame={args.command_odom_target_frame} target_propagation={bool(args.enable_command_odometry and not args.disable_target_propagation)} max_dt={None if args.command_odom_max_dt < 0.0 else args.command_odom_max_dt}")
     print(f"[INFO]: run_id={run_id}")
     if lidar_debug_dir:
