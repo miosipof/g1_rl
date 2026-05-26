@@ -57,7 +57,7 @@ from adapters import (
     load_adapter_config,
 )
 from adapters.real_livox import LivoxAdapterConfig, UnitreeVibesLivox2Adapter, UnitreeVibesLivox2AdapterConfig
-from adapters.safety_supervisor import SafetySupervisor
+from adapters.safety_supervisor import SafetySupervisor, SafetySupervisorConfig
 from g1_nav_rl.perception.target_from_bbox import (
     Detection2D,
     TargetFromBBoxConfig,
@@ -121,6 +121,8 @@ class DetectTargetObservationProvider:
         yolo_device: str | None,
         target_class: str,
         redetect_every_steps: int,
+        occluded_redetect_every_steps: int,
+        lost_redetect_every_steps: int,
         occlusion_grace_steps: int,
         smoothing_alpha: float,
         max_jump_m: float,
@@ -135,6 +137,8 @@ class DetectTargetObservationProvider:
         self.base_provider = base_provider
         self.target_class = str(target_class)
         self.redetect_every_steps = int(redetect_every_steps)
+        self.occluded_redetect_every_steps = int(occluded_redetect_every_steps)
+        self.lost_redetect_every_steps = int(lost_redetect_every_steps)
         self.occlusion_grace_steps = int(occlusion_grace_steps)
         self.smoothing_alpha = float(smoothing_alpha)
         self.max_jump_m = float(max_jump_m)
@@ -165,8 +169,9 @@ class DetectTargetObservationProvider:
 
     def read_observation(self) -> RobotObservation:
         obs: RobotObservation = self.base_provider.read_observation()
-        should_detect = self.active_target is None or self.redetect_every_steps <= 1 or (
-            self.step_index % self.redetect_every_steps == 0
+        redetect_interval = self._current_redetect_interval()
+        should_detect = self.active_target is None or redetect_interval <= 1 or (
+            self.step_index % redetect_interval == 0
         )
         status: TargetTrackingStatus
         if should_detect:
@@ -182,9 +187,21 @@ class DetectTargetObservationProvider:
         meta["target_tracking"] = status.to_dict()
         meta["target_tracking_step"] = self.step_index
         meta["target_redetect_due"] = should_detect
+        meta["target_redetect_interval"] = redetect_interval
         out = replace(obs, target_hint=active, metadata=meta)
         self.step_index += 1
         return out
+
+    def _current_redetect_interval(self) -> int:
+        # When target is lost or recently occluded, do not wait for the normal
+        # tracking cadence.  Force frequent reacquisition attempts so the robot
+        # does not abort just because the next scheduled redetect is not due.
+        state = self.last_status.state
+        if state == "lost":
+            return max(1, int(self.lost_redetect_every_steps))
+        if state == "occluded_recent":
+            return max(1, int(self.occluded_redetect_every_steps))
+        return max(1, int(self.redetect_every_steps))
 
     def _detect_target(self, obs: RobotObservation) -> tuple[Target2D | None, list[Detection2D], TargetTrackingStatus]:
         if obs.rgbd is None:
@@ -323,6 +340,10 @@ class DetectTargetObservationProvider:
                 missed_steps=missed,
                 rejected_jump_m=None if base is None else base.rejected_jump_m,
             )
+        # Drop the stale body-frame target once the grace interval expires.
+        # Command-odometry propagation still keeps a world-frame target only while
+        # the wrapped observation exposes an active target.
+        self.active_target = None
         return TargetTrackingStatus(
             state="lost",
             reason=reason,
@@ -424,7 +445,9 @@ def main() -> int:
     parser.add_argument("--yolo-iou", type=float, default=0.45, help="YOLO IoU threshold.")
     parser.add_argument("--yolo-device", default="cpu", help="YOLO device. Default: cpu for Jetson compatibility.")
     parser.add_argument("--target-class", default="person", help="YOLO class to follow.")
-    parser.add_argument("--redetect-every", type=int, default=5, help="Run YOLO every N bridge steps.")
+    parser.add_argument("--redetect-every", type=int, default=5, help="Run YOLO every N bridge steps while actively tracking.")
+    parser.add_argument("--occluded-redetect-every", type=int, default=1, help="Run YOLO every N bridge steps while target is occluded_recent. Default: every step.")
+    parser.add_argument("--lost-redetect-every", type=int, default=1, help="Run YOLO every N bridge steps while target is lost. Default: every step.")
     parser.add_argument("--occlusion-grace-steps", type=int, default=50, help="Keep last target for this many missed steps.")
     parser.add_argument("--target-smoothing-alpha", type=float, default=0.35, help="Target low-pass smoothing alpha.")
     parser.add_argument("--target-max-jump-m", type=float, default=1.25, help="Reject target jumps larger than this distance.")
@@ -462,6 +485,10 @@ def main() -> int:
     parser.add_argument("--command-vx-scale", type=float, default=1.0, help="Final vx scale/sign applied before Unitree Move().")
     parser.add_argument("--command-vy-scale", type=float, default=1.0, help="Final vy scale/sign applied before Unitree Move().")
     parser.add_argument("--command-wz-scale", type=float, default=1.0, help="Final wz scale/sign applied before Unitree Move(); use -1 if yaw sign is inverted.")
+    parser.add_argument("--allow-yaw-on-front-stop", action="store_true", help="Allow yaw-only escape commands when front obstacle stop would otherwise zero all motion.")
+    parser.add_argument("--front-stop-yaw-escape-min-wz", type=float, default=0.05, help="Minimum proposed |wz| required to preserve yaw during front-obstacle stop.")
+    parser.add_argument("--front-stop-yaw-escape-max-wz", type=float, default=0.60, help="Maximum |wz| allowed during front-obstacle yaw escape.")
+    parser.add_argument("--front-stop-yaw-escape-max-linear", type=float, default=0.05, help="Maximum proposed linear speed norm allowed for yaw escape during front-obstacle stop.")
     parser.add_argument("--yes-i-understand-this-moves-the-robot", action="store_true", help="Enable real Unitree Move commands.")
     parser.add_argument("--allow-synthetic-robot-state-motion", action="store_true", help="Required for real motion until real RobotState provider is implemented.")
     args = parser.parse_args()
@@ -472,6 +499,10 @@ def main() -> int:
         raise SystemExit("--dt must be non-negative")
     if args.redetect_every < 1:
         raise SystemExit("--redetect-every must be >= 1")
+    if args.occluded_redetect_every < 1:
+        raise SystemExit("--occluded-redetect-every must be >= 1")
+    if args.lost_redetect_every < 1:
+        raise SystemExit("--lost-redetect-every must be >= 1")
     if args.occlusion_grace_steps < 0:
         raise SystemExit("--occlusion-grace-steps must be >= 0")
     if not (0.0 <= args.target_smoothing_alpha <= 1.0):
@@ -502,6 +533,12 @@ def main() -> int:
         raise SystemExit("--state-interval-s must be non-negative")
     if args.command_odom_max_dt == 0.0:
         raise SystemExit("--command-odom-max-dt must be positive, negative, or omitted; use <0 to disable the cap")
+    if args.front_stop_yaw_escape_min_wz < 0.0:
+        raise SystemExit("--front-stop-yaw-escape-min-wz must be >= 0")
+    if args.front_stop_yaw_escape_max_wz <= 0.0:
+        raise SystemExit("--front-stop-yaw-escape-max-wz must be > 0")
+    if args.front_stop_yaw_escape_max_linear < 0.0:
+        raise SystemExit("--front-stop-yaw-escape-max-linear must be >= 0")
 
     real_motion = bool(args.yes_i_understand_this_moves_the_robot)
     if real_motion and not args.allow_synthetic_robot_state_motion:
@@ -550,6 +587,8 @@ def main() -> int:
         yolo_device=None if args.yolo_device.lower() in {"auto", "none", ""} else args.yolo_device,
         target_class=args.target_class,
         redetect_every_steps=args.redetect_every,
+        occluded_redetect_every_steps=args.occluded_redetect_every,
+        lost_redetect_every_steps=args.lost_redetect_every,
         occlusion_grace_steps=args.occlusion_grace_steps,
         smoothing_alpha=args.target_smoothing_alpha,
         max_jump_m=args.target_max_jump_m,
@@ -592,7 +631,15 @@ def main() -> int:
         )
     )
     policy = StopUnlessTargetPolicy(nav_policy)
-    supervisor = SafetySupervisor.from_runtime_config(cfg)
+    supervisor = SafetySupervisor.from_runtime_config(
+        cfg,
+        config=SafetySupervisorConfig(
+            allow_yaw_on_front_stop=bool(args.allow_yaw_on_front_stop),
+            front_stop_yaw_escape_min_wz=float(args.front_stop_yaw_escape_min_wz),
+            front_stop_yaw_escape_max_wz=float(args.front_stop_yaw_escape_max_wz),
+            front_stop_yaw_escape_max_linear_mps=float(args.front_stop_yaw_escape_max_linear),
+        ),
+    )
     require_fsm_id = None if args.allow_non_200 else int(args.expected_fsm_id)
     sink = UnitreeLocoAdapter(
         config=UnitreeLocoAdapterConfig(
@@ -650,6 +697,18 @@ def main() -> int:
             "heading_rotate_lateral_scale": float(args.heading_rotate_lateral_scale),
             "target_nav_max_wz": None if args.target_nav_max_wz is None else float(args.target_nav_max_wz),
         },
+        "target_redetection": {
+            "redetect_every": int(args.redetect_every),
+            "occluded_redetect_every": int(args.occluded_redetect_every),
+            "lost_redetect_every": int(args.lost_redetect_every),
+            "occlusion_grace_steps": int(args.occlusion_grace_steps),
+        },
+        "safety_supervisor": {
+            "allow_yaw_on_front_stop": bool(args.allow_yaw_on_front_stop),
+            "front_stop_yaw_escape_min_wz": float(args.front_stop_yaw_escape_min_wz),
+            "front_stop_yaw_escape_max_wz": float(args.front_stop_yaw_escape_max_wz),
+            "front_stop_yaw_escape_max_linear": float(args.front_stop_yaw_escape_max_linear),
+        },
     }
     write_run_info(lidar_debug_dir, run_info)
     write_run_info(rgbd_debug_dir, run_info)
@@ -658,11 +717,12 @@ def main() -> int:
     print(f"[INFO]: config={args.config}")
     print(f"[INFO]: iface={args.iface}")
     print(f"[INFO]: real_motion={real_motion}")
-    print(f"[INFO]: yolo_model={args.yolo_model!r} yolo_device={args.yolo_device!r} redetect_every={args.redetect_every}")
+    print(f"[INFO]: yolo_model={args.yolo_model!r} yolo_device={args.yolo_device!r} redetect_every={args.redetect_every} occluded_redetect_every={args.occluded_redetect_every} lost_redetect_every={args.lost_redetect_every}")
     print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
     print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
     print(f"[INFO]: target-nav command: mode={args.target_nav_command_mode} heading_lateral_scale={args.heading_lateral_scale} heading_min_vx_scale={args.heading_min_vx_scale} lookahead={args.heading_lookahead_m} slow_angle={args.heading_slow_angle_rad} rotate_angle={args.heading_rotate_in_place_angle_rad} max_wz={args.target_nav_max_wz}")
     print(f"[INFO]: command odometry: enabled={bool(args.enable_command_odometry)} target_frame={args.command_odom_target_frame} target_propagation={bool(args.enable_command_odometry and not args.disable_target_propagation)} max_dt={None if args.command_odom_max_dt < 0.0 else args.command_odom_max_dt}")
+    print(f"[INFO]: safety yaw escape: allow={bool(args.allow_yaw_on_front_stop)} min_wz={args.front_stop_yaw_escape_min_wz} max_wz={args.front_stop_yaw_escape_max_wz} max_linear={args.front_stop_yaw_escape_max_linear}")
     print(f"[INFO]: run_id={run_id}")
     if lidar_debug_dir:
         print(f"[INFO]: LiDAR debug artifacts: {lidar_debug_dir}")

@@ -98,6 +98,8 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--allow-synthetic-robot-state-motion" in stdout
     assert "--allow-non-200" in stdout
     assert "--redetect-every" in stdout
+    assert "--occluded-redetect-every" in stdout
+    assert "--lost-redetect-every" in stdout
     assert "--command-wz-scale" in stdout
     assert "--run-id" in stdout
     assert "--no-timestamp-debug-dirs" in stdout
@@ -109,6 +111,8 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--heading-lookahead-m" in stdout
     assert "--heading-rotate-in-place-angle-rad" in stdout
     assert "--target-nav-max-wz" in stdout
+    assert "--allow-yaw-on-front-stop" in stdout
+    assert "--front-stop-yaw-escape-max-wz" in stdout
 
 
 def test_isaac_stream_compare_script_help_exposes_stream_flags() -> None:

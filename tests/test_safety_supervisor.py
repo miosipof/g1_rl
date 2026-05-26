@@ -12,6 +12,7 @@ from adapters import (
     RobotState,
     SafetyConfig,
     SafetySupervisor,
+    SafetySupervisorConfig,
     WatchdogConfig,
 )
 
@@ -244,3 +245,52 @@ def test_safety_supervisor_does_not_front_stop_for_reverse_command() -> None:
 
     assert not decision.command.is_stop
     assert decision.command.vx == pytest.approx(-0.05)
+
+
+def test_safety_supervisor_allows_yaw_escape_on_front_stop_when_enabled() -> None:
+    sup = _supervisor(
+        config=SafetySupervisorConfig(
+            allow_yaw_on_front_stop=True,
+            front_stop_yaw_escape_min_wz=0.05,
+            front_stop_yaw_escape_max_wz=0.60,
+            front_stop_yaw_escape_max_linear_mps=0.05,
+        )
+    )
+    points = np.array([[0.20, 0.0, 0.5]], dtype=np.float32)
+    observation = _obs(lidar=_lidar(10.0, points))
+
+    decision = sup.filter_command(
+        Command2D(0.02, 0.0, 0.40, timestamp_s=9.95),
+        observation,
+        operator_enabled=True,
+        now_s=10.0,
+    )
+
+    assert not decision.command.is_stop
+    assert decision.command.vx == pytest.approx(0.0)
+    assert decision.command.vy == pytest.approx(0.0)
+    assert decision.command.wz == pytest.approx(0.20)  # clipped by command limits before safety escape
+    assert not decision.reasons
+    assert any(w.startswith("front_obstacle_yaw_escape") for w in decision.warnings)
+    assert decision.metadata["front_yaw_escape_active"] is True
+
+
+def test_safety_supervisor_yaw_escape_still_stops_when_linear_too_large() -> None:
+    sup = _supervisor(
+        config=SafetySupervisorConfig(
+            allow_yaw_on_front_stop=True,
+            front_stop_yaw_escape_max_linear_mps=0.03,
+        )
+    )
+    points = np.array([[0.20, 0.0, 0.5]], dtype=np.float32)
+    observation = _obs(lidar=_lidar(10.0, points))
+
+    decision = sup.filter_command(
+        Command2D(0.10, 0.0, 0.20, timestamp_s=9.95),
+        observation,
+        operator_enabled=True,
+        now_s=10.0,
+    )
+
+    assert decision.command.is_stop
+    assert any(r.startswith("front_obstacle_stop") for r in decision.reasons)
