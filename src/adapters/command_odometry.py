@@ -20,6 +20,7 @@ from g1_nav_rl.navigation.simple_nav import (
     Target2D,
     angle_wrap,
     body_to_world_xy,
+    world_to_body_xy,
     integrate_body_command,
 )
 
@@ -278,9 +279,138 @@ class CommandOdometryObservationProvider:
         return replace(robot_state, pose=pose, details=merged_details)
 
 
+@dataclass
+class CommandOdometryTargetPropagationProvider(CommandOdometryObservationProvider):
+    """Inject command odometry and keep occluded targets fixed in world frame.
+
+    The live detector currently emits target hints in the robot/body frame.  If a
+    target is missed for a few frames, its tracker can still output the previous
+    body-frame target.  Without propagation this makes the target appear to stay
+    at the same body-frame offset even while command odometry estimates that the
+    robot moved.
+
+    This provider stores each fresh target measurement as a world-frame point
+    using the current command-odometry pose.  During ``occluded_recent`` periods
+    it feeds that stored world-frame target to the policy and reports the
+    corresponding current body-frame target in metadata.  When the tracker is
+    ``lost``, the policy target is cleared.
+    """
+
+    clear_target_on_lost: bool = True
+    last_target_world_xy: tuple[float, float] | None = field(default=None, init=False)
+    last_target_update_s: float | None = field(default=None, init=False)
+    last_target_source: str | None = field(default=None, init=False)
+
+    def read_observation(self) -> RobotObservation:
+        obs = self.base_provider.read_observation()
+        pose = self.estimator.advance_to(float(obs.timestamp_s))
+        target_hint, target_meta, tracking_meta = self._propagated_target_hint(obs, pose)
+        robot_state = self._with_pose_robot_state(obs.robot_state, pose, obs.timestamp_s)
+        metadata = dict(obs.metadata)
+        metadata["command_odometry"] = self.estimator.snapshot().to_dict()
+        metadata["command_odometry_target_hint_frame_in"] = self.target_hint_frame
+        metadata["command_odometry_target_hint_converted"] = bool(
+            target_meta.get("measurement_used") and self.target_hint_frame == "body"
+        )
+        metadata["target_propagation"] = target_meta
+        if tracking_meta is not None:
+            metadata["target_tracking"] = tracking_meta
+        statuses = list(obs.statuses)
+        statuses.append(
+            AdapterStatus(
+                name="command_odometry",
+                health=AdapterHealth.OK,
+                timestamp_s=obs.timestamp_s,
+                message="command-integrated pose and target propagation injected",
+                details={**self.estimator.snapshot().to_dict(), "target_propagation": target_meta},
+            )
+        )
+        return replace(
+            obs,
+            pose=pose,
+            robot_state=robot_state,
+            target_hint=target_hint,
+            statuses=tuple(statuses),
+            metadata=metadata,
+        )
+
+    def _propagated_target_hint(
+        self,
+        obs: RobotObservation,
+        pose: Pose2D,
+    ) -> tuple[Target2D | None, dict[str, Any], dict[str, Any] | None]:
+        tracking_raw = obs.metadata.get("target_tracking")
+        tracking = dict(tracking_raw) if isinstance(tracking_raw, Mapping) else None
+        state = None if tracking is None else str(tracking.get("state"))
+        reason = None if tracking is None else str(tracking.get("reason"))
+        raw_target = None if tracking is None else tracking.get("raw_target")
+        measurement_used = bool(obs.target_hint is not None and state == "tracking" and raw_target is not None)
+
+        source = "none"
+        target_world_xy: tuple[float, float] | None = None
+        target_body_xy: tuple[float, float] | None = None
+        propagated = False
+
+        if measurement_used and obs.target_hint is not None:
+            target_world_xy = self._target_to_world(obs.target_hint, pose)
+            self.last_target_world_xy = target_world_xy
+            self.last_target_update_s = float(obs.timestamp_s)
+            self.last_target_source = "measurement"
+            source = "measurement"
+        elif state == "lost" and self.clear_target_on_lost:
+            target_world_xy = None
+            source = "lost"
+        elif self.last_target_world_xy is not None and state in {"occluded_recent", "tracking"}:
+            # ``tracking`` without ``raw_target`` is unusual, but treating it as
+            # propagation is safer than re-freezing a stale body-frame hint.
+            target_world_xy = self.last_target_world_xy
+            propagated = True
+            source = "propagated_last_world_target"
+        elif obs.target_hint is not None:
+            # Fallback for legacy/test providers that expose a target without the
+            # target-tracking metadata used by the live script.
+            target_world_xy = self._target_to_world(obs.target_hint, pose)
+            self.last_target_world_xy = target_world_xy
+            self.last_target_update_s = float(obs.timestamp_s)
+            self.last_target_source = "fallback_target_hint"
+            source = "fallback_target_hint"
+
+        target_hint = None if target_world_xy is None else Target2D(float(target_world_xy[0]), float(target_world_xy[1]))
+        if target_world_xy is not None:
+            target_body_xy = world_to_body_xy(target_world_xy, pose)
+
+        if tracking is not None:
+            tracking["target_frame"] = "body" if target_body_xy is not None else None
+            tracking["active_target"] = None if target_body_xy is None else [float(target_body_xy[0]), float(target_body_xy[1])]
+            tracking["active_target_world"] = None if target_world_xy is None else [float(target_world_xy[0]), float(target_world_xy[1])]
+            tracking["propagated_by_command_odometry"] = bool(propagated)
+
+        meta = {
+            "enabled": True,
+            "source": source,
+            "input_state": state,
+            "input_reason": reason,
+            "measurement_used": bool(measurement_used),
+            "propagated": bool(propagated),
+            "target_hint_frame_in": self.target_hint_frame,
+            "target_world_xy": None if target_world_xy is None else [float(target_world_xy[0]), float(target_world_xy[1])],
+            "target_body_xy": None if target_body_xy is None else [float(target_body_xy[0]), float(target_body_xy[1])],
+            "last_target_update_s": self.last_target_update_s,
+            "last_target_source": self.last_target_source,
+            "pose_xy_yaw": [float(pose.x), float(pose.y), float(pose.yaw)],
+        }
+        return target_hint, meta, tracking
+
+    def _target_to_world(self, target: Target2D, pose: Pose2D) -> tuple[float, float]:
+        if self.target_hint_frame == "world":
+            return target.xy
+        return body_to_world_xy(target.xy, pose)
+
+
 __all__ = [
     "CommandOdometryConfig",
     "CommandOdometryEstimator",
     "CommandOdometryObservationProvider",
+    "CommandOdometryTargetPropagationProvider",
     "CommandOdometrySnapshot",
 ]

@@ -10,6 +10,7 @@ from adapters import (
     CommandOdometryConfig,
     CommandOdometryEstimator,
     CommandOdometryObservationProvider,
+    CommandOdometryTargetPropagationProvider,
     Pose2D,
     RobotObservation,
     RobotState,
@@ -160,3 +161,83 @@ def test_command_odometry_update_from_bridge_result_stops_on_rejected_command() 
     # It integrated the previously active command until t=1.0, then stopped.
     assert provider.snapshot().pose.x == pytest.approx(1.0)
     assert provider.snapshot().active_command.is_stop
+
+
+def test_command_odometry_target_propagation_keeps_occluded_target_world_fixed() -> None:
+    base = FakeProvider(
+        RobotObservation(
+            timestamp_s=0.0,
+            target_hint=Target2D(2.0, 0.0),
+            metadata={
+                "target_tracking": {
+                    "state": "tracking",
+                    "reason": "measurement",
+                    "active_target": [2.0, 0.0],
+                    "raw_target": [2.0, 0.0],
+                }
+            },
+        ),
+        RobotObservation(
+            timestamp_s=1.0,
+            target_hint=Target2D(2.0, 0.0),  # stale body-frame target from the simple tracker
+            metadata={
+                "target_tracking": {
+                    "state": "occluded_recent",
+                    "reason": "no_detection",
+                    "active_target": [2.0, 0.0],
+                    "raw_target": None,
+                    "missed_steps": 1,
+                }
+            },
+        ),
+    )
+    provider = CommandOdometryTargetPropagationProvider(
+        base_provider=base,
+        estimator=CommandOdometryEstimator(CommandOdometryConfig(max_dt_s=None)),
+        target_hint_frame="body",
+    )
+
+    obs0 = provider.read_observation()
+    assert obs0.target_hint is not None
+    assert obs0.target_hint.xy == pytest.approx((2.0, 0.0))
+
+    provider.set_active_command(Command2D(1.0, 0.0, 0.0), timestamp_s=0.0)
+    obs1 = provider.read_observation()
+
+    # The world-frame target remains where it was first detected.  It is not
+    # converted again from the stale [2, 0] body-frame target after the robot
+    # has moved forward by 1 m.
+    assert obs1.pose is not None
+    assert obs1.pose.x == pytest.approx(1.0)
+    assert obs1.target_hint is not None
+    assert obs1.target_hint.xy == pytest.approx((2.0, 0.0))
+    assert obs1.metadata["target_propagation"]["propagated"] is True
+    assert obs1.metadata["target_propagation"]["target_body_xy"] == pytest.approx([1.0, 0.0])
+    assert obs1.metadata["target_tracking"]["active_target"] == pytest.approx([1.0, 0.0])
+
+
+def test_command_odometry_target_propagation_clears_target_when_lost() -> None:
+    base = FakeProvider(
+        RobotObservation(
+            timestamp_s=0.0,
+            target_hint=Target2D(1.0, 0.0),
+            metadata={"target_tracking": {"state": "tracking", "reason": "measurement", "raw_target": [1.0, 0.0]}},
+        ),
+        RobotObservation(
+            timestamp_s=1.0,
+            target_hint=None,
+            metadata={"target_tracking": {"state": "lost", "reason": "no_detection", "active_target": None}},
+        ),
+    )
+    provider = CommandOdometryTargetPropagationProvider(
+        base_provider=base,
+        estimator=CommandOdometryEstimator(CommandOdometryConfig(max_dt_s=None)),
+        target_hint_frame="body",
+    )
+
+    assert provider.read_observation().target_hint is not None
+    obs1 = provider.read_observation()
+
+    assert obs1.target_hint is None
+    assert obs1.metadata["target_propagation"]["source"] == "lost"
+    assert obs1.metadata["target_tracking"]["active_target"] is None

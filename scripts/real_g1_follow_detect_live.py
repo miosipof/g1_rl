@@ -35,6 +35,7 @@ from adapters import (
     CommandOdometryConfig,
     CommandOdometryEstimator,
     CommandOdometryObservationProvider,
+    CommandOdometryTargetPropagationProvider,
     CompositeDryRunObservationProvider,
     DryRunCommandSink,
     LidarDebugWriter,
@@ -438,7 +439,8 @@ def main() -> int:
     parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters.")
     parser.add_argument("--enable-command-odometry", action="store_true", help="Inject simple command-integrated pose into observations for short-horizon real tests.")
     parser.add_argument("--command-odom-max-dt", type=float, default=2.0, help="Maximum dt integrated by command odometry per update; use <=0 to disable the cap.")
-    parser.add_argument("--command-odom-target-frame", choices=("body", "world"), default="body", help="Frame of target hints before command-odometry injection. Current live detector emits body-frame hints.")
+    parser.add_argument("--command-odom-target-frame", choices=("body", "world"), default="body", help="Frame of fresh target hints before command-odometry injection/propagation. Current live detector emits body-frame hints.")
+    parser.add_argument("--disable-target-propagation", action="store_true", help="With command odometry enabled, use simple target-frame conversion only; do not keep occluded targets fixed in command-odometry world frame.")
     parser.add_argument("--save-lidar-debug", type=Path, default=None, help="Base directory for LiDAR occupancy/debug artifacts. A timestamped run subdir is added by default.")
     parser.add_argument("--save-rgbd-debug", type=Path, default=None, help="Base directory for RGB-D snapshot/YOLO debug artifacts. A timestamped run subdir is added by default.")
     parser.add_argument("--run-id", default=None, help="Optional run id used for timestamped debug subdirectories.")
@@ -540,7 +542,8 @@ def main() -> int:
     observation_provider = target_provider
     if args.enable_command_odometry:
         max_dt = None if args.command_odom_max_dt < 0.0 else float(args.command_odom_max_dt)
-        odom_provider = CommandOdometryObservationProvider(
+        odom_cls = CommandOdometryObservationProvider if args.disable_target_propagation else CommandOdometryTargetPropagationProvider
+        odom_provider = odom_cls(
             base_provider=target_provider,
             estimator=CommandOdometryEstimator(CommandOdometryConfig(max_dt_s=max_dt)),
             target_hint_frame=args.command_odom_target_frame,
@@ -601,6 +604,7 @@ def main() -> int:
         "command_odometry": {
             "enabled": bool(args.enable_command_odometry),
             "target_hint_frame": str(args.command_odom_target_frame),
+            "target_propagation_enabled": bool(args.enable_command_odometry and not args.disable_target_propagation),
             "max_dt_s": None if args.command_odom_max_dt < 0.0 else float(args.command_odom_max_dt),
         },
     }
@@ -614,7 +618,7 @@ def main() -> int:
     print(f"[INFO]: yolo_model={args.yolo_model!r} yolo_device={args.yolo_device!r} redetect_every={args.redetect_every}")
     print(f"[INFO]: fsm gate: require_fsm_id={require_fsm_id} state_samples={args.state_samples} state_interval_s={args.state_interval_s}")
     print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
-    print(f"[INFO]: command odometry: enabled={bool(args.enable_command_odometry)} target_frame={args.command_odom_target_frame} max_dt={None if args.command_odom_max_dt < 0.0 else args.command_odom_max_dt}")
+    print(f"[INFO]: command odometry: enabled={bool(args.enable_command_odometry)} target_frame={args.command_odom_target_frame} target_propagation={bool(args.enable_command_odometry and not args.disable_target_propagation)} max_dt={None if args.command_odom_max_dt < 0.0 else args.command_odom_max_dt}")
     print(f"[INFO]: run_id={run_id}")
     if lidar_debug_dir:
         print(f"[INFO]: LiDAR debug artifacts: {lidar_debug_dir}")

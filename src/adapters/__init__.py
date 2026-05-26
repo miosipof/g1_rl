@@ -124,6 +124,7 @@ from .command_odometry import (
     CommandOdometryConfig,
     CommandOdometryEstimator,
     CommandOdometryObservationProvider,
+    CommandOdometryTargetPropagationProvider,
     CommandOdometrySnapshot,
 )
 
@@ -185,6 +186,7 @@ __all__ = [
     "CommandOdometryConfig",
     "CommandOdometryEstimator",
     "CommandOdometryObservationProvider",
+    "CommandOdometryTargetPropagationProvider",
     "CommandOdometrySnapshot",
     "Command2D",
     "CommandLimitsConfig",
