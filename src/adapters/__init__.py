@@ -120,6 +120,17 @@ from .rgbd_debug import (
 )
 
 
+from .detection_stream import (
+    DETECTION_STREAM_SCHEMA_VERSION,
+    DetectionStreamClient,
+    DetectionStreamFrame,
+    DetectionStreamHealth,
+    DetectionStreamStatus,
+    DetectionStreamReadResult,
+    TrackDetection,
+    write_detection_stream_frame_atomic,
+)
+
 from .command_odometry import (
     CommandOdometryConfig,
     CommandOdometryEstimator,
@@ -147,6 +158,14 @@ from .g1_policy_runtime import (
 )
 
 __all__ = [
+    "write_detection_stream_frame_atomic",
+    "TrackDetection",
+    "DetectionStreamReadResult",
+    "DetectionStreamFrame",
+    "DetectionStreamHealth",
+    "DetectionStreamStatus",
+    "DetectionStreamClient",
+    "DETECTION_STREAM_SCHEMA_VERSION",
     "AdapterCommandResult",
     "AdapterHealth",
     "AdapterRuntimeConfig",

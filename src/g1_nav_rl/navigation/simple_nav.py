@@ -102,6 +102,30 @@ class SimpleNavConfig:
     command_mode: str = "holonomic"
     heading_lateral_scale: float = 0.20
     heading_min_vx_scale: float = 0.25
+    heading_slow_angle_rad: float = 0.35
+    heading_rotate_in_place_angle_rad: float = 0.80
+    heading_rotate_vx_scale: float = 0.0
+    heading_rotate_lateral_scale: float = 0.0
+    path_lookahead_m: float = 0.0
+
+    def __post_init__(self) -> None:
+        command_mode = str(self.command_mode).replace("-", "_")
+        if command_mode not in {"holonomic", "heading_aligned"}:
+            raise ValueError("SimpleNavConfig.command_mode must be 'holonomic' or 'heading_aligned'")
+        for name in (
+            "heading_lateral_scale",
+            "heading_min_vx_scale",
+            "heading_rotate_vx_scale",
+            "heading_rotate_lateral_scale",
+            "path_lookahead_m",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"SimpleNavConfig.{name} must be non-negative and finite")
+        if float(self.heading_slow_angle_rad) < 0.0:
+            raise ValueError("SimpleNavConfig.heading_slow_angle_rad must be non-negative")
+        if float(self.heading_rotate_in_place_angle_rad) < float(self.heading_slow_angle_rad):
+            raise ValueError("heading_rotate_in_place_angle_rad must be >= heading_slow_angle_rad")
 
 
 @dataclass(frozen=True)
@@ -133,6 +157,7 @@ class NavigationCommand:
     command_mode: str = "holonomic"
     bearing_error: float | None = None
     heading_alignment_scale: float | None = None
+    heading_turn_in_place: bool = False
     raw_command: MotionCommand | None = None
 
 
@@ -201,6 +226,45 @@ def select_waypoint(
     return i
 
 
+def select_lookahead_point(
+    path_xy: Sequence[PointXY],
+    current_xy: PointXY,
+    waypoint_index: int,
+    lookahead_m: float,
+) -> PointXY:
+    """Select a smoother control point along the remaining path.
+
+    ``waypoint_index`` still controls progress/reached logic. This helper only
+    chooses the point used for command generation. A positive lookahead reduces
+    grid-cell-level heading jitter and makes real-G1 yaw commands align with the
+    path corridor rather than the nearest cell.
+    """
+
+    if not path_xy:
+        return float(current_xy[0]), float(current_xy[1])
+    idx = max(0, min(int(waypoint_index), len(path_xy) - 1))
+    lookahead = max(0.0, float(lookahead_m))
+    if lookahead <= 1.0e-9:
+        x, y = path_xy[idx]
+        return float(x), float(y)
+
+    prev = (float(current_xy[0]), float(current_xy[1]))
+    accumulated = 0.0
+    for j in range(idx, len(path_xy)):
+        nxt = (float(path_xy[j][0]), float(path_xy[j][1]))
+        seg_len = math.hypot(nxt[0] - prev[0], nxt[1] - prev[1])
+        if seg_len <= 1.0e-9:
+            prev = nxt
+            continue
+        if accumulated + seg_len >= lookahead:
+            t = (lookahead - accumulated) / seg_len
+            return (prev[0] + t * (nxt[0] - prev[0]), prev[1] + t * (nxt[1] - prev[1]))
+        accumulated += seg_len
+        prev = nxt
+    x, y = path_xy[-1]
+    return float(x), float(y)
+
+
 def path_tangent_yaw(path_xy: Sequence[PointXY], waypoint_index: int, fallback_yaw: float) -> float:
     if waypoint_index <= 0 or waypoint_index >= len(path_xy):
         return float(fallback_yaw)
@@ -236,7 +300,7 @@ def command_to_waypoint_heading_aligned(
     pose: Pose2D,
     waypoint_xy_w: PointXY,
     cfg: SimpleNavConfig,
-) -> tuple[MotionCommand, PointXY, float, float, MotionCommand]:
+) -> tuple[MotionCommand, PointXY, float, float, bool, MotionCommand]:
     """Map a waypoint to a real-G1-friendly heading-aligned command.
 
     The controller prefers ``vx + wz`` over lateral strafing.  The desired yaw
@@ -248,11 +312,30 @@ def command_to_waypoint_heading_aligned(
     x_b, y_b = world_to_body_xy(waypoint_xy_w, pose)
     distance = math.hypot(x_b, y_b)
     bearing = angle_wrap(math.atan2(y_b, x_b)) if distance > 1.0e-9 else 0.0
+    abs_bearing = abs(bearing)
     cos_scale = max(0.0, math.cos(bearing))
-    alignment_scale = max(float(cfg.heading_min_vx_scale), cos_scale)
+    base_alignment_scale = max(float(cfg.heading_min_vx_scale), cos_scale)
+    lateral_scale = float(cfg.heading_lateral_scale)
+    slow_angle = max(0.0, float(cfg.heading_slow_angle_rad))
+    rotate_angle = max(slow_angle, float(cfg.heading_rotate_in_place_angle_rad))
+
+    turn_in_place = rotate_angle > 0.0 and abs_bearing >= rotate_angle
+    if rotate_angle > slow_angle and abs_bearing > slow_angle:
+        blend = min(1.0, max(0.0, (abs_bearing - slow_angle) / (rotate_angle - slow_angle)))
+    elif turn_in_place:
+        blend = 1.0
+    else:
+        blend = 0.0
+
+    alignment_scale = (1.0 - blend) * base_alignment_scale + blend * float(cfg.heading_rotate_vx_scale)
+    lateral_scale = (1.0 - blend) * lateral_scale + blend * float(cfg.heading_rotate_lateral_scale)
+    if turn_in_place:
+        alignment_scale = float(cfg.heading_rotate_vx_scale)
+        lateral_scale = float(cfg.heading_rotate_lateral_scale)
+
     min_vx = -float(cfg.max_vx) if bool(cfg.allow_backward) else 0.0
     raw_vx = float(cfg.k_xy) * distance * alignment_scale
-    raw_vy = float(cfg.k_xy) * y_b * float(cfg.heading_lateral_scale)
+    raw_vy = float(cfg.k_xy) * y_b * lateral_scale
     raw_wz = float(cfg.k_yaw) * bearing
     raw = MotionCommand(raw_vx, raw_vy, raw_wz)
     cmd = MotionCommand(
@@ -260,7 +343,7 @@ def command_to_waypoint_heading_aligned(
         clip(raw_vy, -float(cfg.max_vy), float(cfg.max_vy)),
         clip(raw_wz, -float(cfg.max_wz), float(cfg.max_wz)),
     )
-    return cmd, (x_b, y_b), bearing, alignment_scale, raw
+    return cmd, (x_b, y_b), bearing, alignment_scale, turn_in_place, raw
 
 
 def integrate_body_command(pose: Pose2D, command: MotionCommand, dt: float) -> Pose2D:
@@ -407,14 +490,21 @@ class SimpleNavigator:
             waypoint_index=self.waypoint_index,
             waypoint_reached_radius=self.config.waypoint_reached_radius,
         )
-        waypoint_xy_w = path[self.waypoint_index]
+        progress_waypoint_xy_w = path[self.waypoint_index]
+        waypoint_xy_w = select_lookahead_point(
+            path_xy=path,
+            current_xy=pose.xy,
+            waypoint_index=self.waypoint_index,
+            lookahead_m=float(self.config.path_lookahead_m),
+        )
         tangent_yaw = path_tangent_yaw(path, self.waypoint_index, pose.yaw)
         command_mode = str(self.config.command_mode).replace("-", "_")
         bearing_error: float | None = None
         heading_alignment_scale: float | None = None
+        heading_turn_in_place = False
         raw_command: MotionCommand | None = None
         if command_mode == "heading_aligned":
-            command, waypoint_xy_b, bearing_error, heading_alignment_scale, raw_command = command_to_waypoint_heading_aligned(
+            command, waypoint_xy_b, bearing_error, heading_alignment_scale, heading_turn_in_place, raw_command = command_to_waypoint_heading_aligned(
                 pose, waypoint_xy_w, self.config
             )
         elif command_mode == "holonomic":
@@ -440,6 +530,7 @@ class SimpleNavigator:
             command_mode=command_mode,
             bearing_error=bearing_error,
             heading_alignment_scale=heading_alignment_scale,
+            heading_turn_in_place=heading_turn_in_place,
             raw_command=raw_command,
         )
 

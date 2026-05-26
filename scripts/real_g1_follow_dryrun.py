@@ -43,7 +43,7 @@ from adapters import (
     timestamped_output_dir,
     write_run_info,
 )
-from adapters.safety_supervisor import SafetySupervisor
+from adapters.safety_supervisor import SafetySupervisor, SafetySupervisorConfig
 from adapters.real_livox import LivoxAdapterConfig, NpyLivoxReplayAdapter, UnitreeVibesLivox2Adapter, UnitreeVibesLivox2AdapterConfig
 
 
@@ -154,7 +154,13 @@ def main() -> int:
     parser.add_argument("--target-nav-replan-every", type=int, default=0, help="Replan cadence for --policy target-nav; 0 disables periodic replanning.")
     parser.add_argument("--target-nav-enable-replanning", action="store_true", help="Enable path conflict/periodic replanning in --policy target-nav.")
     parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters for --policy target-nav.")
+    parser.add_argument("--target-nav-max-wz", type=float, default=None, help="Override target-nav policy max yaw rate before final Unitree command scaling.")
     parser.add_argument("--target-nav-command-mode", choices=("holonomic", "heading_aligned"), default="holonomic", help="Waypoint-to-command controller for --policy target-nav. heading_aligned prefers vx+wz and damps vy.")
+    parser.add_argument("--heading-lookahead-m", type=float, default=0.60, help="Path lookahead distance used by heading_aligned mode to smooth local grid-cell turns.")
+    parser.add_argument("--heading-slow-angle-rad", type=float, default=0.35, help="Bearing error above which heading_aligned starts reducing vx/vy.")
+    parser.add_argument("--heading-rotate-in-place-angle-rad", type=float, default=0.80, help="Bearing error above which heading_aligned commands turn-first behavior.")
+    parser.add_argument("--heading-rotate-vx-scale", type=float, default=0.0, help="Forward scale during turn-first heading alignment.")
+    parser.add_argument("--heading-rotate-lateral-scale", type=float, default=0.0, help="Lateral scale during turn-first heading alignment.")
     parser.add_argument("--heading-lateral-scale", type=float, default=0.20, help="Policy-level lateral damping used by --target-nav-command-mode heading_aligned.")
     parser.add_argument("--heading-min-vx-scale", type=float, default=0.25, help="Minimum forward scale used by heading_aligned mode when bearing error is large.")
     parser.add_argument("--obstacle-front-m", type=float, default=None, help="Optional synthetic front obstacle distance.")
@@ -198,6 +204,10 @@ def main() -> int:
     parser.add_argument("--rgbd-debug-yolo-iou", type=float, default=0.45, help="YOLO IoU threshold for RGB-D debug detection.")
     parser.add_argument("--rgbd-debug-yolo-device", default=None, help="Optional YOLO device for RGB-D debug detection, e.g. cuda:0 or cpu.")
     parser.add_argument("--rgbd-debug-yolo-classes", default="person", help="Comma-separated classes to keep for RGB-D debug YOLO; use 'all' to keep every class.")
+    parser.add_argument("--allow-yaw-on-front-stop", action="store_true", help="Allow yaw-only escape commands when front obstacle stop would otherwise zero all motion.")
+    parser.add_argument("--front-stop-yaw-escape-min-wz", type=float, default=0.05, help="Minimum proposed |wz| required to preserve yaw during front-obstacle stop.")
+    parser.add_argument("--front-stop-yaw-escape-max-wz", type=float, default=0.60, help="Maximum |wz| allowed during front-obstacle yaw escape.")
+    parser.add_argument("--front-stop-yaw-escape-max-linear", type=float, default=0.05, help="Maximum proposed linear speed norm allowed for yaw escape during front-obstacle stop.")
     parser.add_argument("--json-lines", action="store_true", help="Print one JSON object per step.")
     args = parser.parse_args()
 
@@ -213,10 +223,26 @@ def main() -> int:
         raise SystemExit("--target-nav-replan-every must be >= 0")
     if args.target_nav_inflation < 0.0:
         raise SystemExit("--target-nav-inflation must be >= 0")
+    if args.target_nav_max_wz is not None and args.target_nav_max_wz <= 0.0:
+        raise SystemExit("--target-nav-max-wz must be positive when provided")
+    if args.heading_lookahead_m < 0.0:
+        raise SystemExit("--heading-lookahead-m must be >= 0")
+    if args.heading_slow_angle_rad < 0.0:
+        raise SystemExit("--heading-slow-angle-rad must be >= 0")
+    if args.heading_rotate_in_place_angle_rad < args.heading_slow_angle_rad:
+        raise SystemExit("--heading-rotate-in-place-angle-rad must be >= --heading-slow-angle-rad")
+    if args.heading_rotate_vx_scale < 0.0 or args.heading_rotate_lateral_scale < 0.0:
+        raise SystemExit("--heading-rotate-vx-scale and --heading-rotate-lateral-scale must be >= 0")
     if not (0.0 <= args.rgbd_debug_yolo_confidence <= 1.0):
         raise SystemExit("--rgbd-debug-yolo-confidence must be in [0, 1]")
     if not (0.0 <= args.rgbd_debug_yolo_iou <= 1.0):
         raise SystemExit("--rgbd-debug-yolo-iou must be in [0, 1]")
+    if args.front_stop_yaw_escape_min_wz < 0.0:
+        raise SystemExit("--front-stop-yaw-escape-min-wz must be >= 0")
+    if args.front_stop_yaw_escape_max_wz <= 0.0:
+        raise SystemExit("--front-stop-yaw-escape-max-wz must be > 0")
+    if args.front_stop_yaw_escape_max_linear < 0.0:
+        raise SystemExit("--front-stop-yaw-escape-max-linear must be >= 0")
 
     cfg = load_adapter_config(args.config)
     realsense_adapter: RealSenseRGBDAdapter | None = None
@@ -287,13 +313,27 @@ def main() -> int:
             enable_replanning=bool(args.target_nav_enable_replanning or args.target_nav_replan_every > 0),
             replan_every=int(args.target_nav_replan_every),
             inflation_radius_m=float(args.target_nav_inflation),
+            max_wz=args.target_nav_max_wz,
             command_mode=args.target_nav_command_mode,
             heading_lateral_scale=float(args.heading_lateral_scale),
             heading_min_vx_scale=float(args.heading_min_vx_scale),
+            heading_slow_angle_rad=float(args.heading_slow_angle_rad),
+            heading_rotate_in_place_angle_rad=float(args.heading_rotate_in_place_angle_rad),
+            heading_rotate_vx_scale=float(args.heading_rotate_vx_scale),
+            heading_rotate_lateral_scale=float(args.heading_rotate_lateral_scale),
+            path_lookahead_m=float(args.heading_lookahead_m),
         )
         policy = LidarTargetNavPolicyRuntime(policy_cfg)
 
-    supervisor = SafetySupervisor.from_runtime_config(cfg)
+    supervisor = SafetySupervisor.from_runtime_config(
+        cfg,
+        config=SafetySupervisorConfig(
+            allow_yaw_on_front_stop=bool(args.allow_yaw_on_front_stop),
+            front_stop_yaw_escape_min_wz=float(args.front_stop_yaw_escape_min_wz),
+            front_stop_yaw_escape_max_wz=float(args.front_stop_yaw_escape_max_wz),
+            front_stop_yaw_escape_max_linear_mps=float(args.front_stop_yaw_escape_max_linear),
+        ),
+    )
     sink = DryRunCommandSink(name="dryrun_bridge_sink")
     bridge = RealBridge(
         observation_provider=provider,

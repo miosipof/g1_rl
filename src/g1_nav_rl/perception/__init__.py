@@ -1,5 +1,17 @@
 """Perception-to-navigation target adapters."""
 
+
+from .detection_stream import (
+    DETECTION_STREAM_SCHEMA_VERSION,
+    DetectionStreamClient,
+    DetectionStreamFrame,
+    DetectionStreamHealth,
+    DetectionStreamReadResult,
+    DetectionStreamStatus,
+    TrackDetection,
+    write_detection_stream_frame_atomic,
+)
+
 from .target_from_bbox import (
     CameraIntrinsics,
     DepthEstimate,
@@ -20,6 +32,14 @@ from .target_from_bbox import (
 )
 
 __all__ = [
+    "DETECTION_STREAM_SCHEMA_VERSION",
+    "DetectionStreamClient",
+    "DetectionStreamFrame",
+    "DetectionStreamHealth",
+    "DetectionStreamReadResult",
+    "DetectionStreamStatus",
+    "TrackDetection",
+    "write_detection_stream_frame_atomic",
     "CameraIntrinsics",
     "DepthEstimate",
     "Detection2D",
@@ -36,6 +56,12 @@ __all__ = [
     "target_xy_with_standoff",
     "transform_point",
     "unproject_pixel_to_camera",
+    "DetectionStreamProjectionConfig",
+    "camera_to_body_matrix_for_frame",
+    "depth_valid_ratio_in_bbox",
+    "detection_passes_basic_filters",
+    "detection_to_track",
+    "make_detection_stream_frame_from_detections",
 ]
 
 try:
@@ -46,3 +72,12 @@ except Exception:  # optional ultralytics dependency may be unavailable
     filter_detections = None  # type: ignore
 
 __all__ += ["YoloDetector", "YoloDetectorConfig", "filter_detections"]
+
+from .detection_stream_producer import (
+    DetectionStreamProjectionConfig,
+    camera_to_body_matrix_for_frame,
+    depth_valid_ratio_in_bbox,
+    detection_passes_basic_filters,
+    detection_to_track,
+    make_detection_stream_frame_from_detections,
+)

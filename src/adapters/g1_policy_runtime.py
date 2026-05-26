@@ -86,6 +86,11 @@ class LidarTargetNavPolicyRuntimeConfig:
         command_mode: str = "holonomic",
         heading_lateral_scale: float = 0.20,
         heading_min_vx_scale: float = 0.25,
+        heading_slow_angle_rad: float = 0.35,
+        heading_rotate_in_place_angle_rad: float = 0.80,
+        heading_rotate_vx_scale: float = 0.0,
+        heading_rotate_lateral_scale: float = 0.0,
+        path_lookahead_m: float = 0.0,
     ) -> "LidarTargetNavPolicyRuntimeConfig":
         """Build a conservative navigation config from the real adapter config.
 
@@ -103,6 +108,11 @@ class LidarTargetNavPolicyRuntimeConfig:
             command_mode=str(command_mode).replace("-", "_"),
             heading_lateral_scale=float(heading_lateral_scale),
             heading_min_vx_scale=float(heading_min_vx_scale),
+            heading_slow_angle_rad=float(heading_slow_angle_rad),
+            heading_rotate_in_place_angle_rad=float(heading_rotate_in_place_angle_rad),
+            heading_rotate_vx_scale=float(heading_rotate_vx_scale),
+            heading_rotate_lateral_scale=float(heading_rotate_lateral_scale),
+            path_lookahead_m=float(path_lookahead_m),
         )
         astar_cfg = GridAStarCfg(
             inflation_radius=float(inflation_radius_m if inflation_radius_m is not None else 0.35),
@@ -137,6 +147,7 @@ class LidarTargetNavDebug:
     path_yaw: float | None = None
     bearing_error: float | None = None
     heading_alignment_scale: float | None = None
+    heading_turn_in_place: bool = False
     raw_command: tuple[float, float, float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -160,6 +171,7 @@ class LidarTargetNavDebug:
             "path_yaw": self.path_yaw,
             "bearing_error": self.bearing_error,
             "heading_alignment_scale": self.heading_alignment_scale,
+            "heading_turn_in_place": bool(self.heading_turn_in_place),
             "raw_command": None if self.raw_command is None else list(self.raw_command),
         }
 
@@ -316,6 +328,7 @@ def make_lidar_nav_debug(
         path_yaw=float(nav_cmd.path_yaw),
         bearing_error=None if nav_cmd.bearing_error is None else float(nav_cmd.bearing_error),
         heading_alignment_scale=None if nav_cmd.heading_alignment_scale is None else float(nav_cmd.heading_alignment_scale),
+        heading_turn_in_place=bool(getattr(nav_cmd, "heading_turn_in_place", False)),
         raw_command=None if nav_cmd.raw_command is None else tuple(float(v) for v in nav_cmd.raw_command.tuple),
     )
 

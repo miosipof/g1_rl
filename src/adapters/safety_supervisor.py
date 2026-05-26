@@ -67,13 +67,24 @@ class SafetySupervisorConfig:
     front_lateral_half_width_m: float = 0.45
     apply_obstacle_slowdown: bool = True
     apply_accel_limits: bool = True
+    allow_yaw_on_front_stop: bool = False
+    front_stop_yaw_escape_min_wz: float = 0.05
+    front_stop_yaw_escape_max_wz: float = 0.60
+    front_stop_yaw_escape_max_linear_mps: float = 0.05
     stop_source: str = "safety_stop"
     limited_source: str = "safety_limited"
     slowed_source: str = "safety_obstacle_slowed"
+    yaw_escape_source: str = "safety_front_yaw_escape"
 
     def __post_init__(self) -> None:
         if self.front_lateral_half_width_m <= 0.0 or not math.isfinite(self.front_lateral_half_width_m):
             raise ValueError("front_lateral_half_width_m must be positive finite")
+        if self.front_stop_yaw_escape_min_wz < 0.0 or not math.isfinite(self.front_stop_yaw_escape_min_wz):
+            raise ValueError("front_stop_yaw_escape_min_wz must be non-negative finite")
+        if self.front_stop_yaw_escape_max_wz <= 0.0 or not math.isfinite(self.front_stop_yaw_escape_max_wz):
+            raise ValueError("front_stop_yaw_escape_max_wz must be positive finite")
+        if self.front_stop_yaw_escape_max_linear_mps < 0.0 or not math.isfinite(self.front_stop_yaw_escape_max_linear_mps):
+            raise ValueError("front_stop_yaw_escape_max_linear_mps must be non-negative finite")
 
 
 class SafetySupervisor:
@@ -312,11 +323,19 @@ class SafetySupervisor:
     ) -> tuple[Command2D, list[str], list[str], dict[str, Any]]:
         reasons: list[str] = []
         warnings: list[str] = []
-        meta: dict[str, Any] = {"front_obstacle_distance_m": None}
+        meta: dict[str, Any] = {
+            "front_obstacle_distance_m": None,
+            "front_yaw_escape_allowed": bool(self.config.allow_yaw_on_front_stop),
+            "front_yaw_escape_active": False,
+        }
 
         if observation.lidar is None or observation.lidar.point_count == 0:
             return command, reasons, warnings, meta
-        if command.vx <= 0.0:
+
+        # Pure/yaw-dominant rotation can be useful as an escape action when the
+        # front corridor is blocked.  Therefore we still inspect the front sector
+        # for commands with wz != 0 even when vx <= 0.
+        if command.vx <= 0.0 and abs(command.wz) <= self.config.front_stop_yaw_escape_min_wz:
             return command, reasons, warnings, meta
 
         points = observation.lidar.points_body_xyz
@@ -332,6 +351,30 @@ class SafetySupervisor:
         slow_d = float(self.safety.obstacle_slow_distance_m)
 
         if front_min <= stop_d:
+            linear_norm = float(math.hypot(command.vx, command.vy))
+            yaw_abs = abs(float(command.wz))
+            meta["front_yaw_escape_linear_norm_mps"] = linear_norm
+            meta["front_yaw_escape_abs_wz"] = yaw_abs
+            if (
+                self.config.allow_yaw_on_front_stop
+                and yaw_abs >= self.config.front_stop_yaw_escape_min_wz
+                and linear_norm <= self.config.front_stop_yaw_escape_max_linear_mps
+            ):
+                wz = max(
+                    -self.config.front_stop_yaw_escape_max_wz,
+                    min(self.config.front_stop_yaw_escape_max_wz, float(command.wz)),
+                )
+                meta["front_yaw_escape_active"] = True
+                meta["front_yaw_escape_wz"] = wz
+                warnings.append(
+                    f"front_obstacle_yaw_escape:{front_min:.3f}m<={stop_d:.3f}m wz={wz:.3f}"
+                )
+                return (
+                    replace(command, vx=0.0, vy=0.0, wz=wz, timestamp_s=now_s, source=self.config.yaw_escape_source),
+                    reasons,
+                    warnings,
+                    meta,
+                )
             reasons.append(f"front_obstacle_stop:{front_min:.3f}m<={stop_d:.3f}m")
             return Command2D.stop(timestamp_s=now_s, source=self.config.stop_source), reasons, warnings, meta
 

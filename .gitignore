@@ -9,3 +9,4 @@ data/
 *.pt
 *.pth
 *egg-info*
+.pytest_cache

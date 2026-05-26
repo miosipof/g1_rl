@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -97,6 +98,8 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--allow-synthetic-robot-state-motion" in stdout
     assert "--allow-non-200" in stdout
     assert "--redetect-every" in stdout
+    assert "--occluded-redetect-every" in stdout
+    assert "--lost-redetect-every" in stdout
     assert "--command-wz-scale" in stdout
     assert "--run-id" in stdout
     assert "--no-timestamp-debug-dirs" in stdout
@@ -105,3 +108,24 @@ def test_detect_follow_live_help_exposes_motion_gates(monkeypatch, capsys) -> No
     assert "--disable-target-propagation" in stdout
     assert "--target-nav-command-mode" in stdout
     assert "--heading-lateral-scale" in stdout
+    assert "--heading-lookahead-m" in stdout
+    assert "--heading-rotate-in-place-angle-rad" in stdout
+    assert "--target-nav-max-wz" in stdout
+    assert "--allow-yaw-on-front-stop" in stdout
+    assert "--front-stop-yaw-escape-max-wz" in stdout
+
+
+def test_isaac_stream_compare_script_help_exposes_stream_flags() -> None:
+    script = ROOT / "scripts" / "smoke_test_yolo_person_nav_stream_compare.py"
+    result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True, check=True)
+    assert "--stream-target-body-x" in result.stdout
+    assert "--direct-target-source" in result.stdout
+    assert "--mode" in result.stdout
+
+
+def test_isaac_yolo_nav_stream_source_bypasses_bbox_provider_for_initial_snapshot() -> None:
+    script = (ROOT / "scripts" / "smoke_test_yolo_person_nav.py").read_text()
+    assert 'choices=["auto", "yolo", "fallback", "stream"]' in script
+    assert 'def detection_stream_initial_target_world' in script
+    assert 'if str(args_cli.target_source) == "stream":\n        target_xy, stream_meta = detection_stream_initial_target_world(step_idx=0)' in script
+    assert 'stream initial target target_xy_w=' in script

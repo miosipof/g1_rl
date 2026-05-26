@@ -90,8 +90,8 @@ command_limits:
   vx_max: 0.50
   vy_min: -0.05
   vy_max: 0.25
-  wz_min: -0.20
-  wz_max: 0.20
+  wz_min: -1.0
+  wz_max: 1.0
   max_linear_accel_mps2: 0.20
   max_yaw_accel_radps2: 0.40
   command_rate_hz: 10.0
@@ -125,8 +125,8 @@ safety:
   stop_on_estop: true
   stop_on_robot_fault: true
   min_battery_percent: 20.0
-  obstacle_stop_distance_m: 0.15
-  obstacle_slow_distance_m: 0.30
+  obstacle_stop_distance_m: 0.20
+  obstacle_slow_distance_m: 0.40
 
 metadata:
   notes:
