@@ -466,8 +466,13 @@ parser.add_argument("--yolo_model", type=str, default="yolov8n.pt")
 parser.add_argument("--yolo_conf", type=float, default=0.25)
 parser.add_argument("--yolo_iou", type=float, default=0.45)
 parser.add_argument("--yolo_device", type=str, default="")
-parser.add_argument("--target_source", choices=["auto", "yolo", "fallback"], default="auto", help="Perception target source. auto runs YOLO first then fallback; fallback skips YOLO and uses projected known-person bbox; yolo requires YOLO detection unless assertions are disabled.")
+parser.add_argument("--target_source", choices=["auto", "yolo", "fallback", "stream"], default="auto", help="Perception target source. auto runs YOLO first then fallback; fallback skips YOLO and uses projected known-person bbox; stream reads a DetectionStreamFrame JSON file produced by an external detector/tracker.")
 parser.add_argument("--target_class", type=str, default="person")
+
+parser.add_argument("--detection_stream_path", type=str, default="", help="Path to latest_tracks.json when --target_source=stream.")
+parser.add_argument("--detection_stream_max_age_s", type=float, default=1.0, help="Maximum age for stream target frames. Use a large value for static Isaac smoke files.")
+parser.add_argument("--detection_stream_allow_stale", action="store_true", help="Allow stale detection stream frames for deterministic Isaac smoke/replay tests.")
+parser.add_argument("--detection_stream_track_id", type=str, default="", help="Optional locked track id to read from the stream. Empty selects the best matching class.")
 parser.add_argument("--min_confidence", type=float, default=0.25)
 parser.add_argument("--selection_policy", type=str, default="nearest", choices=("nearest", "largest", "highest_confidence"))
 parser.add_argument("--fallback_synthetic_bbox", dest="fallback_synthetic_bbox", action="store_true", default=True, help="Use projected known person bbox if YOLO is unavailable/no detection. Enabled by default.")
@@ -574,6 +579,7 @@ from g1_nav_rl.perception.target_from_bbox import (  # noqa: E402
 )
 from g1_nav_rl.perception.target_provider import BBoxTargetProvider, TargetProviderConfig  # noqa: E402
 from g1_nav_rl.perception.target_tracker import TargetMeasurement, TargetTracker, TargetTrackerConfig  # noqa: E402
+from g1_nav_rl.perception.detection_stream import DetectionStreamClient, DetectionStreamHealth  # noqa: E402
 from g1_nav_rl.robots.g1_command_proxy import (  # noqa: E402
     G1CommandProxy,
     G1CommandProxyLimits,
@@ -2678,8 +2684,8 @@ _YOLO_DETECTOR_CACHE = None
 
 def run_yolo_if_requested(rgb_np: np.ndarray) -> list[Detection2D]:
     global _YOLO_DETECTOR_CACHE
-    if bool(args_cli.skip_yolo) or str(args_cli.target_source) == "fallback":
-        print("[INFO]: YOLO skipped by --skip_yolo or --target_source=fallback", flush=True)
+    if bool(args_cli.skip_yolo) or str(args_cli.target_source) in {"fallback", "stream"}:
+        print("[INFO]: YOLO skipped by --skip_yolo, fallback, or stream target source", flush=True)
         return []
     try:
         print("[CKPT]: YOLO import/config start", flush=True)
@@ -2733,8 +2739,144 @@ def select_perception_detection(
     return selected.detection, selected.source, selected.reason
 
 
+
+def _stream_track_id_arg() -> int | str | None:
+    raw = str(args_cli.detection_stream_track_id).strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+
+
+def _read_detection_stream_best_track(*, step_idx: int | None = None) -> tuple[Any | None, dict[str, Any]]:
+    """Read and validate the best matching track from the stream file."""
+    path = str(args_cli.detection_stream_path).strip()
+    meta: dict[str, Any] = {
+        "detection_source": "stream",
+        "target_valid": False,
+        "stream_path": path,
+        "step": None if step_idx is None else int(step_idx),
+    }
+    if not path:
+        meta.update({"reason": "stream_path_missing"})
+        return None, meta
+
+    client = DetectionStreamClient(
+        path=path,
+        max_age_s=float(args_cli.detection_stream_max_age_s),
+        missing_ok=True,
+    )
+    result = client.read()
+    meta["stream_status"] = {
+        "health": str(result.status.health.value),
+        "message": result.status.message,
+        "details": dict(result.status.details),
+    }
+    if result.frame is None:
+        meta.update({"reason": "stream_unavailable"})
+        return None, meta
+    if result.status.health != DetectionStreamHealth.OK and not bool(args_cli.detection_stream_allow_stale):
+        meta.update({"reason": "stream_not_fresh"})
+        return None, meta
+
+    track = result.frame.best_track(
+        class_name=str(args_cli.target_class),
+        min_confidence=float(args_cli.min_confidence),
+        require_target_body_xy=True,
+        track_id=_stream_track_id_arg(),
+    )
+    meta["frame"] = {
+        "timestamp_s": float(result.frame.timestamp_s),
+        "frame_id": result.frame.frame_id,
+        "source": result.frame.source,
+        "track_count": len(result.frame.tracks),
+    }
+    meta["tracks"] = [track.to_dict() for track in result.frame.tracks]
+    if track is None or track.target_body_xy is None:
+        meta.update({"reason": "no_matching_stream_track"})
+        return None, meta
+    return track, meta
+
+
+def detection_stream_initial_target_world(*, step_idx: int | None = None) -> tuple[PointXY | None, dict[str, Any]]:
+    """Read an initial stream target before the navigation proxy exists.
+
+    The comparison smoke harness writes stream targets in the initial body frame.
+    Before navigation starts, the proxy pose is the origin with yaw=0, so body XY
+    and world XY are equivalent.
+    """
+    track, meta = _read_detection_stream_best_track(step_idx=step_idx)
+    if track is None or track.target_body_xy is None:
+        return None, meta
+    target_xy_w = (float(track.target_body_xy[0]), float(track.target_body_xy[1]))
+    meta.update(
+        {
+            "reason": "ok",
+            "target_valid": True,
+            "selected_detection": track.to_dict(),
+            "target": {
+                "target_body_xy": [float(track.target_body_xy[0]), float(track.target_body_xy[1])],
+                "target_xy_w": [target_xy_w[0], target_xy_w[1]],
+                "track_id": track.track_id,
+                "class_name": track.class_name,
+                "confidence": float(track.confidence),
+                "depth_m": track.depth_m,
+                "depth_valid_ratio": track.depth_valid_ratio,
+            },
+            "initial_pose_assumption": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+        }
+    )
+    return target_xy_w, meta
+
+def detection_stream_target_world(proxy: G1CommandProxy, *, step_idx: int | None = None) -> tuple[PointXY | None, dict[str, Any]]:
+    """Read the latest DetectionStreamFrame and convert target_body_xy to world XY.
+
+    The stream target convention is body-frame ``[x, y]`` in meters, where +x is
+    forward and +y is robot-left. This allows the same stream schema to feed
+    Isaac, real-robot, and replay tests without running YOLO inside this script.
+    """
+    track, meta = _read_detection_stream_best_track(step_idx=step_idx)
+    if track is None or track.target_body_xy is None:
+        return None, meta
+
+    device = proxy.pos_w.device
+    target_b = torch.tensor([track.target_body_xy], dtype=torch.float32, device=device)
+    target_w_tensor = proxy.pos_w[0, 0:2] + _rotate_body_to_world_xy(target_b, proxy.yaw[0])[0]
+    target_xy_w = (float(target_w_tensor[0].detach().cpu().item()), float(target_w_tensor[1].detach().cpu().item()))
+    meta.update(
+        {
+            "reason": "ok",
+            "target_valid": True,
+            "selected_detection": track.to_dict(),
+            "target": {
+                "target_body_xy": [float(track.target_body_xy[0]), float(track.target_body_xy[1])],
+                "target_xy_w": [target_xy_w[0], target_xy_w[1]],
+                "track_id": track.track_id,
+                "class_name": track.class_name,
+                "confidence": float(track.confidence),
+                "depth_m": track.depth_m,
+                "depth_valid_ratio": track.depth_valid_ratio,
+            },
+        }
+    )
+    return target_xy_w, meta
+
+
 def extract_perception_target(scene: InteractiveScene, proxy: G1CommandProxy) -> tuple[PointXY, dict[str, Any]]:
-    """Run YOLO/fallback bbox + depth projection and return a world-frame Target2D."""
+    """Run YOLO/fallback/stream perception and return a world-frame Target2D."""
+    if str(args_cli.target_source) == "stream":
+        target_xy, stream_meta = detection_stream_target_world(proxy, step_idx=0)
+        if target_xy is None:
+            if bool(args_cli.assert_detection) or bool(args_cli.assert_target):
+                raise RuntimeError(f"stream target unavailable: {stream_meta}")
+            return (float(PERSON_X), float(PERSON_Y)), stream_meta
+        print(f"[INFO]: stream target result target_xy_w=({target_xy[0]:.3f}, {target_xy[1]:.3f}) meta={stream_meta}", flush=True)
+        return target_xy, stream_meta
+
     print("[CKPT]: extract_perception_target: reading camera outputs", flush=True)
     camera = scene["camera"]
     rgb = camera.data.output.get("rgb")
@@ -2883,6 +3025,15 @@ def extract_perception_target_from_cpu_snapshot(scene: InteractiveScene, sim: si
     select a bbox first, compute a robust depth scalar inside that bbox on the
     tensor device, and synchronize only that scalar.
     """
+    if str(args_cli.target_source) == "stream":
+        target_xy, stream_meta = detection_stream_initial_target_world(step_idx=0)
+        if target_xy is None:
+            if bool(args_cli.assert_detection) or bool(args_cli.assert_target):
+                raise RuntimeError(f"stream target unavailable: {stream_meta}")
+            return (float(PERSON_X), float(PERSON_Y)), stream_meta
+        print(f"[INFO]: stream initial target target_xy_w=({target_xy[0]:.3f}, {target_xy[1]:.3f}) meta={stream_meta}", flush=True)
+        return target_xy, stream_meta
+
     print("[CKPT]: snapshot_target: starting camera warmup before RGB snapshot", flush=True)
     sim_dt = float(sim.get_physics_dt())
     warmup_steps = max(0, int(args_cli.perception_warmup_steps))
@@ -3038,6 +3189,13 @@ def extract_periodic_redetection_target(
         "step": int(step_idx),
         "target_valid": False,
     }
+    if str(args_cli.target_source) == "stream":
+        target_xy, stream_meta = detection_stream_target_world(proxy, step_idx=step_idx)
+        meta.update(stream_meta)
+        if target_xy is None:
+            return None, meta
+        return target_xy, meta
+
     try:
         camera = scene["camera"]
         rgb = camera.data.output.get("rgb")

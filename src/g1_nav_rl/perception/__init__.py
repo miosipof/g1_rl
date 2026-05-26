@@ -1,5 +1,17 @@
 """Perception-to-navigation target adapters."""
 
+
+from .detection_stream import (
+    DETECTION_STREAM_SCHEMA_VERSION,
+    DetectionStreamClient,
+    DetectionStreamFrame,
+    DetectionStreamHealth,
+    DetectionStreamReadResult,
+    DetectionStreamStatus,
+    TrackDetection,
+    write_detection_stream_frame_atomic,
+)
+
 from .target_from_bbox import (
     CameraIntrinsics,
     DepthEstimate,
@@ -20,6 +32,14 @@ from .target_from_bbox import (
 )
 
 __all__ = [
+    "DETECTION_STREAM_SCHEMA_VERSION",
+    "DetectionStreamClient",
+    "DetectionStreamFrame",
+    "DetectionStreamHealth",
+    "DetectionStreamReadResult",
+    "DetectionStreamStatus",
+    "TrackDetection",
+    "write_detection_stream_frame_atomic",
     "CameraIntrinsics",
     "DepthEstimate",
     "Detection2D",
