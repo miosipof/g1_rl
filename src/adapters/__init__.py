@@ -145,6 +145,13 @@ from .run_dirs import (
     write_run_info,
 )
 
+
+from .stepwise_runtime import (
+    StepwiseTargetNavPolicyRuntime,
+    StepwiseTargetNavPolicyRuntimeConfig,
+    stepwise_decision_to_dict,
+)
+
 from .g1_policy_runtime import (
     ConstantVelocityPolicy,
     LidarTargetNavDebug,
@@ -159,6 +166,9 @@ from .g1_policy_runtime import (
 
 __all__ = [
     "write_detection_stream_frame_atomic",
+    "StepwiseTargetNavPolicyRuntime",
+    "StepwiseTargetNavPolicyRuntimeConfig",
+    "stepwise_decision_to_dict",
     "TrackDetection",
     "DetectionStreamReadResult",
     "DetectionStreamFrame",

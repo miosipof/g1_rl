@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import sys
 from dataclasses import dataclass
@@ -469,6 +470,30 @@ parser.add_argument("--yolo_device", type=str, default="")
 parser.add_argument("--target_source", choices=["auto", "yolo", "fallback", "stream"], default="auto", help="Perception target source. auto runs YOLO first then fallback; fallback skips YOLO and uses projected known-person bbox; stream reads a DetectionStreamFrame JSON file produced by an external detector/tracker.")
 parser.add_argument("--target_class", type=str, default="person")
 
+parser.add_argument(
+    "--controller_mode",
+    choices=("continuous", "stepwise"),
+    default="continuous",
+    help=(
+        "Navigation controller. 'continuous' keeps the existing NavRuntime waypoint follower; "
+        "'stepwise' uses the stop-observe-plan-execute StepwiseTargetNavPolicyRuntime. "
+        "For Step A, use with --target_source=stream."
+    ),
+)
+parser.add_argument("--stepwise_forward_segment_m", type=float, default=0.35)
+parser.add_argument("--stepwise_forward_speed_mps", type=float, default=0.35)
+parser.add_argument("--stepwise_turn_speed_radps", type=float, default=0.50)
+parser.add_argument("--stepwise_turn_angle_max_deg", type=float, default=35.0)
+parser.add_argument("--stepwise_replan_every_actions", type=int, default=2)
+parser.add_argument("--stepwise_blind_plan_actions", type=int, default=1)
+parser.add_argument("--stepwise_emergency_front_stop_m", type=float, default=0.35)
+parser.add_argument("--stepwise_action_duration_max_s", type=float, default=1.0)
+parser.add_argument("--stepwise_stop_after_action_steps", type=int, default=1, help="Number of zero-command physics steps after each stepwise action.")
+parser.add_argument("--stepwise_front_x_max_m", type=float, default=1.0)
+parser.add_argument("--stepwise_front_y_abs_max_m", type=float, default=0.35)
+parser.add_argument("--stepwise_trace_jsonl", type=str, default="", help="Optional JSONL path for stepwise decisions. Default: <output_dir>/stepwise_trace.jsonl.")
+parser.add_argument("--stepwise_static_stream_world_target", action="store_true", help="Treat stream target_body_xy as an initial body/world target and recompute current body-frame target each cycle. Useful only for deterministic static Isaac stream smoke tests.")
+
 parser.add_argument("--detection_stream_path", type=str, default="", help="Path to latest_tracks.json when --target_source=stream.")
 parser.add_argument("--detection_stream_max_age_s", type=float, default=1.0, help="Maximum age for stream target frames. Use a large value for static Isaac smoke files.")
 parser.add_argument("--detection_stream_allow_stale", action="store_true", help="Allow stale detection stream frames for deterministic Isaac smoke/replay tests.")
@@ -580,6 +605,9 @@ from g1_nav_rl.perception.target_from_bbox import (  # noqa: E402
 from g1_nav_rl.perception.target_provider import BBoxTargetProvider, TargetProviderConfig  # noqa: E402
 from g1_nav_rl.perception.target_tracker import TargetMeasurement, TargetTracker, TargetTrackerConfig  # noqa: E402
 from g1_nav_rl.perception.detection_stream import DetectionStreamClient, DetectionStreamHealth  # noqa: E402
+from g1_nav_rl.navigation.stepwise import StepwiseNavConfig  # noqa: E402
+from adapters.stepwise_runtime import StepwiseTargetNavPolicyRuntime, StepwiseTargetNavPolicyRuntimeConfig  # noqa: E402
+from adapters.types import LidarFrame, RobotObservation  # noqa: E402
 from g1_nav_rl.robots.g1_command_proxy import (  # noqa: E402
     G1CommandProxy,
     G1CommandProxyLimits,
@@ -3313,6 +3341,109 @@ def build_rgbd_depth_observation(scene: InteractiveScene) -> torch.Tensor | None
     return depth.clamp(min=depth_min, max=depth_max)
 
 
+
+
+def _lidar_frame_from_lidar_obs(lidar_obs: dict[str, torch.Tensor], *, timestamp_s: float) -> LidarFrame:
+    """Convert the Isaac smoke-test LiDAR dict into the adapter LidarFrame.
+
+    ``build_lidar_proxy_observation`` exposes projected body-frame LiDAR hits as
+    ``lidar_points_b`` with shape ``[env, ray, 2]`` because the existing grid
+    planner operates in XY.  The adapter-level ``LidarFrame`` contract is
+    intentionally stricter and requires ``Nx3`` body-frame points so that the
+    same runtime can also consume real 3D Livox data.  For this 2D Isaac proxy
+    scan, append a zero z column at the script boundary instead of weakening the
+    shared adapter contract.
+    """
+    points_b = lidar_obs["lidar_points_b"][0]
+    valid = lidar_obs["lidar_valid"][0]
+    if valid.numel():
+        points_b = points_b[valid.to(dtype=torch.bool)]
+    if points_b.ndim != 2 or points_b.shape[-1] != 2:
+        raise ValueError(f"lidar_points_b must have shape [N, 2], got {tuple(points_b.shape)}")
+    z = torch.zeros((points_b.shape[0], 1), dtype=points_b.dtype, device=points_b.device)
+    points_xyz_b = torch.cat((points_b, z), dim=-1)
+    points_np = points_xyz_b.detach().cpu().numpy().astype("float32", copy=False)
+    return LidarFrame(
+        timestamp_s=float(timestamp_s),
+        points_body_xyz=points_np,
+        source_frame_id="isaac_raycaster_xy_projected",
+        metadata={"source": "smoke_test_yolo_person_nav", "z_source": "zero_filled_2d_proxy_scan"},
+    )
+
+
+def _target_body_from_world(*, proxy: G1CommandProxy, target_xy_w: torch.Tensor) -> tuple[float, float]:
+    """Return current target vector in the proxy body frame."""
+    delta_w = target_xy_w[0:1] - proxy.pos_w[0:1, 0:2]
+    target_b = rotate_world_to_body_2d(delta_w, proxy.yaw[0:1])
+    return float(target_b[0, 0].detach().cpu().item()), float(target_b[0, 1].detach().cpu().item())
+
+
+def _target_world_from_body(*, proxy: G1CommandProxy, target_body_xy: PointXY) -> tuple[float, float]:
+    device = proxy.pos_w.device
+    target_b = torch.tensor([target_body_xy], dtype=torch.float32, device=device)
+    target_w = proxy.pos_w[0, 0:2] + _rotate_body_to_world_xy(target_b, proxy.yaw[0])[0]
+    return float(target_w[0].detach().cpu().item()), float(target_w[1].detach().cpu().item())
+
+
+def _stepwise_stream_target_body(*, step_idx: int) -> tuple[PointXY | None, dict[str, Any]]:
+    """Read stream target in body frame for the stepwise controller."""
+    track, meta = _read_detection_stream_best_track(step_idx=step_idx)
+    if track is None or track.target_body_xy is None:
+        return None, meta
+    target_b = (float(track.target_body_xy[0]), float(track.target_body_xy[1]))
+    meta.update(
+        {
+            "reason": "ok",
+            "target_valid": True,
+            "selected_detection": track.to_dict(),
+            "target": {
+                "target_body_xy": [target_b[0], target_b[1]],
+                "track_id": track.track_id,
+                "class_name": track.class_name,
+                "confidence": float(track.confidence),
+                "depth_m": track.depth_m,
+                "depth_valid_ratio": track.depth_valid_ratio,
+            },
+        }
+    )
+    return target_b, meta
+
+
+def _make_stepwise_runtime(*, grid_cfg: OccupancyGridCfg, astar_cfg: GridAStarCfg, success_radius: float) -> StepwiseTargetNavPolicyRuntime:
+    cfg = StepwiseNavConfig(
+        grid_cfg=grid_cfg,
+        astar_cfg=astar_cfg,
+        forward_segment_m=float(args_cli.stepwise_forward_segment_m),
+        forward_speed_mps=float(args_cli.stepwise_forward_speed_mps),
+        turn_speed_radps=float(args_cli.stepwise_turn_speed_radps),
+        turn_angle_max_rad=math.radians(float(args_cli.stepwise_turn_angle_max_deg)),
+        action_duration_max_s=float(args_cli.stepwise_action_duration_max_s),
+        replan_every_actions=int(args_cli.stepwise_replan_every_actions),
+        blind_plan_actions=int(args_cli.stepwise_blind_plan_actions),
+        emergency_front_stop_m=float(args_cli.stepwise_emergency_front_stop_m),
+        success_radius_m=float(success_radius),
+        allow_goal_relocation=True,
+        source="isaac_stepwise_nav",
+    )
+    return StepwiseTargetNavPolicyRuntime(
+        StepwiseTargetNavPolicyRuntimeConfig(
+            stepwise_cfg=cfg,
+            require_lidar=True,
+            front_x_min_m=0.0,
+            front_x_max_m=float(args_cli.stepwise_front_x_max_m),
+            front_y_abs_max_m=float(args_cli.stepwise_front_y_abs_max_m),
+            source="isaac_stepwise_target_nav_policy",
+        )
+    )
+
+
+def _write_stepwise_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(dict(row), sort_keys=True) + "\n")
+    print(f"[INFO]: Wrote stepwise JSONL trace: {path}", flush=True)
+
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, frozen_target_xy_w: PointXY, perception_meta: dict[str, Any]) -> None:
     print("[CKPT]: run_simulator entered", flush=True)
     sim_dt = sim.get_physics_dt()
@@ -3388,6 +3519,369 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
     )
     print("[CKPT]: initial planning grid built", flush=True)
     print_lidar_raw_diagnostics(lidar_obs, label="initial snapshot")
+
+    if str(args_cli.controller_mode) == "stepwise":
+        if str(args_cli.target_source) != "stream":
+            print(
+                "[WARN]: --controller_mode=stepwise is intended for --target_source=stream in Step A; "
+                "falling back to the frozen initial target as a body-frame target when stream is not selected.",
+                flush=True,
+            )
+        if bool(args_cli.enable_safety) or bool(args_cli.enable_rgbd_safety):
+            print(
+                "[WARN]: stepwise mode bypasses continuous LiDAR/RGB-D safety shaping; "
+                "only the stepwise hard forward guard is active.",
+                flush=True,
+            )
+
+        stepwise_runtime = _make_stepwise_runtime(grid_cfg=grid_cfg, astar_cfg=astar_cfg, success_radius=success_radius)
+        stepwise_rows: list[dict[str, Any]] = []
+        last_stepwise_path_xy_w: list[PointXY] = []
+        target_xy_w_env0: PointXY = (
+            float(target_xy_w[0, 0].detach().cpu().item()),
+            float(target_xy_w[0, 1].detach().cpu().item()),
+        )
+        env_origin_xy_w: PointXY = (
+            float(scene.env_origins[0, 0].detach().cpu().item()),
+            float(scene.env_origins[0, 1].detach().cpu().item()),
+        )
+        safety_zone_radius_m = float(body_radius + safety_margin)
+        world_grid_cfg = make_fixed_world_grid_cfg(grid_cfg, start_xy_w)
+        free_state_w = build_world_free_state_from_lidar(
+            lidar_obs,
+            proxy=proxy,
+            world_grid_cfg=world_grid_cfg,
+            max_range=float(lidar_obs_cfg.max_range),
+        )
+
+        empty_lidar_is_allowed = bool(SCENARIO.get("allow_empty_lidar", False)) or bool(args_cli.allow_empty_lidar)
+        initial_valid_hits = int(lidar_obs["lidar_valid"][0].detach().cpu().sum().item()) if lidar_obs["lidar_valid"].numel() else 0
+        if GRID_SOURCE == "lidar" and OBSTACLES and initial_valid_hits == 0 and not empty_lidar_is_allowed:
+            raise RuntimeError(
+                "LiDAR-only stepwise planning produced zero valid hits even though this scenario has obstacles. "
+                "This usually means the RayCaster scan plane is missing/grazing the mesh, or the mesh path is wrong."
+            )
+
+        records: list[StepRecord] = []
+        min_scenario_clearance = math.inf
+        min_margin_slack = math.inf
+        min_grid_edge_clearance = math.inf
+        target_reached = False
+        reached_step: int | None = None
+        nonstraight_command_count = 0
+        replan_count = 0
+        safety_override_count = 0
+        rgbd_safety_override_count = 0
+        save_grid = not bool(args_cli.no_save_grid)
+        print_every = max(1, int(args_cli.print_every))
+        save_every = max(1, int(args_cli.save_every))
+
+        print("[INFO]: Starting STEPWISE streaming-target + LiDAR navigation smoke test...", flush=True)
+        print(f"[INFO]: scenario: {args_cli.scenario} — {SCENARIO['description']}", flush=True)
+        print(f"[INFO]: target source: {args_cli.target_source}", flush=True)
+        print(
+            f"[INFO]: stepwise cfg: forward_segment={float(args_cli.stepwise_forward_segment_m):.3f} m, "
+            f"forward_speed={float(args_cli.stepwise_forward_speed_mps):.3f} m/s, "
+            f"turn_speed={float(args_cli.stepwise_turn_speed_radps):.3f} rad/s, "
+            f"turn_cap={float(args_cli.stepwise_turn_angle_max_deg):.1f} deg, "
+            f"blind_actions={int(args_cli.stepwise_blind_plan_actions)}, "
+            f"front_stop={float(args_cli.stepwise_emergency_front_stop_m):.3f} m",
+            flush=True,
+        )
+        print("[INFO]: controller: StepwiseTargetNavPolicyRuntime; no command odometry; no continuous safety smoothing", flush=True)
+        print("[CKPT]: entering stepwise action loop", flush=True)
+
+        for step_idx in range(int(args_cli.max_steps) + 1):
+            if not simulation_app.is_running():
+                break
+
+            should_save_frame = save_grid and (step_idx == 0 or step_idx % save_every == 0)
+            viz_free_update_every = max(0, int(args_cli.viz_free_update_every))
+            should_update_free_viz = should_save_frame or (viz_free_update_every > 0 and step_idx % viz_free_update_every == 0)
+            should_update_memory = (
+                str(args_cli.lidar_map_mode) == "memory"
+                and (step_idx == 0 or (int(args_cli.map_update_every) > 0 and step_idx % int(args_cli.map_update_every) == 0))
+            )
+            live_grid, live_lidar_grid, live_footprint_grid, live_lidar_obs, live_raw_lidar_grid, live_instant_lidar_grid, lidar_memory_points_w = build_planning_grid(
+                scene=scene,
+                proxy=proxy,
+                lidar_obs_cfg=lidar_obs_cfg,
+                grid_cfg=grid_cfg,
+                device=device,
+                lidar_memory_points_w=lidar_memory_points_w,
+                update_lidar_memory=should_update_memory,
+            )
+            if should_update_free_viz:
+                current_free_state_w = build_world_free_state_from_lidar(
+                    live_lidar_obs,
+                    proxy=proxy,
+                    world_grid_cfg=world_grid_cfg,
+                    max_range=float(lidar_obs_cfg.max_range),
+                )
+                free_state_w = torch.maximum(free_state_w, current_free_state_w)
+
+            x = float(proxy.pos_w[0, 0].detach().cpu().item())
+            y = float(proxy.pos_w[0, 1].detach().cpu().item())
+            yaw = float(proxy.yaw[0].detach().cpu().item())
+            current_nav_pose = NavPose2D(x=x, y=y, yaw=yaw)
+
+            if str(args_cli.target_source) == "stream":
+                target_body_xy, target_meta = _stepwise_stream_target_body(step_idx=step_idx)
+                if target_body_xy is not None and bool(args_cli.stepwise_static_stream_world_target):
+                    raw_stream_target_body_xy = target_body_xy
+                    target_body_xy = _target_body_from_world(proxy=proxy, target_xy_w=target_xy_w)
+                    target_meta = dict(target_meta)
+                    target_meta["reason"] = "ok_static_stream_world_target_projection"
+                    target_meta["static_stream_raw_target_body_xy"] = [
+                        float(raw_stream_target_body_xy[0]),
+                        float(raw_stream_target_body_xy[1]),
+                    ]
+                    target_meta.setdefault("target", {})["target_body_xy"] = [float(target_body_xy[0]), float(target_body_xy[1])]
+            else:
+                target_body_xy = _target_body_from_world(proxy=proxy, target_xy_w=target_xy_w)
+                target_meta = {
+                    "detection_source": str(args_cli.target_source),
+                    "target_valid": True,
+                    "reason": "frozen_target_body_projection",
+                    "target": {"target_body_xy": [target_body_xy[0], target_body_xy[1]]},
+                }
+
+            if target_body_xy is not None:
+                target_xy_w_env0 = _target_world_from_body(proxy=proxy, target_body_xy=target_body_xy)
+                target_hint = NavTarget2D(x=float(target_body_xy[0]), y=float(target_body_xy[1]))
+                target_distance = math.hypot(float(target_body_xy[0]), float(target_body_xy[1]))
+            else:
+                target_hint = None
+                target_distance = math.inf
+
+            timestamp_s = float(step_idx) * float(sim_dt)
+            lidar_frame = _lidar_frame_from_lidar_obs(live_lidar_obs, timestamp_s=timestamp_s)
+            observation = RobotObservation(
+                timestamp_s=timestamp_s,
+                pose=current_nav_pose,
+                lidar=lidar_frame,
+                target_hint=target_hint,
+                metadata={
+                    "controller_mode": "stepwise",
+                    "target_meta": target_meta,
+                    "grid_source": GRID_SOURCE,
+                    "scenario": str(args_cli.scenario),
+                    # Use the exact same grid that the Isaac smoke test builds
+                    # and visualizes.  The stepwise runtime must not reconstruct
+                    # a separate sparse LiDAR-only grid when --grid_source is
+                    # hybrid/world/memory; that makes replans disagree with the
+                    # displayed obstacle inflation.
+                    "stepwise_occupancy_grid": live_grid[0].detach().cpu(),
+                },
+            )
+            command = stepwise_runtime.step(observation)
+            decision = stepwise_runtime.last_decision
+            decision_dict = None if decision is None else decision.to_dict()
+
+            if decision is not None and decision.plan is not None:
+                # The body-frame path is valid in the robot frame in which that
+                # plan was created.  On non-replan cycles the robot may already
+                # have turned, so re-transforming the old body-frame path with
+                # the current yaw makes the debug overlay appear to swing,
+                # over-extend, or cut through obstacles.  Only project to world
+                # when a fresh plan was actually produced in the current frame;
+                # otherwise keep the previously projected world-frame plan.
+                if bool(decision.replan_attempted):
+                    path_xy_w = path_body_to_world(decision.plan.path_xy_b, proxy)
+                    last_stepwise_path_xy_w = list(path_xy_w)
+                else:
+                    path_xy_w = list(last_stepwise_path_xy_w)
+                plan_found = bool(decision.plan.found)
+                waypoint_count = len(path_xy_w)
+            else:
+                path_xy_w = []
+                last_stepwise_path_xy_w = []
+                plan_found = False
+                waypoint_count = 0
+            replan_count = int(stepwise_runtime.navigator.executed_actions_since_replan)  # local counter for trace compatibility
+
+            vx, vy, wz = command.tuple
+            nominal_vx, nominal_vy, nominal_wz = command.tuple
+            waypoint_xy_b = target_body_xy if target_body_xy is not None else (0.0, 0.0)
+            waypoint_xy = target_xy_w_env0
+
+            scenario_clearance = min_scenario_edge_clearance(x, y, OBSTACLES, body_radius)
+            margin_slack = scenario_clearance - safety_margin if math.isfinite(scenario_clearance) else math.inf
+            grid_clearance = compute_obstacle_clearance_from_grid(
+                live_grid[0],
+                grid_cfg,
+                body_radius=body_radius,
+                occupancy_threshold=astar_cfg.occupancy_threshold,
+            )
+            grid_edge_clearance = float(grid_clearance.get("edge_clearance", math.inf))
+            min_scenario_clearance = min(min_scenario_clearance, scenario_clearance)
+            min_margin_slack = min(min_margin_slack, margin_slack)
+            min_grid_edge_clearance = min(min_grid_edge_clearance, grid_edge_clearance)
+
+            live_occupied = int((live_grid[0] > 0).detach().cpu().sum().item())
+            live_valid_hits = int(live_lidar_obs["lidar_valid"][0].detach().cpu().sum().item()) if live_lidar_obs["lidar_valid"].numel() else 0
+            record = StepRecord(
+                step=step_idx,
+                x=x,
+                y=y,
+                yaw=yaw,
+                waypoint_index=0,
+                waypoint_x=waypoint_xy[0],
+                waypoint_y=waypoint_xy[1],
+                target_distance=target_distance,
+                scenario_edge_clearance=scenario_clearance,
+                scenario_margin_slack=margin_slack,
+                grid_edge_clearance=grid_edge_clearance,
+                vx=vx,
+                vy=vy,
+                wz=wz,
+                nominal_vx=nominal_vx,
+                nominal_vy=nominal_vy,
+                nominal_wz=nominal_wz,
+                lidar_valid=live_valid_hits,
+                occupied_cells=live_occupied,
+                safety_action="stepwise_hard_forward_guard",
+                safety_front_clearance=math.inf if decision is None or decision.front_min_distance_m is None else float(decision.front_min_distance_m),
+                safety_left_clearance=math.inf,
+                safety_right_clearance=math.inf,
+                safety_override=False if decision is None else bool(decision.blocked),
+                safety_scale=1.0,
+                rgbd_safety_action="disabled",
+                rgbd_safety_front_depth=math.inf,
+                rgbd_safety_left_depth=math.inf,
+                rgbd_safety_right_depth=math.inf,
+                rgbd_safety_override=False,
+                rgbd_safety_scale=1.0,
+            )
+            records.append(record)
+
+            stepwise_rows.append(
+                {
+                    "step": int(step_idx),
+                    "pose": {"x": x, "y": y, "yaw": yaw},
+                    "target_body_xy": None if target_body_xy is None else [target_body_xy[0], target_body_xy[1]],
+                    "target_world_xy": [target_xy_w_env0[0], target_xy_w_env0[1]],
+                    "target_meta": target_meta,
+                    "command": {"vx": vx, "vy": vy, "wz": wz, "duration_s": command.duration_s},
+                    "decision": decision_dict,
+                    "plan_found": plan_found,
+                    "waypoint_count": waypoint_count,
+                    "lidar_valid_hits": live_valid_hits,
+                    "occupied_cells": live_occupied,
+                }
+            )
+
+            should_print = step_idx == 0 or step_idx % print_every == 0 or (decision is not None and decision.target_reached)
+            if should_print:
+                print_step(
+                    record=record,
+                    total_waypoints=max(waypoint_count, 1),
+                    waypoint_xy_b=waypoint_xy_b,
+                    success_radius=success_radius,
+                    safety_margin=safety_margin,
+                )
+                if decision is not None:
+                    print(
+                        f"stepwise decision       : reason={decision.reason}, execute={decision.execute}, "
+                        f"target_visible={decision.target_visible}, blocked={decision.blocked}, "
+                        f"action={decision.action.kind.value}, duration={decision.action.duration_s:.3f}",
+                        flush=True,
+                    )
+
+            current_xy_w = (x, y)
+            if not trajectory_w or math.hypot(current_xy_w[0] - trajectory_w[-1][0], current_xy_w[1] - trajectory_w[-1][1]) > 1.0e-4:
+                trajectory_w.append(current_xy_w)
+
+            if should_save_frame:
+                save_world_occupancy_debug_image(
+                    live_grid,
+                    free_state_w=free_state_w,
+                    proxy=proxy,
+                    local_grid_cfg=grid_cfg,
+                    world_grid_cfg=world_grid_cfg,
+                    start_xy_w=start_xy_w,
+                    target_xy_w=target_xy_w_env0,
+                    robot_xy_w=current_xy_w,
+                    covered_trajectory_xy_w=trajectory_w,
+                    active_path_xy_w=path_xy_w,
+                    obstacles=OBSTACLES,
+                    env_origin_xy_w=env_origin_xy_w,
+                    safety_zone_radius_m=safety_zone_radius_m,
+                    out_dir=grid_dir,
+                    step_idx=step_idx,
+                    occupancy_threshold=float(astar_cfg.occupancy_threshold),
+                )
+
+            if decision is not None and decision.target_reached:
+                target_reached = True
+                reached_step = step_idx
+                proxy.set_command(torch.zeros((num_envs, 3), dtype=torch.float32, device=device))
+                break
+
+            if scenario_clearance < 0.0:
+                print(f"[WARN]: collision detected at step={step_idx}: scenario_clearance={scenario_clearance:.3f} m", flush=True)
+                break
+
+            if abs(vy) > 0.05 or abs(wz) > 0.05:
+                nonstraight_command_count += 1
+            if decision is not None and bool(decision.blocked):
+                safety_override_count += 1
+
+            if command.duration_s is not None and not command.is_stop:
+                action_steps = max(1, int(math.ceil(float(command.duration_s) / float(sim_dt))))
+                cmd = torch.tensor([[vx, vy, wz]], dtype=torch.float32, device=device).repeat(num_envs, 1)
+                proxy.set_command(cmd)
+                for _ in range(action_steps):
+                    proxy.step(sim_dt)
+                    sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
+                    scene.write_data_to_sim()
+                    sim.step()
+                    scene.update(sim_dt)
+
+            proxy.set_command(torch.zeros((num_envs, 3), dtype=torch.float32, device=device))
+            for _ in range(max(1, int(args_cli.stepwise_stop_after_action_steps))):
+                proxy.step(sim_dt)
+                sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
+                scene.write_data_to_sim()
+                sim.step()
+                scene.update(sim_dt)
+
+        csv_path = output_dir / "nav_lidar_trace.csv"
+        write_records_csv(csv_path, records)
+        jsonl_path = Path(args_cli.stepwise_trace_jsonl) if str(args_cli.stepwise_trace_jsonl).strip() else output_dir / "stepwise_trace.jsonl"
+        _write_stepwise_jsonl(jsonl_path, stepwise_rows)
+
+        first_dist = records[0].target_distance if records else math.inf
+        last_dist = records[-1].target_distance if records else math.inf
+        min_dist = min((r.target_distance for r in records), default=math.inf)
+        print("=" * 80, flush=True)
+        print(f"[INFO]: target distance first/last/min: {first_dist:.3f} / {last_dist:.3f} / {min_dist:.3f}", flush=True)
+        print(f"[INFO]: min scenario edge clearance: {min_scenario_clearance:.3f}", flush=True)
+        print(f"[INFO]: min scenario safety-margin slack: {min_margin_slack:.3f}", flush=True)
+        print(f"[INFO]: min grid edge clearance: {min_grid_edge_clearance:.3f}", flush=True)
+        print(f"[INFO]: target reached: {target_reached} step={reached_step}", flush=True)
+        print(f"[INFO]: nonstraight command count: {nonstraight_command_count}", flush=True)
+        print(f"[INFO]: stepwise blocked-forward count: {safety_override_count}", flush=True)
+        print(f"[INFO]: wrote trace: {csv_path}", flush=True)
+        print("[INFO]: STEPWISE streaming-target + LiDAR navigation smoke test complete.", flush=True)
+
+        if args_cli.assert_planner:
+            any_plan_found = any(bool(row.get("plan_found")) for row in stepwise_rows)
+            if bool(SCENARIO.get("expect_success", True)) and not any_plan_found:
+                raise RuntimeError("Stepwise planner never found a path.")
+            if bool(SCENARIO.get("expect_avoidance", False)) and nonstraight_command_count <= 0:
+                raise RuntimeError(f"Expected at least one yaw/non-straight stepwise command for scenario {args_cli.scenario!r}.")
+        if args_cli.assert_no_collision and math.isfinite(min_scenario_clearance) and min_scenario_clearance < 0.0:
+            raise RuntimeError(f"collision: min_scenario_clearance={min_scenario_clearance:.3f}")
+        if args_cli.assert_margin and math.isfinite(min_margin_slack) and min_margin_slack < -float(args_cli.margin_tolerance):
+            raise RuntimeError(
+                "executed trajectory cut into planning margin: "
+                f"min_slack={min_margin_slack:.3f}, tolerance={float(args_cli.margin_tolerance):.3f}"
+            )
+        if args_cli.assert_success and bool(SCENARIO.get("expect_success", True)) and not target_reached:
+            raise RuntimeError(f"target not reached: last_distance={last_dist:.3f}, success_radius={success_radius:.3f}")
+        return
+
     # Phase-1 navigation module: same A* + monotonic waypoint controller used by
     # this smoke test, now kept in src/g1_nav_rl/navigation/simple_nav.py.
     nav_cfg = SimpleNavConfig(

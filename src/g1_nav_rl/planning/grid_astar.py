@@ -378,6 +378,7 @@ def plan_grid_path_xy(
     planner_cfg: GridAStarCfg | None = None,
     *,
     allow_goal_relocation: bool = True,
+    allow_start_relocation: bool = True,
 ) -> GridAStarResult:
     """Plan a body-frame path on a local occupancy grid.
 
@@ -390,6 +391,10 @@ def plan_grid_path_xy(
         allow_goal_relocation: If true and the goal lies in an occupied cell,
             search from the nearest free cell instead. This is useful when the
             target itself is represented by/inside an obstacle blob.
+        allow_start_relocation: If true and the start lies in inflated occupancy,
+            search from the nearest free cell.  Stepwise real/sim controllers
+            should usually disable this so being inside the safety margin is a
+            hard planning failure instead of planning from a fictitious start.
     """
     cfg = planner_cfg or GridAStarCfg()
     grid = occupancy_grid
@@ -415,9 +420,14 @@ def plan_grid_path_xy(
     if not is_cell_in_bounds(goal_cell, height=height, width=width):
         return GridAStarResult(False, start_cell, goal_cell, [], [], math.inf, 0, "goal_out_of_bounds")
 
-    adjusted_start = _nearest_free_cell(start_cell, inflated)
-    if adjusted_start is None:
-        return GridAStarResult(False, start_cell, goal_cell, [], [], math.inf, 0, "no_free_start_cell")
+    if bool(inflated[start_cell[0], start_cell[1]]):
+        if not allow_start_relocation:
+            return GridAStarResult(False, start_cell, goal_cell, [], [], math.inf, 0, "start_occupied")
+        adjusted_start = _nearest_free_cell(start_cell, inflated)
+        if adjusted_start is None:
+            return GridAStarResult(False, start_cell, goal_cell, [], [], math.inf, 0, "no_free_start_cell")
+    else:
+        adjusted_start = start_cell
 
     adjusted_goal = goal_cell
     if bool(inflated[goal_cell[0], goal_cell[1]]):

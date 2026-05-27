@@ -1,0 +1,854 @@
+"""Synchronized plan-execute-replan navigation core.
+
+The controller in this module is deliberately input-agnostic.  It does not know
+about Isaac Sim, RealSense, Livox, YOLO, Unitree SDK, or the real/sim command
+sink.  Callers provide normalized observations:
+
+- a current local body-frame target point from RGB-D/YOLO or a stream;
+- a current local body-frame occupancy grid built from LiDAR/depth;
+- an optional raw frontal clearance scalar for a last-resort forward stop.
+
+The controller keeps exactly one piece of state: the currently committed A*
+plan and its command queue.  Replanning is a synchronized procedure:
+
+1. stop/observe is requested when a trigger fires;
+2. on the next call, the latest target + LiDAR grid are used to run A*;
+3. the new path is converted to a plain sequence of body-frame velocity
+   commands ``[vx, vy, wz]_i``;
+4. commands are executed sequentially until another trigger invalidates the
+   plan.
+
+The controller does not smooth commands, does not run yaw escape, does not
+propagate targets, and does not modify the planned path with shortcut/coalescing
+heuristics.  A* remains responsible for obstacle inflation and avoidance.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+import math
+from typing import Any, Mapping, Sequence
+
+import torch
+
+from g1_nav_rl.mapping.occupancy_grid import OccupancyGridCfg
+from g1_nav_rl.navigation.simple_nav import MotionCommand, angle_wrap, path_length_xy
+from g1_nav_rl.planning.grid_astar import (
+    GridAStarCfg,
+    GridAStarResult,
+    bresenham_cells,
+    grid_cell_to_xy,
+    inflate_occupancy_grid,
+    is_cell_in_bounds,
+    plan_grid_path_xy,
+    xy_to_grid_cell,
+)
+
+PointXY = tuple[float, float]
+PoseXYYaw = tuple[float, float, float]
+
+
+class StepwiseActionKind(str, Enum):
+    """Discrete command kinds emitted by the synchronized controller."""
+
+    TURN = "turn"
+    FORWARD = "forward"
+    STOP_OBSERVE = "stop_observe"
+
+
+@dataclass(frozen=True)
+class StepwiseAction:
+    """One executable body-frame velocity command.
+
+    ``duration_s`` is exact for the command and is never clipped inside this
+    module.  If a runner wants to impose a hardware timeout, it should stop and
+    request a synchronized replan rather than pretending the full action was
+    executed.
+    """
+
+    kind: StepwiseActionKind | str
+    command: MotionCommand
+    duration_s: float
+    angle_rad: float | None = None
+    distance_m: float | None = None
+    source: str = "stepwise_nav"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        kind = self.kind if isinstance(self.kind, StepwiseActionKind) else StepwiseActionKind(str(self.kind))
+        duration_s = float(self.duration_s)
+        if not math.isfinite(duration_s) or duration_s < 0.0:
+            raise ValueError(f"StepwiseAction.duration_s must be finite and non-negative, got {duration_s}")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "duration_s", duration_s)
+        if self.angle_rad is not None:
+            angle = float(self.angle_rad)
+            if not math.isfinite(angle):
+                raise ValueError("StepwiseAction.angle_rad must be finite when provided")
+            object.__setattr__(self, "angle_rad", angle)
+        if self.distance_m is not None:
+            distance = float(self.distance_m)
+            if not math.isfinite(distance) or distance < 0.0:
+                raise ValueError("StepwiseAction.distance_m must be finite and non-negative when provided")
+            object.__setattr__(self, "distance_m", distance)
+
+    @property
+    def is_stop(self) -> bool:
+        return self.kind == StepwiseActionKind.STOP_OBSERVE or (
+            abs(self.command.vx) < 1.0e-9 and abs(self.command.vy) < 1.0e-9 and abs(self.command.wz) < 1.0e-9
+        )
+
+    @classmethod
+    def stop_observe(cls, *, source: str = "stepwise_stop_observe", reason: str = "stop_observe") -> "StepwiseAction":
+        return cls(
+            kind=StepwiseActionKind.STOP_OBSERVE,
+            command=MotionCommand(0.0, 0.0, 0.0),
+            duration_s=0.0,
+            source=source,
+            metadata={"reason": reason},
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind.value,
+            "command": [float(v) for v in self.command.tuple],
+            "duration_s": float(self.duration_s),
+            "angle_rad": None if self.angle_rad is None else float(self.angle_rad),
+            "distance_m": None if self.distance_m is None else float(self.distance_m),
+            "source": str(self.source),
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
+class StepwiseNavConfig:
+    """Configuration for synchronized A* plan execution.
+
+    The names keep compatibility with earlier prototypes and CLI flags, but the
+    behavior is now simpler: A* is planned once per sync and converted into a
+    queue of exact velocity commands.  Replanning is triggered by path blockage,
+    target/pose mismatch, explicit periodic checkpoints, exhausted queues, or
+    caller-forced replans.
+    """
+
+    grid_cfg: OccupancyGridCfg = field(default_factory=OccupancyGridCfg)
+    astar_cfg: GridAStarCfg = field(default_factory=lambda: GridAStarCfg(inflation_radius=0.35))
+
+    # Motion conversion.  Speeds are command magnitudes, not smoothing gains.
+    forward_segment_m: float = 0.35  # retained for CLI compatibility; A* cell sequence is not shortcut/coalesced
+    forward_speed_mps: float = 0.35
+    turn_speed_radps: float = 0.50
+    turn_angle_max_rad: float = math.radians(35.0)  # retained for compatibility; not used as a cap
+    min_turn_angle_rad: float = math.radians(3.0)
+    min_forward_m: float = 0.02
+    action_duration_max_s: float = 0.0  # retained for compatibility; not used as a clip
+
+    # Replan triggers.
+    replan_every_actions: int = 0
+    replan_every_forward_m: float = 0.0
+    target_change_replan_m: float = 0.50
+    path_block_check: bool = True
+    path_block_lookahead_m: float = 1.50
+
+    # Kept for compatibility. Missing target stops; blind execution is not used
+    # in this synchronized controller.
+    blind_plan_actions: int = 0
+
+    # Last-resort raw front guard before executing a forward/translation command.
+    emergency_front_stop_m: float = 0.35
+    success_radius_m: float = 0.75
+    start_xy_b: PointXY = (0.0, 0.0)
+    allow_goal_relocation: bool = True
+    allow_start_relocation: bool = True
+    source: str = "stepwise_nav"
+
+    def __post_init__(self) -> None:
+        nonnegative = (
+            "forward_segment_m",
+            "forward_speed_mps",
+            "turn_speed_radps",
+            "turn_angle_max_rad",
+            "min_turn_angle_rad",
+            "min_forward_m",
+            "action_duration_max_s",
+            "replan_every_forward_m",
+            "target_change_replan_m",
+            "path_block_lookahead_m",
+            "emergency_front_stop_m",
+            "success_radius_m",
+        )
+        for name in nonnegative:
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"StepwiseNavConfig.{name} must be finite and non-negative")
+        if self.forward_speed_mps <= 0.0:
+            raise ValueError("forward_speed_mps must be positive")
+        if self.turn_speed_radps <= 0.0:
+            raise ValueError("turn_speed_radps must be positive")
+        if int(self.replan_every_actions) < 0:
+            raise ValueError("replan_every_actions must be non-negative")
+        if int(self.blind_plan_actions) < 0:
+            raise ValueError("blind_plan_actions must be non-negative")
+        if len(self.start_xy_b) != 2:
+            raise ValueError("start_xy_b must be a 2-tuple")
+
+
+@dataclass(frozen=True)
+class StepwisePlanResult:
+    """A synchronized A* plan and the command queue derived from it."""
+
+    astar_result: GridAStarResult
+    actions: list[StepwiseAction]
+    target_xy_b: PointXY
+
+    @property
+    def found(self) -> bool:
+        return bool(self.astar_result.found)
+
+    @property
+    def path_xy_b(self) -> list[PointXY]:
+        return list(self.astar_result.path_xy_b)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "found": bool(self.found),
+            "reason": str(self.astar_result.reason),
+            "target_xy_b": [float(v) for v in self.target_xy_b],
+            "path_len": int(len(self.astar_result.path_xy_b)),
+            "path_length_m": float(path_length_xy(self.astar_result.path_xy_b)),
+            "action_count": int(len(self.actions)),
+            "start_cell": [int(v) for v in self.astar_result.start_cell],
+            "goal_cell": [int(v) for v in self.astar_result.goal_cell],
+        }
+
+
+@dataclass(frozen=True)
+class StepwiseDecision:
+    """One controller decision returned to a sim or real runner."""
+
+    action: StepwiseAction
+    execute: bool
+    reason: str
+    target_visible: bool
+    target_reached: bool = False
+    plan: StepwisePlanResult | None = None
+    blocked: bool = False
+    front_min_distance_m: float | None = None
+    blind_actions_used: int = 0
+    queue_len_after_pop: int = 0
+    replan_attempted: bool = False
+    replan_reason: str | None = None
+    cycle_index: int = 0
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cycle_index": int(self.cycle_index),
+            "execute": bool(self.execute),
+            "reason": str(self.reason),
+            "target_visible": bool(self.target_visible),
+            "target_reached": bool(self.target_reached),
+            "blocked": bool(self.blocked),
+            "front_min_distance_m": self.front_min_distance_m,
+            "blind_actions_used": int(self.blind_actions_used),
+            "queue_len_after_pop": int(self.queue_len_after_pop),
+            "replan_attempted": bool(self.replan_attempted),
+            "replan_reason": self.replan_reason,
+            "action": self.action.to_dict(),
+            "plan": None if self.plan is None else self.plan.to_dict(),
+            "metadata": dict(self.metadata),
+        }
+
+
+def _as_xy(value: Sequence[float], *, name: str) -> PointXY:
+    if len(value) != 2:
+        raise ValueError(f"{name} must have length 2, got {value!r}")
+    x, y = float(value[0]), float(value[1])
+    if not math.isfinite(x) or not math.isfinite(y):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return x, y
+
+
+def _duration_for_turn(angle_rad: float, cfg: StepwiseNavConfig) -> float:
+    return abs(float(angle_rad)) / float(cfg.turn_speed_radps)
+
+
+def _duration_for_translation(distance_m: float, cfg: StepwiseNavConfig) -> float:
+    return abs(float(distance_m)) / float(cfg.forward_speed_mps)
+
+
+def _body_to_plan_xy(local_xy: PointXY, expected_pose: PoseXYYaw) -> PointXY:
+    x_b, y_b = float(local_xy[0]), float(local_xy[1])
+    x, y, yaw = expected_pose
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return x + c * x_b - s * y_b, y + s * x_b + c * y_b
+
+
+def _plan_to_body_xy(point_xy: PointXY, expected_pose: PoseXYYaw) -> PointXY:
+    px, py = float(point_xy[0]), float(point_xy[1])
+    x, y, yaw = expected_pose
+    dx = px - x
+    dy = py - y
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return c * dx + s * dy, -s * dx + c * dy
+
+
+def _apply_action_to_expected_pose(pose: PoseXYYaw, action: StepwiseAction) -> PoseXYYaw:
+    x, y, yaw = pose
+    dt = float(action.duration_s)
+    dx_b = float(action.command.vx) * dt
+    dy_b = float(action.command.vy) * dt
+    dyaw = float(action.command.wz) * dt
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    return (
+        x + c * dx_b - s * dy_b,
+        y + s * dx_b + c * dy_b,
+        angle_wrap(yaw + dyaw),
+    )
+
+
+def _make_turn_action(angle_rad: float, *, cfg: StepwiseNavConfig, path_index: int) -> StepwiseAction:
+    wz = math.copysign(float(cfg.turn_speed_radps), float(angle_rad))
+    return StepwiseAction(
+        kind=StepwiseActionKind.TURN,
+        command=MotionCommand(0.0, 0.0, wz),
+        duration_s=_duration_for_turn(angle_rad, cfg),
+        angle_rad=float(angle_rad),
+        source=cfg.source,
+        metadata={"path_index": int(path_index), "mode": "sync_plan_command_queue"},
+    )
+
+
+def _make_translation_action(local_xy: PointXY, *, cfg: StepwiseNavConfig, path_index: int) -> StepwiseAction:
+    lx, ly = float(local_xy[0]), float(local_xy[1])
+    distance = math.hypot(lx, ly)
+    if distance <= 1.0e-9:
+        raise ValueError("cannot create translation action for zero distance")
+    duration = _duration_for_translation(distance, cfg)
+    return StepwiseAction(
+        kind=StepwiseActionKind.FORWARD,
+        command=MotionCommand(lx / duration, ly / duration, 0.0),
+        duration_s=duration,
+        distance_m=distance,
+        source=cfg.source,
+        metadata={"path_index": int(path_index), "mode": "sync_plan_command_queue"},
+    )
+
+
+def path_to_stepwise_actions(
+    path_xy_b: Sequence[Sequence[float]],
+    *,
+    cfg: StepwiseNavConfig | None = None,
+) -> list[StepwiseAction]:
+    """Convert an A* body-frame path into a simple command queue.
+
+    The conversion follows the path in order.  For each next grid waypoint, the
+    virtual robot first yaws toward that waypoint when the bearing error exceeds
+    ``min_turn_angle_rad``; then it emits a translation command to that waypoint.
+    Small residual lateral components are kept in the translation command rather
+    than hidden by smoothing.  This implements the intended priority:
+
+    ``yaw first -> translate -> next path point``.
+    """
+
+    cfg = cfg or StepwiseNavConfig()
+    points = [_as_xy(p, name="path_xy_b point") for p in path_xy_b]
+    if len(points) < 2:
+        return []
+
+    actions: list[StepwiseAction] = []
+    expected_pose: PoseXYYaw = (float(points[0][0]), float(points[0][1]), 0.0)
+
+    for path_index, waypoint in enumerate(points[1:], start=1):
+        local = _plan_to_body_xy(waypoint, expected_pose)
+        distance = math.hypot(local[0], local[1])
+        if distance < float(cfg.min_forward_m):
+            continue
+
+        bearing = angle_wrap(math.atan2(local[1], local[0]))
+        if abs(bearing) >= float(cfg.min_turn_angle_rad):
+            turn = _make_turn_action(bearing, cfg=cfg, path_index=path_index)
+            actions.append(turn)
+            expected_pose = _apply_action_to_expected_pose(expected_pose, turn)
+            local = _plan_to_body_xy(waypoint, expected_pose)
+            distance = math.hypot(local[0], local[1])
+            if distance < float(cfg.min_forward_m):
+                continue
+
+        translate = _make_translation_action(local, cfg=cfg, path_index=path_index)
+        actions.append(translate)
+        expected_pose = _apply_action_to_expected_pose(expected_pose, translate)
+
+    return actions
+
+
+def plan_stepwise_actions(
+    occupancy_grid: torch.Tensor,
+    target_xy_b: Sequence[float],
+    *,
+    cfg: StepwiseNavConfig | None = None,
+) -> StepwisePlanResult:
+    """Plan from current body origin to a local target and build commands."""
+
+    cfg = cfg or StepwiseNavConfig()
+    target = _as_xy(target_xy_b, name="target_xy_b")
+    astar = plan_grid_path_xy(
+        occupancy_grid,
+        cfg.start_xy_b,
+        target,
+        cfg.grid_cfg,
+        cfg.astar_cfg,
+        allow_goal_relocation=bool(cfg.allow_goal_relocation),
+        allow_start_relocation=bool(cfg.allow_start_relocation),
+    )
+    actions = path_to_stepwise_actions(astar.path_xy_b, cfg=cfg) if astar.found else []
+    return StepwisePlanResult(astar_result=astar, actions=actions, target_xy_b=target)
+
+
+def target_reached(target_xy_b: Sequence[float] | None, *, cfg: StepwiseNavConfig | None = None) -> bool:
+    """Return true if the local target/stand-off goal is already reached."""
+
+    if target_xy_b is None:
+        return False
+    cfg = cfg or StepwiseNavConfig()
+    x, y = _as_xy(target_xy_b, name="target_xy_b")
+    return math.hypot(x, y) <= float(cfg.success_radius_m)
+
+
+def front_clearance_from_points(
+    points_body_xyz: Any,
+    *,
+    x_min_m: float = 0.0,
+    x_max_m: float = 1.0,
+    y_abs_max_m: float = 0.35,
+    z_min_m: float | None = None,
+    z_max_m: float | None = None,
+) -> float | None:
+    """Compute minimum frontal obstacle distance from body-frame points."""
+
+    pts = torch.as_tensor(points_body_xyz, dtype=torch.float32)
+    if pts.ndim != 2 or pts.shape[1] < 2:
+        raise ValueError(f"points_body_xyz must have shape Nx2 or Nx3, got {tuple(pts.shape)}")
+    if pts.numel() == 0:
+        return None
+    x = pts[:, 0]
+    y = pts[:, 1]
+    mask = torch.isfinite(pts[:, :2]).all(dim=1)
+    mask = mask & (x >= float(x_min_m)) & (x <= float(x_max_m)) & (torch.abs(y) <= float(y_abs_max_m))
+    if pts.shape[1] >= 3:
+        z = pts[:, 2]
+        mask = mask & torch.isfinite(z)
+        if z_min_m is not None:
+            mask = mask & (z >= float(z_min_m))
+        if z_max_m is not None:
+            mask = mask & (z <= float(z_max_m))
+    if not bool(mask.any()):
+        return None
+    return float(x[mask].min().item())
+
+
+def forward_action_blocked(
+    action: StepwiseAction,
+    *,
+    front_min_distance_m: float | None,
+    cfg: StepwiseNavConfig | None = None,
+) -> bool:
+    """Apply the last-resort raw forward guard."""
+
+    cfg = cfg or StepwiseNavConfig()
+    if action.kind != StepwiseActionKind.FORWARD:
+        return False
+    if front_min_distance_m is None:
+        return False
+    # Translation commands may include a lateral component, but they still move
+    # the robot footprint.  The raw corridor guard is intentionally conservative:
+    # if something is too close in front, do not translate.
+    return float(front_min_distance_m) < float(cfg.emergency_front_stop_m)
+
+
+def _target_mismatch_m(*, observed_target_xy_b: PointXY, plan_target_xy_b: PointXY, expected_pose: PoseXYYaw) -> float:
+    expected_target_now_b = _plan_to_body_xy(plan_target_xy_b, expected_pose)
+    return math.hypot(
+        float(observed_target_xy_b[0]) - expected_target_now_b[0],
+        float(observed_target_xy_b[1]) - expected_target_now_b[1],
+    )
+
+
+def _inflated_grid(occupancy_grid: torch.Tensor, cfg: StepwiseNavConfig) -> torch.Tensor:
+    grid = occupancy_grid
+    if grid.ndim == 3:
+        if grid.shape[0] != 1:
+            raise ValueError("path-block check expects a single grid or batch size 1")
+        grid = grid[0]
+    if grid.ndim != 2:
+        raise ValueError(f"occupancy_grid must have shape [H,W] or [1,H,W], got {tuple(occupancy_grid.shape)}")
+    return inflate_occupancy_grid(
+        grid,
+        cfg=cfg.grid_cfg,
+        inflation_radius=cfg.astar_cfg.inflation_radius,
+        occupancy_threshold=cfg.astar_cfg.occupancy_threshold,
+    ).to(dtype=torch.bool, device="cpu")
+
+
+def _path_prefix_with_lookahead(path_xy_b: Sequence[PointXY], *, lookahead_m: float) -> list[PointXY]:
+    if not path_xy_b:
+        return []
+    if lookahead_m <= 0.0:
+        return list(path_xy_b)
+    out = [path_xy_b[0]]
+    covered = 0.0
+    prev = path_xy_b[0]
+    for p in path_xy_b[1:]:
+        seg = math.hypot(float(p[0]) - float(prev[0]), float(p[1]) - float(prev[1]))
+        if covered + seg > lookahead_m:
+            if seg > 1.0e-9:
+                t = (lookahead_m - covered) / seg
+                out.append((float(prev[0]) + t * (float(p[0]) - float(prev[0])), float(prev[1]) + t * (float(p[1]) - float(prev[1]))))
+            break
+        out.append(p)
+        covered += seg
+        prev = p
+    return out
+
+
+def remaining_path_blocked(
+    occupancy_grid: torch.Tensor,
+    plan: StepwisePlanResult,
+    *,
+    cfg: StepwiseNavConfig | None = None,
+    expected_pose: PoseXYYaw = (0.0, 0.0, 0.0),
+    current_action_index: int = 0,
+) -> tuple[bool, dict[str, Any]]:
+    """Check whether the current inflated grid blocks the remaining planned path.
+
+    The cached A* path is stored in the body frame used at the last sync.  The
+    controller maintains a minimal expected pose inside that plan frame from the
+    commands it has issued.  This lets us express the remaining path in the
+    current body frame before checking it against the latest LiDAR occupancy.
+    """
+
+    cfg = cfg or StepwiseNavConfig()
+    if not cfg.path_block_check or plan is None or not plan.found:
+        return False, {"checked": False, "reason": "disabled_or_no_plan"}
+
+    path = plan.path_xy_b
+    if len(path) < 2:
+        return False, {"checked": False, "reason": "short_path"}
+
+    # Find the path index associated with the next queued action.  If metadata is
+    # missing, fall back to the beginning; this is conservative.
+    path_index = 1
+    if 0 <= int(current_action_index) < len(plan.actions):
+        try:
+            path_index = int(plan.actions[int(current_action_index)].metadata.get("path_index", 1))
+        except Exception:
+            path_index = 1
+    path_index = max(1, min(path_index, len(path) - 1))
+
+    remaining_plan_frame: list[PointXY] = [(float(expected_pose[0]), float(expected_pose[1]))]
+    remaining_plan_frame.extend(path[path_index:])
+    remaining_body = [_plan_to_body_xy(p, expected_pose) for p in remaining_plan_frame]
+    remaining_body = _path_prefix_with_lookahead(remaining_body, lookahead_m=float(cfg.path_block_lookahead_m))
+    if len(remaining_body) < 2:
+        return False, {"checked": False, "reason": "empty_remaining_path"}
+
+    inflated = _inflated_grid(occupancy_grid, cfg)
+    height, width = int(inflated.shape[0]), int(inflated.shape[1])
+    for seg_idx, (a, b) in enumerate(zip(remaining_body[:-1], remaining_body[1:])):
+        ca = xy_to_grid_cell(a, cfg.grid_cfg)
+        cb = xy_to_grid_cell(b, cfg.grid_cfg)
+        if not is_cell_in_bounds(ca, height=height, width=width) or not is_cell_in_bounds(cb, height=height, width=width):
+            return True, {"checked": True, "reason": "remaining_path_out_of_bounds", "segment_index": int(seg_idx)}
+        for cell in bresenham_cells(ca, cb):
+            if not is_cell_in_bounds(cell, height=height, width=width):
+                return True, {"checked": True, "reason": "remaining_path_out_of_bounds", "segment_index": int(seg_idx), "cell": list(cell)}
+            if bool(inflated[cell[0], cell[1]].item()):
+                return True, {
+                    "checked": True,
+                    "reason": "inflated_occupancy_intersection",
+                    "segment_index": int(seg_idx),
+                    "cell": list(cell),
+                    "cell_xy_b": list(grid_cell_to_xy(cell, cfg.grid_cfg)),
+                    "path_index": int(path_index),
+                }
+    return False, {"checked": True, "reason": "clear", "path_index": int(path_index), "checked_points": len(remaining_body)}
+
+
+class StepwiseNavigator:
+    """Synchronized A* plan executor.
+
+    Public behavior:
+    - no target -> stop;
+    - no plan / pending sync -> plan from latest target + grid;
+    - active plan -> execute next queued command;
+    - path blocked / target mismatch / periodic trigger -> stop now, then
+      replan from fresh data on the next call.
+    """
+
+    def __init__(self, cfg: StepwiseNavConfig | None = None) -> None:
+        self.cfg = cfg or StepwiseNavConfig()
+        self.action_queue: list[StepwiseAction] = []
+        self.current_action_index = 0
+        self.last_plan: StepwisePlanResult | None = None
+        self.cycle_index = 0
+        self.executed_actions_since_replan = 0
+        self.executed_forward_m_since_replan = 0.0
+        self.blind_actions_used = 0
+        self.pending_replan_reason: str | None = None
+        self.expected_pose_in_plan: PoseXYYaw = (0.0, 0.0, 0.0)
+
+    def reset(self) -> None:
+        self.action_queue.clear()
+        self.current_action_index = 0
+        self.last_plan = None
+        self.cycle_index = 0
+        self.executed_actions_since_replan = 0
+        self.executed_forward_m_since_replan = 0.0
+        self.blind_actions_used = 0
+        self.pending_replan_reason = None
+        self.expected_pose_in_plan = (0.0, 0.0, 0.0)
+
+    def _stop_decision(
+        self,
+        *,
+        reason: str,
+        target_visible: bool,
+        target_reached_value: bool = False,
+        blocked: bool = False,
+        front_min_distance_m: float | None = None,
+        replan_reason: str | None = None,
+        replan_attempted: bool = False,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> StepwiseDecision:
+        action = StepwiseAction.stop_observe(reason=reason)
+        decision = StepwiseDecision(
+            action=action,
+            execute=False,
+            reason=reason,
+            target_visible=bool(target_visible),
+            target_reached=bool(target_reached_value),
+            plan=self.last_plan,
+            blocked=bool(blocked),
+            front_min_distance_m=front_min_distance_m,
+            blind_actions_used=0,
+            queue_len_after_pop=max(0, len(self.action_queue) - self.current_action_index),
+            replan_attempted=bool(replan_attempted),
+            replan_reason=replan_reason,
+            cycle_index=self.cycle_index,
+            metadata=dict(metadata or {}),
+        )
+        self.cycle_index += 1
+        return decision
+
+    def _request_sync_stop(self, reason: str, *, front_min_distance_m: float | None, metadata: Mapping[str, Any]) -> StepwiseDecision:
+        self.pending_replan_reason = reason
+        self.action_queue.clear()
+        self.current_action_index = 0
+        return self._stop_decision(
+            reason=reason,
+            target_visible=True,
+            blocked=reason in {"path_blocked", "forward_blocked"},
+            front_min_distance_m=front_min_distance_m,
+            replan_reason=reason,
+            metadata={**metadata, "sync_replan_reason": reason},
+        )
+
+    def _sync_replan(
+        self,
+        *,
+        target_xy_b: Sequence[float],
+        occupancy_grid: torch.Tensor,
+        replan_reason: str,
+    ) -> StepwisePlanResult:
+        plan = plan_stepwise_actions(occupancy_grid, target_xy_b, cfg=self.cfg)
+        self.last_plan = plan
+        self.action_queue = list(plan.actions)
+        self.current_action_index = 0
+        self.executed_actions_since_replan = 0
+        self.executed_forward_m_since_replan = 0.0
+        self.blind_actions_used = 0
+        self.pending_replan_reason = None
+        self.expected_pose_in_plan = (0.0, 0.0, 0.0)
+        return plan
+
+    def _execute_next_action(
+        self,
+        *,
+        target_visible: bool,
+        front_min_distance_m: float | None,
+        replan_reason: str | None,
+        replan_attempted: bool,
+        metadata: Mapping[str, Any],
+    ) -> StepwiseDecision:
+        assert self.last_plan is not None
+        action = self.action_queue[self.current_action_index]
+        blocked = forward_action_blocked(action, front_min_distance_m=front_min_distance_m, cfg=self.cfg)
+        if blocked:
+            return self._request_sync_stop("forward_blocked", front_min_distance_m=front_min_distance_m, metadata=metadata)
+
+        self.current_action_index += 1
+        self.executed_actions_since_replan += 1
+        if action.kind == StepwiseActionKind.FORWARD:
+            self.executed_forward_m_since_replan += float(action.distance_m or 0.0)
+        self.expected_pose_in_plan = _apply_action_to_expected_pose(self.expected_pose_in_plan, action)
+
+        decision = StepwiseDecision(
+            action=action,
+            execute=not action.is_stop,
+            reason="execute_action" if not action.is_stop else "stop_observe",
+            target_visible=bool(target_visible),
+            plan=self.last_plan,
+            front_min_distance_m=front_min_distance_m,
+            blind_actions_used=0,
+            queue_len_after_pop=max(0, len(self.action_queue) - self.current_action_index),
+            replan_attempted=bool(replan_attempted),
+            replan_reason=replan_reason,
+            cycle_index=self.cycle_index,
+            metadata={**dict(metadata), "expected_pose_in_plan_after_action": list(self.expected_pose_in_plan)},
+        )
+        self.cycle_index += 1
+        return decision
+
+    def decide(
+        self,
+        *,
+        target_xy_b: Sequence[float] | None,
+        occupancy_grid: torch.Tensor | None,
+        front_min_distance_m: float | None = None,
+        force_replan: bool = False,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> StepwiseDecision:
+        """Return the next synchronized plan-execution command."""
+
+        meta = dict(metadata or {})
+        target_visible = target_xy_b is not None
+
+        if not target_visible:
+            self.action_queue.clear()
+            self.current_action_index = 0
+            self.pending_replan_reason = None
+            return self._stop_decision(
+                reason="target_missing_stop_observe",
+                target_visible=False,
+                front_min_distance_m=front_min_distance_m,
+                metadata=meta,
+            )
+
+        assert target_xy_b is not None
+        target_xy = _as_xy(target_xy_b, name="target_xy_b")
+        if target_reached(target_xy, cfg=self.cfg):
+            self.action_queue.clear()
+            self.current_action_index = 0
+            self.pending_replan_reason = None
+            return self._stop_decision(
+                reason="target_reached",
+                target_visible=True,
+                target_reached_value=True,
+                front_min_distance_m=front_min_distance_m,
+                metadata=meta,
+            )
+
+        if occupancy_grid is None:
+            return self._stop_decision(
+                reason="missing_occupancy_grid",
+                target_visible=True,
+                front_min_distance_m=front_min_distance_m,
+                replan_reason=self.pending_replan_reason,
+                metadata=meta,
+            )
+
+        if force_replan:
+            return self._request_sync_stop("force_replan", front_min_distance_m=front_min_distance_m, metadata=meta)
+
+        active_plan = self.last_plan is not None and self.current_action_index < len(self.action_queue)
+        need_immediate_replan_reason: str | None = None
+        if self.pending_replan_reason is not None:
+            need_immediate_replan_reason = self.pending_replan_reason
+        elif not active_plan:
+            need_immediate_replan_reason = "initial_sync" if self.last_plan is None else "queue_exhausted"
+
+        if need_immediate_replan_reason is not None:
+            plan = self._sync_replan(target_xy_b=target_xy, occupancy_grid=occupancy_grid, replan_reason=need_immediate_replan_reason)
+            if not plan.found:
+                return self._stop_decision(
+                    reason="plan_failed",
+                    target_visible=True,
+                    front_min_distance_m=front_min_distance_m,
+                    replan_attempted=True,
+                    replan_reason=need_immediate_replan_reason,
+                    metadata={**meta, "plan_failure_reason": plan.astar_result.reason},
+                )
+            if not self.action_queue:
+                return self._stop_decision(
+                    reason="empty_action_queue",
+                    target_visible=True,
+                    front_min_distance_m=front_min_distance_m,
+                    replan_attempted=True,
+                    replan_reason=need_immediate_replan_reason,
+                    metadata=meta,
+                )
+            return self._execute_next_action(
+                target_visible=True,
+                front_min_distance_m=front_min_distance_m,
+                replan_reason=need_immediate_replan_reason,
+                replan_attempted=True,
+                metadata=meta,
+            )
+
+        assert self.last_plan is not None
+
+        if float(self.cfg.target_change_replan_m) > 0.0:
+            mismatch = _target_mismatch_m(
+                observed_target_xy_b=target_xy,
+                plan_target_xy_b=self.last_plan.target_xy_b,
+                expected_pose=self.expected_pose_in_plan,
+            )
+            meta["target_expected_mismatch_m"] = float(mismatch)
+            if mismatch >= float(self.cfg.target_change_replan_m):
+                return self._request_sync_stop("target_changed", front_min_distance_m=front_min_distance_m, metadata=meta)
+
+        if int(self.cfg.replan_every_actions) > 0 and self.executed_actions_since_replan >= int(self.cfg.replan_every_actions):
+            return self._request_sync_stop("periodic_replan_actions", front_min_distance_m=front_min_distance_m, metadata=meta)
+
+        if float(self.cfg.replan_every_forward_m) > 0.0 and self.executed_forward_m_since_replan >= float(self.cfg.replan_every_forward_m):
+            return self._request_sync_stop("periodic_replan_distance", front_min_distance_m=front_min_distance_m, metadata=meta)
+
+        blocked, block_info = remaining_path_blocked(
+            occupancy_grid,
+            self.last_plan,
+            cfg=self.cfg,
+            expected_pose=self.expected_pose_in_plan,
+            current_action_index=self.current_action_index,
+        )
+        meta["path_block_check"] = block_info
+        if blocked:
+            return self._request_sync_stop("path_blocked", front_min_distance_m=front_min_distance_m, metadata=meta)
+
+        return self._execute_next_action(
+            target_visible=True,
+            front_min_distance_m=front_min_distance_m,
+            replan_reason=None,
+            replan_attempted=False,
+            metadata=meta,
+        )
+
+
+__all__ = [
+    "PointXY",
+    "StepwiseActionKind",
+    "StepwiseAction",
+    "StepwiseNavConfig",
+    "StepwisePlanResult",
+    "StepwiseDecision",
+    "StepwiseNavigator",
+    "front_clearance_from_points",
+    "forward_action_blocked",
+    "remaining_path_blocked",
+    "path_to_stepwise_actions",
+    "plan_stepwise_actions",
+    "target_reached",
+]
