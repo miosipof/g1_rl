@@ -65,6 +65,14 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream-depth-m", type=float, default=3.2)
     parser.add_argument("--stream-depth-valid-ratio", type=float, default=1.0)
 
+    parser.add_argument("--target-lock-mode", choices=("none", "primary_track"), default="primary_track", help="Stepwise stream target selection policy passed to the child.")
+    parser.add_argument("--target-lock-min-confidence", type=float, default=-1.0, help="Primary-lock min confidence. Negative uses child --min_confidence.")
+    parser.add_argument("--target-lock-min-depth-valid-ratio", type=float, default=0.0)
+    parser.add_argument("--target-lock-max-lost-s", type=float, default=5.0)
+    parser.add_argument("--target-lock-max-jump-m", type=float, default=1.0)
+    parser.add_argument("--target-lock-allow-track-switch", action="store_true")
+    parser.add_argument("--target-lock-no-require-track-id", action="store_true")
+
     parser.add_argument("--forward-segment-m", type=float, default=0.35)
     parser.add_argument("--forward-speed-mps", type=float, default=0.35)
     parser.add_argument("--turn-speed-radps", type=float, default=0.50)
@@ -279,6 +287,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         str(stream_path),
         "--detection_stream_max_age_s",
         str(float(args.stream_max_age_s)),
+        "--target_lock_mode",
+        str(args.target_lock_mode),
+        "--target_lock_min_confidence",
+        str(float(args.target_lock_min_confidence)),
+        "--target_lock_min_depth_valid_ratio",
+        str(float(args.target_lock_min_depth_valid_ratio)),
+        "--target_lock_max_lost_s",
+        str(float(args.target_lock_max_lost_s)),
+        "--target_lock_max_jump_m",
+        str(float(args.target_lock_max_jump_m)),
         "--output_dir",
         str(child_output_dir),
         "--perception_image_dir",
@@ -304,6 +322,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--stepwise_action_duration_max_s",
         str(float(args.action_duration_max_s)),
     ]
+    if bool(args.target_lock_allow_track_switch):
+        cmd.append("--target_lock_allow_track_switch")
+    if bool(args.target_lock_no_require_track_id):
+        cmd.append("--target_lock_no_require_track_id")
     if bool(args.save_rgb_screenshots):
         cmd.append("--save_perception_images")
     if not bool(args.no_stream_allow_stale):

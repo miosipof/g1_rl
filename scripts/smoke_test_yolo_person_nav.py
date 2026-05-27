@@ -500,6 +500,13 @@ parser.add_argument("--detection_stream_path", type=str, default="", help="Path 
 parser.add_argument("--detection_stream_max_age_s", type=float, default=1.0, help="Maximum age for stream target frames. Use a large value for static Isaac smoke files.")
 parser.add_argument("--detection_stream_allow_stale", action="store_true", help="Allow stale detection stream frames for deterministic Isaac smoke/replay tests.")
 parser.add_argument("--detection_stream_track_id", type=str, default="", help="Optional locked track id to read from the stream. Empty selects the best matching class.")
+parser.add_argument("--target_lock_mode", choices=("none", "primary_track"), default="none", help="Detection-stream target identity policy. primary_track locks the initial highest-confidence valid track and ignores distractors.")
+parser.add_argument("--target_lock_min_confidence", type=float, default=-1.0, help="Minimum confidence for primary-track lock. Negative uses --min_confidence.")
+parser.add_argument("--target_lock_min_depth_valid_ratio", type=float, default=0.0, help="Minimum depth_valid_ratio for primary-track lock candidates.")
+parser.add_argument("--target_lock_max_lost_s", type=float, default=5.0, help="How long to keep using the last-known target after the locked track disappears.")
+parser.add_argument("--target_lock_max_jump_m", type=float, default=1.0, help="Reject locked-track target jumps larger than this; 0 disables jump rejection.")
+parser.add_argument("--target_lock_allow_track_switch", action="store_true", help="Allow switching to another valid target-class track after the locked track is missing. Disabled by default.")
+parser.add_argument("--target_lock_no_require_track_id", action="store_true", help="Allow primary target locking without track_id. Not recommended for real multi-object runs.")
 parser.add_argument("--min_confidence", type=float, default=0.25)
 parser.add_argument("--selection_policy", type=str, default="nearest", choices=("nearest", "largest", "highest_confidence"))
 parser.add_argument("--fallback_synthetic_bbox", dest="fallback_synthetic_bbox", action="store_true", default=True, help="Use projected known person bbox if YOLO is unavailable/no detection. Enabled by default.")
@@ -607,6 +614,7 @@ from g1_nav_rl.perception.target_from_bbox import (  # noqa: E402
 from g1_nav_rl.perception.target_provider import BBoxTargetProvider, TargetProviderConfig  # noqa: E402
 from g1_nav_rl.perception.target_tracker import TargetMeasurement, TargetTracker, TargetTrackerConfig  # noqa: E402
 from g1_nav_rl.perception.detection_stream import DetectionStreamClient, DetectionStreamHealth  # noqa: E402
+from adapters.stream_target_lock import PrimaryTargetLock, PrimaryTargetLockConfig  # noqa: E402
 from g1_nav_rl.navigation.stepwise import StepwiseNavConfig  # noqa: E402
 from adapters.stepwise_runtime import StepwiseTargetNavPolicyRuntime, StepwiseTargetNavPolicyRuntimeConfig  # noqa: E402
 from adapters.types import LidarFrame, RobotObservation  # noqa: E402
@@ -2885,6 +2893,97 @@ def _stream_track_id_arg() -> int | str | None:
 
 
 
+
+_PRIMARY_TARGET_LOCK: PrimaryTargetLock | None = None
+
+
+def _primary_target_lock() -> PrimaryTargetLock:
+    global _PRIMARY_TARGET_LOCK
+    if _PRIMARY_TARGET_LOCK is None:
+        min_conf = float(args_cli.target_lock_min_confidence)
+        if min_conf < 0.0:
+            min_conf = float(args_cli.min_confidence)
+        _PRIMARY_TARGET_LOCK = PrimaryTargetLock(
+            PrimaryTargetLockConfig(
+                target_class=str(args_cli.target_class),
+                min_confidence=min_conf,
+                min_depth_valid_ratio=float(args_cli.target_lock_min_depth_valid_ratio),
+                max_stream_age_s=float(args_cli.detection_stream_max_age_s),
+                max_lost_s=float(args_cli.target_lock_max_lost_s),
+                max_target_jump_m=float(args_cli.target_lock_max_jump_m),
+                require_track_id=not bool(args_cli.target_lock_no_require_track_id),
+                allow_track_switch=bool(args_cli.target_lock_allow_track_switch),
+                initial_track_id=_stream_track_id_arg(),
+            )
+        )
+    return _PRIMARY_TARGET_LOCK
+
+
+def _read_detection_stream_target_lock(*, step_idx: int | None = None) -> tuple[PointXY | None, dict[str, Any]]:
+    """Read stream frame through the primary-track lock and return target body XY."""
+    path = str(args_cli.detection_stream_path).strip()
+    meta: dict[str, Any] = {
+        "detection_source": "stream",
+        "target_valid": False,
+        "stream_path": path,
+        "step": None if step_idx is None else int(step_idx),
+        "target_lock_mode": str(args_cli.target_lock_mode),
+    }
+    if not path:
+        state = _primary_target_lock().update(None, now_s=0.0, stream_metadata={"reason": "stream_path_missing"})
+        meta.update({"reason": "stream_path_missing", "target_lock": state.to_dict()})
+        return None, meta
+
+    client = DetectionStreamClient(
+        path=path,
+        max_age_s=float(args_cli.detection_stream_max_age_s),
+        missing_ok=True,
+    )
+    result = client.read()
+    meta["stream_status"] = {
+        "health": str(result.status.health.value),
+        "message": result.status.message,
+        "details": dict(result.status.details),
+    }
+    state = _primary_target_lock().update_read_result(
+        result,
+        allow_stale=bool(args_cli.detection_stream_allow_stale),
+    )
+    if result.frame is not None:
+        meta["frame"] = {
+            "timestamp_s": float(result.frame.timestamp_s),
+            "frame_id": result.frame.frame_id,
+            "source": result.frame.source,
+            "track_count": len(result.frame.tracks),
+        }
+        meta["tracks"] = [track.to_dict() for track in result.frame.tracks]
+    meta["target_lock"] = state.to_dict()
+    if state.target is None:
+        meta.update({"reason": state.reason, "target_valid": False})
+        return None, meta
+
+    target_b = (float(state.target.x), float(state.target.y))
+    selected_detection = None if state.selected_track is None else state.selected_track.to_dict()
+    if selected_detection is not None:
+        meta["selected_detection"] = selected_detection
+    meta.update(
+        {
+            "reason": state.reason,
+            "target_valid": True,
+            "target": {
+                "target_body_xy": [target_b[0], target_b[1]],
+                "track_id": state.locked_track_id,
+                "using_last_known": bool(state.using_last_known),
+                "target_lock_state": state.state.value,
+                "class_name": str(args_cli.target_class),
+                "confidence": None if state.selected_track is None else float(state.selected_track.confidence),
+                "depth_m": None if state.selected_track is None else state.selected_track.depth_m,
+                "depth_valid_ratio": None if state.selected_track is None else state.selected_track.depth_valid_ratio,
+            },
+        }
+    )
+    return target_b, meta
+
 def _read_detection_stream_best_track(*, step_idx: int | None = None) -> tuple[Any | None, dict[str, Any]]:
     """Read and validate the best matching track from the stream file."""
     path = str(args_cli.detection_stream_path).strip()
@@ -3513,6 +3612,9 @@ def _target_world_from_body(*, proxy: G1CommandProxy, target_body_xy: PointXY) -
 
 def _stepwise_stream_target_body(*, step_idx: int) -> tuple[PointXY | None, dict[str, Any]]:
     """Read stream target in body frame for the stepwise controller."""
+    if str(args_cli.target_lock_mode) == "primary_track":
+        return _read_detection_stream_target_lock(step_idx=step_idx)
+
     track, meta = _read_detection_stream_best_track(step_idx=step_idx)
     if track is None or track.target_body_xy is None:
         return None, meta
@@ -3521,6 +3623,7 @@ def _stepwise_stream_target_body(*, step_idx: int) -> tuple[PointXY | None, dict
         {
             "reason": "ok",
             "target_valid": True,
+            "target_lock": {"state": "disabled", "mode": "none"},
             "selected_detection": track.to_dict(),
             "target": {
                 "target_body_xy": [target_b[0], target_b[1]],

@@ -146,6 +146,14 @@ from .run_dirs import (
 )
 
 
+
+from .stream_target_lock import (
+    PrimaryTargetLock,
+    PrimaryTargetLockConfig,
+    PrimaryTargetLockStateKind,
+    PrimaryTargetState,
+)
+
 from .stepwise_runtime import (
     StepwiseTargetNavPolicyRuntime,
     StepwiseTargetNavPolicyRuntimeConfig,
@@ -284,4 +292,8 @@ __all__ = [
     "summarize_loco_state",
     "world_points_to_body_xyz",
     "normalize_policy_command",
+    "PrimaryTargetLock",
+    "PrimaryTargetLockConfig",
+    "PrimaryTargetLockStateKind",
+    "PrimaryTargetState",
 ]
