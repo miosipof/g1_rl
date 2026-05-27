@@ -63,7 +63,7 @@ def test_stepwise_runtime_missing_target_returns_stop():
 
     assert cmd.is_stop
     assert rt.last_decision is not None
-    assert rt.last_decision.reason == "target_missing_no_plan"
+    assert rt.last_decision.reason == "target_missing_stop_observe"
 
 
 def test_stepwise_runtime_uses_occupancy_grid_override_for_planning():

@@ -70,9 +70,34 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--turn-speed-radps", type=float, default=0.50)
     parser.add_argument("--turn-angle-max-deg", type=float, default=35.0)
     parser.add_argument("--blind-plan-actions", type=int, default=1)
-    parser.add_argument("--replan-every-actions", type=int, default=2)
+    parser.add_argument(
+        "--replan-every-actions",
+        "--stepwise_replan_every_actions",
+        "--stepwise-replan-every-actions",
+        dest="replan_every_actions",
+        type=int,
+        default=0,
+        help="Pass-through periodic sync replan after N primitive actions. Default 0 disables this.",
+    )
+    parser.add_argument(
+        "--replan-every-forward-m",
+        "--stepwise_replan_every_forward_m",
+        "--stepwise-replan-every-forward-m",
+        dest="replan_every_forward_m",
+        type=float,
+        default=0.0,
+        help="Pass-through periodic sync replan after commanded forward distance. Default 0 disables this.",
+    )
     parser.add_argument("--emergency-front-stop-m", type=float, default=0.35)
-    parser.add_argument("--action-duration-max-s", type=float, default=1.0)
+    parser.add_argument("--action-duration-max-s", type=float, default=0.0, help="Compatibility option; synchronized stepwise controller does not clip action durations.")
+    parser.add_argument("--sweep-start-ignore-m", "--stepwise_sweep_start_ignore_m", "--stepwise-sweep-start-ignore-m", dest="sweep_start_ignore_m", type=float, default=0.05, help="Distance near robot origin ignored by immediate swept-footprint path_blocked check.")
+    parser.add_argument(
+        "--save-rgb-screenshots",
+        "--save-perception-images",
+        dest="save_rgb_screenshots",
+        action="store_true",
+        help="Pass --save_perception_images to the child; stepwise mode then writes RGB frames alongside occupancy maps.",
+    )
 
     parser.add_argument(
         "script_args",
@@ -210,6 +235,16 @@ def _run_command(command: list[str], *, run_dir: Path, timeout_s: float, poll_in
         "stderr_tail": _tail_text(stderr_path, max_lines=tail_lines),
     }
     _write_json_atomic(result_path, result)
+    _write_json_atomic(
+        command_path,
+        {
+            "status": "completed" if int(effective_returncode) == 0 else status,
+            "returncode": int(effective_returncode),
+            "elapsed_s": float(elapsed),
+            "pid": None if proc is None else proc.pid,
+            "command": command,
+        },
+    )
     return result
 
 
@@ -260,11 +295,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         str(int(args.blind_plan_actions)),
         "--stepwise_replan_every_actions",
         str(int(args.replan_every_actions)),
+        "--stepwise_replan_every_forward_m",
+        str(float(args.replan_every_forward_m)),
         "--stepwise_emergency_front_stop_m",
         str(float(args.emergency_front_stop_m)),
+        "--stepwise_sweep_start_ignore_m",
+        str(float(args.sweep_start_ignore_m)),
         "--stepwise_action_duration_max_s",
         str(float(args.action_duration_max_s)),
     ]
+    if bool(args.save_rgb_screenshots):
+        cmd.append("--save_perception_images")
     if not bool(args.no_stream_allow_stale):
         cmd.append("--detection_stream_allow_stale")
     if bool(args.static_stream):
@@ -297,11 +338,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     _write_json_atomic(
         summary_path,
         {
-            "status": result["status"],
+            "status": "completed" if int(result["returncode"]) == 0 else result["status"],
+            "returncode": int(result["returncode"]),
             "run_id": run_id,
             "run_dir": str(run_dir),
             "stream_path": str(stream_path),
             "static_stream": bool(args.static_stream),
+            "trace_path": str(child_output_dir / "nav_lidar_trace.csv"),
+            "stepwise_trace_path": str(child_output_dir / "stepwise_trace.jsonl"),
             "child_result": result,
         },
     )

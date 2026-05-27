@@ -484,10 +484,12 @@ parser.add_argument("--stepwise_forward_segment_m", type=float, default=0.35)
 parser.add_argument("--stepwise_forward_speed_mps", type=float, default=0.35)
 parser.add_argument("--stepwise_turn_speed_radps", type=float, default=0.50)
 parser.add_argument("--stepwise_turn_angle_max_deg", type=float, default=35.0)
-parser.add_argument("--stepwise_replan_every_actions", type=int, default=2)
+parser.add_argument("--stepwise_replan_every_actions", "--stepwise-replan-every-actions", type=int, default=0, help="Periodic synchronized replan after N executed primitive actions. Default 0 disables this; prefer distance-based replanning.")
+parser.add_argument("--stepwise_replan_every_forward_m", "--stepwise-replan-every-forward-m", type=float, default=0.0, help="Periodic synchronized replan after this much commanded forward/translation distance. Default 0 disables this.")
 parser.add_argument("--stepwise_blind_plan_actions", type=int, default=1)
 parser.add_argument("--stepwise_emergency_front_stop_m", type=float, default=0.35)
-parser.add_argument("--stepwise_action_duration_max_s", type=float, default=1.0)
+parser.add_argument("--stepwise_action_duration_max_s", type=float, default=0.0, help="Compatibility option; synchronized stepwise controller does not clip action durations.")
+parser.add_argument("--stepwise_sweep_start_ignore_m", type=float, default=0.05, help="Distance near robot origin ignored by immediate swept-footprint path_blocked check.")
 parser.add_argument("--stepwise_stop_after_action_steps", type=int, default=1, help="Number of zero-command physics steps after each stepwise action.")
 parser.add_argument("--stepwise_front_x_max_m", type=float, default=1.0)
 parser.add_argument("--stepwise_front_y_abs_max_m", type=float, default=0.35)
@@ -1392,6 +1394,68 @@ def print_lidar_raw_diagnostics(lidar_obs: dict[str, torch.Tensor], *, label: st
         )
 
 
+def lidar_debug_summary(
+    lidar_obs: dict[str, torch.Tensor],
+    *,
+    raw_lidar_grid: torch.Tensor,
+    instant_lidar_grid: torch.Tensor,
+    lidar_grid: torch.Tensor,
+    planning_grid: torch.Tensor,
+    map_updated: bool,
+) -> dict[str, Any]:
+    """Compact per-step LiDAR/map diagnostics for stepwise traces.
+
+    This intentionally distinguishes raw first-return hits, conservative instant
+    obstacles, accumulated-memory LiDAR grid, and the final grid passed to A*.
+    It is used to debug cases where a true obstacle region is not represented
+    in the LiDAR-derived occupancy map.
+    """
+    valid = lidar_obs["lidar_valid"][0].detach().cpu().to(dtype=torch.bool) if lidar_obs["lidar_valid"].numel() else torch.zeros((0,), dtype=torch.bool)
+    pts_b = lidar_obs["lidar_points_b"][0].detach().cpu() if lidar_obs["lidar_points_b"].numel() else torch.empty((0, 2))
+    hits_w = lidar_obs["lidar_ray_hits_w"][0].detach().cpu() if lidar_obs["lidar_ray_hits_w"].numel() else torch.empty((0, 3))
+    sensor_pos = lidar_obs["lidar_sensor_pos_w"][0].detach().cpu() if lidar_obs["lidar_sensor_pos_w"].numel() else torch.empty((0,))
+    out: dict[str, Any] = {
+        "map_updated": bool(map_updated),
+        "grid_source": str(GRID_SOURCE),
+        "lidar_map_mode": str(args_cli.lidar_map_mode),
+        "map_update_every": int(args_cli.map_update_every),
+        "lidar_obstacle_thickness_m": float(args_cli.lidar_obstacle_thickness),
+        "lidar_obstacle_lateral_padding_m": float(args_cli.lidar_obstacle_lateral_padding),
+        "lidar_horizontal_fov_deg": [float(v) for v in CFG["lidar"]["pattern"]["horizontal_fov_range"]],
+        "lidar_horizontal_res_deg": float(CFG["lidar"]["pattern"]["horizontal_res"]),
+        "lidar_channels": int(CFG["lidar"]["pattern"]["channels"]),
+        "lidar_max_range_m": float(CFG["lidar"].get("max_distance", float("nan"))),
+        "sensor_pos_w": None if sensor_pos.numel() < 3 else [float(sensor_pos[0].item()), float(sensor_pos[1].item()), float(sensor_pos[2].item())],
+        "raw_lidar_occupied_cells": int((raw_lidar_grid[0] > 0).detach().cpu().sum().item()),
+        "instant_lidar_occupied_cells": int((instant_lidar_grid[0] > 0).detach().cpu().sum().item()),
+        "planning_lidar_occupied_cells": int((lidar_grid[0] > 0).detach().cpu().sum().item()),
+        "planning_grid_occupied_cells": int((planning_grid[0] > 0).detach().cpu().sum().item()),
+        "valid_hits": int(valid.sum().item()) if valid.numel() else 0,
+    }
+    if valid.numel() and bool(valid.any()):
+        pts_valid = pts_b[valid]
+        out["hit_bbox_xy_b"] = [
+            float(pts_valid[:, 0].min().item()),
+            float(pts_valid[:, 1].min().item()),
+            float(pts_valid[:, 0].max().item()),
+            float(pts_valid[:, 1].max().item()),
+        ]
+        hits_valid = hits_w[valid]
+        if hits_valid.numel():
+            out["hit_bbox_w"] = [
+                float(hits_valid[:, 0].min().item()),
+                float(hits_valid[:, 1].min().item()),
+                float(hits_valid[:, 2].min().item()),
+                float(hits_valid[:, 0].max().item()),
+                float(hits_valid[:, 1].max().item()),
+                float(hits_valid[:, 2].max().item()),
+            ]
+    else:
+        out["hit_bbox_xy_b"] = None
+        out["hit_bbox_w"] = None
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Geometry and direct waypoint control copied from smoke_test_nav.py semantics
 # -----------------------------------------------------------------------------
@@ -2254,13 +2318,23 @@ class G1NavLidarSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    lidar_mount = RigidObjectCfg(
+    # Important: this mount is intentionally *not* a RigidObject.
+    #
+    # The proxy is manually moved by the smoke-test command wrapper rather than
+    # by an Isaac articulation.  RayCaster did not behave reliably when attached
+    # under that moving proxy tree.  The stable pattern for these tests is to
+    # attach RayCaster to an explicit world/env prim and update that prim's USD
+    # transform from the current proxy pose before stepping the simulator.
+    #
+    # Do not make this a RigidObjectCfg unless all call sites also update the
+    # Isaac Lab rigid-object tensor state safely; previous attempts to do that
+    # produced CUDA illegal-memory-access failures in headless runs.  A static
+    # AssetBaseCfg mount keeps Isaac Lab from overwriting the manual USD pose.
+    lidar_mount = AssetBaseCfg(
         prim_path=CFG["lidar"]["prim_path"],
-        init_state=RigidObjectCfg.InitialStateCfg(pos=tuple(CFG["proxy"]["init_state"]["pos"])),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=tuple(CFG["proxy"]["init_state"]["pos"])),
         spawn=sim_utils.CuboidCfg(
             size=tuple(CFG["lidar"].get("mount_size", [0.05, 0.05, 0.05])),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(rigid_body_enabled=True, kinematic_enabled=True, disable_gravity=True),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(CFG["lidar"].get("mount_color", [1.0, 0.5, 0.0]))),
         ),
     )
@@ -2474,6 +2548,37 @@ def save_perception_debug_image(
         print(f"[INFO]: saved perception debug image: {overlay_path}", flush=True)
     except Exception as exc:
         print(f"[WARN]: failed to save perception debug image {overlay_path}: {exc}", flush=True)
+
+
+
+
+def save_stepwise_live_rgb_frame(scene: InteractiveScene, *, step_idx: int) -> None:
+    """Save the current Isaac camera RGB frame for stepwise/LiDAR debugging.
+
+    The static-stream tests can navigate without using the camera after the
+    initial target.  When --save_perception_images is enabled, this helper gives
+    us a synchronized RGB sanity view for the same steps as occupancy_map_*.png.
+    It is intentionally best-effort: a missing/stale camera frame should not
+    affect navigation tests.
+    """
+    if not bool(args_cli.save_perception_images):
+        return
+    try:
+        camera = scene["camera"]
+        rgb = camera.data.output.get("rgb")
+        if rgb is None:
+            print(f"[WARN]: stepwise RGB frame step={step_idx}: camera rgb output is None", flush=True)
+            return
+        rgb_np = yolo_tensor_rgb_to_numpy(rgb)
+        save_perception_debug_image(
+            rgb_np,
+            tag=f"stepwise_{int(step_idx):06d}",
+            detections=None,
+            selected=None,
+            source="stepwise_live",
+        )
+    except Exception as exc:
+        print(f"[WARN]: failed to save stepwise RGB frame at step={step_idx}: {exc}", flush=True)
 
 
 def yolo_tensor_depth_to_numpy(depth: torch.Tensor) -> np.ndarray:
@@ -3371,6 +3476,27 @@ def _lidar_frame_from_lidar_obs(lidar_obs: dict[str, torch.Tensor], *, timestamp
     )
 
 
+def _xy_list_from_any(value: Any) -> list[float]:
+    """Return ``[x, y]`` from a tuple/list or a 1x2 / 2-element tensor.
+
+    Isaac navigation code uses both Python ``(x, y)`` tuples and batched
+    tensors shaped ``(1, 2)`` for world-frame targets. Metadata writers must
+    flatten those values before calling ``float(...)``; otherwise ``float(t[0])``
+    fails for a batched tensor because ``t[0]`` still contains two elements.
+    """
+
+    if isinstance(value, torch.Tensor):
+        flat = value.detach().cpu().reshape(-1)
+        if int(flat.numel()) < 2:
+            raise ValueError(f"expected at least two xy values, got tensor shape {tuple(value.shape)}")
+        return [float(flat[0].item()), float(flat[1].item())]
+    if isinstance(value, (list, tuple)):
+        if len(value) < 2:
+            raise ValueError(f"expected at least two xy values, got {value!r}")
+        return [float(value[0]), float(value[1])]
+    raise TypeError(f"unsupported xy value type: {type(value).__name__}")
+
+
 def _target_body_from_world(*, proxy: G1CommandProxy, target_xy_w: torch.Tensor) -> tuple[float, float]:
     """Return current target vector in the proxy body frame."""
     delta_w = target_xy_w[0:1] - proxy.pos_w[0:1, 0:2]
@@ -3418,7 +3544,9 @@ def _make_stepwise_runtime(*, grid_cfg: OccupancyGridCfg, astar_cfg: GridAStarCf
         turn_speed_radps=float(args_cli.stepwise_turn_speed_radps),
         turn_angle_max_rad=math.radians(float(args_cli.stepwise_turn_angle_max_deg)),
         action_duration_max_s=float(args_cli.stepwise_action_duration_max_s),
+        sweep_start_ignore_m=float(args_cli.stepwise_sweep_start_ignore_m),
         replan_every_actions=int(args_cli.stepwise_replan_every_actions),
+        replan_every_forward_m=float(args_cli.stepwise_replan_every_forward_m),
         blind_plan_actions=int(args_cli.stepwise_blind_plan_actions),
         emergency_front_stop_m=float(args_cli.stepwise_emergency_front_stop_m),
         success_radius_m=float(success_radius),
@@ -3467,7 +3595,11 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
 
     lidar_mount_paths = resolve_env_prim_paths(CFG["lidar"]["prim_path"], num_envs)
     mount_sync_cfg = LidarMountSyncCfg()
-    print("[CKPT]: syncing LiDAR mounts before optional scene.reset", flush=True)
+    print("[CKPT]: syncing explicit world LiDAR mount before optional scene.reset", flush=True)
+    # RayCaster is attached to an explicit world/env mount prim rather than to
+    # the manually moved G1Proxy tree.  Keep that mount synchronized via USD
+    # transform writes only; do not write RigidObject tensor state for this
+    # mount, because that path has caused CUDA illegal-memory-access failures.
     sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
 
     if bool(args_cli.skip_second_scene_reset):
@@ -3477,7 +3609,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
         scene.reset()
         print("[CKPT]: second scene.reset() returned", flush=True)
     sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
-    print("[CKPT]: LiDAR mounts synced after scene reset", flush=True)
+    print("[CKPT]: explicit world LiDAR mount synced after scene reset", flush=True)
 
     target_local_xy = torch.tensor(CFG["target"]["pos"][0:2], dtype=torch.float32, device=device)
     target_xy_w = scene.env_origins[:, 0:2].to(device=device) + target_local_xy
@@ -3632,11 +3764,19 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
                     target_body_xy = _target_body_from_world(proxy=proxy, target_xy_w=target_xy_w)
                     target_meta = dict(target_meta)
                     target_meta["reason"] = "ok_static_stream_world_target_projection"
-                    target_meta["static_stream_raw_target_body_xy"] = [
+                    target_meta["raw_stream_target_body_xy"] = [
                         float(raw_stream_target_body_xy[0]),
                         float(raw_stream_target_body_xy[1]),
                     ]
+                    # Compatibility alias for traces written by earlier runs.
+                    target_meta["static_stream_raw_target_body_xy"] = list(target_meta["raw_stream_target_body_xy"])
+                    target_meta["current_projected_target_body_xy"] = [float(target_body_xy[0]), float(target_body_xy[1])]
+                    target_world_xy_list = _xy_list_from_any(target_xy_w)
+                    target_meta["target_world_xy"] = target_world_xy_list
                     target_meta.setdefault("target", {})["target_body_xy"] = [float(target_body_xy[0]), float(target_body_xy[1])]
+                    target_meta["target"]["current_projected_target_body_xy"] = [float(target_body_xy[0]), float(target_body_xy[1])]
+                    target_meta["target"]["raw_stream_target_body_xy"] = list(target_meta["raw_stream_target_body_xy"])
+                    target_meta["target"]["target_world_xy"] = list(target_world_xy_list)
             else:
                 target_body_xy = _target_body_from_world(proxy=proxy, target_xy_w=target_xy_w)
                 target_meta = {
@@ -3720,6 +3860,24 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
 
             live_occupied = int((live_grid[0] > 0).detach().cpu().sum().item())
             live_valid_hits = int(live_lidar_obs["lidar_valid"][0].detach().cpu().sum().item()) if live_lidar_obs["lidar_valid"].numel() else 0
+            lidar_debug = lidar_debug_summary(
+                live_lidar_obs,
+                raw_lidar_grid=live_raw_lidar_grid,
+                instant_lidar_grid=live_instant_lidar_grid,
+                lidar_grid=live_lidar_grid,
+                planning_grid=live_grid,
+                map_updated=should_update_memory,
+            )
+            try:
+                proxy_pos_dbg = proxy.pos_w[0].detach().cpu()
+                sensor_pos_dbg = live_lidar_obs["lidar_sensor_pos_w"][0].detach().cpu()
+                lidar_debug["proxy_pos_w"] = [float(proxy_pos_dbg[0].item()), float(proxy_pos_dbg[1].item()), float(proxy_pos_dbg[2].item())]
+                lidar_debug["proxy_yaw_rad"] = float(proxy.yaw[0].detach().cpu().item())
+                if sensor_pos_dbg.numel() >= 3:
+                    lidar_debug["sensor_proxy_xy_error_m"] = float(torch.linalg.norm(sensor_pos_dbg[0:2] - proxy_pos_dbg[0:2]).item())
+                    lidar_debug["sensor_proxy_z_error_m"] = float((sensor_pos_dbg[2] - proxy_pos_dbg[2]).item())
+            except Exception as exc:
+                lidar_debug["sensor_proxy_debug_error"] = repr(exc)
             record = StepRecord(
                 step=step_idx,
                 x=x,
@@ -3760,6 +3918,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
                     "step": int(step_idx),
                     "pose": {"x": x, "y": y, "yaw": yaw},
                     "target_body_xy": None if target_body_xy is None else [target_body_xy[0], target_body_xy[1]],
+                    "current_projected_target_body_xy": None if target_body_xy is None else [target_body_xy[0], target_body_xy[1]],
                     "target_world_xy": [target_xy_w_env0[0], target_xy_w_env0[1]],
                     "target_meta": target_meta,
                     "command": {"vx": vx, "vy": vy, "wz": wz, "duration_s": command.duration_s},
@@ -3768,6 +3927,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
                     "waypoint_count": waypoint_count,
                     "lidar_valid_hits": live_valid_hits,
                     "occupied_cells": live_occupied,
+                    "lidar_debug": lidar_debug,
                 }
             )
 
@@ -3811,6 +3971,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
                     step_idx=step_idx,
                     occupancy_threshold=float(astar_cfg.occupancy_threshold),
                 )
+                save_stepwise_live_rgb_frame(scene, step_idx=step_idx)
 
             if decision is not None and decision.target_reached:
                 target_reached = True

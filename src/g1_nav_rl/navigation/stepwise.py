@@ -144,12 +144,15 @@ class StepwiseNavConfig:
     min_forward_m: float = 0.02
     action_duration_max_s: float = 0.0  # retained for compatibility; not used as a clip
 
-    # Replan triggers.
+    # Replan triggers.  Action-count replanning is disabled by default because
+    # A* grid-cell actions can be very short.  Prefer distance-based sync
+    # replanning or explicit invalidation triggers.
     replan_every_actions: int = 0
     replan_every_forward_m: float = 0.0
     target_change_replan_m: float = 0.50
     path_block_check: bool = True
-    path_block_lookahead_m: float = 1.50
+    path_block_lookahead_m: float = 1.50  # retained for old configs; immediate guard does not use it
+    sweep_start_ignore_m: float = 0.05  # ignore origin-cell inflation when checking the next commanded sweep
 
     # Kept for compatibility. Missing target stops; blind execution is not used
     # in this synchronized controller.
@@ -175,6 +178,7 @@ class StepwiseNavConfig:
             "replan_every_forward_m",
             "target_change_replan_m",
             "path_block_lookahead_m",
+            "sweep_start_ignore_m",
             "emergency_front_stop_m",
             "success_radius_m",
         )
@@ -214,7 +218,11 @@ class StepwisePlanResult:
         return {
             "found": bool(self.found),
             "reason": str(self.astar_result.reason),
-            "target_xy_b": [float(v) for v in self.target_xy_b],
+            # Target in the body frame at the synchronized replan that created
+            # this active plan.  It is not necessarily the current observed
+            # target on later execution steps.
+            "target_xy_b_at_replan": [float(v) for v in self.target_xy_b],
+            "target_xy_b": [float(v) for v in self.target_xy_b],  # compatibility alias
             "path_len": int(len(self.astar_result.path_xy_b)),
             "path_length_m": float(path_length_xy(self.astar_result.path_xy_b)),
             "action_count": int(len(self.actions)),
@@ -276,14 +284,6 @@ def _duration_for_turn(angle_rad: float, cfg: StepwiseNavConfig) -> float:
 
 def _duration_for_translation(distance_m: float, cfg: StepwiseNavConfig) -> float:
     return abs(float(distance_m)) / float(cfg.forward_speed_mps)
-
-
-def _body_to_plan_xy(local_xy: PointXY, expected_pose: PoseXYYaw) -> PointXY:
-    x_b, y_b = float(local_xy[0]), float(local_xy[1])
-    x, y, yaw = expected_pose
-    c = math.cos(yaw)
-    s = math.sin(yaw)
-    return x + c * x_b - s * y_b, y + s * x_b + c * y_b
 
 
 def _plan_to_body_xy(point_xy: PointXY, expected_pose: PoseXYYaw) -> PointXY:
@@ -494,25 +494,123 @@ def _inflated_grid(occupancy_grid: torch.Tensor, cfg: StepwiseNavConfig) -> torc
     ).to(dtype=torch.bool, device="cpu")
 
 
-def _path_prefix_with_lookahead(path_xy_b: Sequence[PointXY], *, lookahead_m: float) -> list[PointXY]:
-    if not path_xy_b:
-        return []
-    if lookahead_m <= 0.0:
-        return list(path_xy_b)
-    out = [path_xy_b[0]]
-    covered = 0.0
-    prev = path_xy_b[0]
-    for p in path_xy_b[1:]:
-        seg = math.hypot(float(p[0]) - float(prev[0]), float(p[1]) - float(prev[1]))
-        if covered + seg > lookahead_m:
-            if seg > 1.0e-9:
-                t = (lookahead_m - covered) / seg
-                out.append((float(prev[0]) + t * (float(p[0]) - float(prev[0])), float(prev[1]) + t * (float(p[1]) - float(prev[1]))))
-            break
-        out.append(p)
-        covered += seg
-        prev = p
-    return out
+def translation_action_blocked_by_grid(
+    action: StepwiseAction,
+    occupancy_grid: torch.Tensor,
+    *,
+    cfg: StepwiseNavConfig | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Check the next translation command against the current inflated grid.
+
+    This guard is deliberately current-frame only.  It checks the immediate
+    commanded translation primitive, not the whole old A* path.  Cells at the
+    robot origin are ignored because obstacle inflation can mark the current
+    start cell occupied when the robot is exactly on the discretized inflation
+    boundary; that condition is diagnostic, but it should not be interpreted as
+    the *next* command entering an obstacle.
+    """
+
+    cfg = cfg or StepwiseNavConfig()
+    if not cfg.path_block_check:
+        return False, {"checked": False, "reason": "disabled"}
+    if action.kind != StepwiseActionKind.FORWARD:
+        return False, {"checked": False, "reason": "non_translation_action", "action_kind": action.kind.value}
+
+    dx = float(action.command.vx) * float(action.duration_s)
+    dy = float(action.command.vy) * float(action.duration_s)
+    distance = math.hypot(dx, dy)
+    if distance < float(cfg.min_forward_m):
+        return False, {"checked": False, "reason": "short_translation", "distance_m": float(distance)}
+
+    grid = occupancy_grid
+    if grid.ndim == 3:
+        if grid.shape[0] != 1:
+            raise ValueError("translation sweep check expects a single grid or batch size 1")
+        grid = grid[0]
+    if grid.ndim != 2:
+        raise ValueError(f"occupancy_grid must have shape [H,W] or [1,H,W], got {tuple(occupancy_grid.shape)}")
+    raw_occupied = (grid.detach().cpu() > float(cfg.astar_cfg.occupancy_threshold)).to(dtype=torch.bool)
+    inflated = _inflated_grid(grid, cfg)
+    height, width = int(inflated.shape[0]), int(inflated.shape[1])
+    start_cell = xy_to_grid_cell((0.0, 0.0), cfg.grid_cfg)
+    end_cell = xy_to_grid_cell((dx, dy), cfg.grid_cfg)
+    effective_start_ignore_m = max(float(cfg.sweep_start_ignore_m), 2.0 * float(cfg.grid_cfg.resolution))
+    base_meta: dict[str, Any] = {
+        "grid_resolution_m": float(cfg.grid_cfg.resolution),
+        "inflation_radius_m": float(cfg.astar_cfg.inflation_radius),
+        "occupancy_threshold": float(cfg.astar_cfg.occupancy_threshold),
+        "start_ignore_m": float(effective_start_ignore_m),
+        "start_cell": list(start_cell),
+        "end_cell": list(end_cell),
+        "end_xy_b": [float(dx), float(dy)],
+        "distance_m": float(distance),
+    }
+    if not is_cell_in_bounds(start_cell, height=height, width=width):
+        return True, {**base_meta, "checked": True, "reason": "sweep_start_out_of_bounds"}
+    if not is_cell_in_bounds(end_cell, height=height, width=width):
+        return True, {**base_meta, "checked": True, "reason": "sweep_end_out_of_bounds"}
+
+    if distance <= effective_start_ignore_m:
+        return False, {
+            **base_meta,
+            "checked": True,
+            "reason": "translation_within_start_ignore_radius",
+            "checked_cells": 0,
+            "ignored_start_cells": 0,
+            "start_raw_occupied": bool(raw_occupied[start_cell[0], start_cell[1]].item()) if is_cell_in_bounds(start_cell, height=height, width=width) else None,
+            "start_inflated_occupied": bool(inflated[start_cell[0], start_cell[1]].item()) if is_cell_in_bounds(start_cell, height=height, width=width) else None,
+        }
+
+    ux = dx / distance
+    uy = dy / distance
+    checked_cells = 0
+    ignored_start_cells = 0
+    for cell in bresenham_cells(start_cell, end_cell):
+        if not is_cell_in_bounds(cell, height=height, width=width):
+            return True, {
+                **base_meta,
+                "checked": True,
+                "reason": "sweep_cell_out_of_bounds",
+                "cell": list(cell),
+                "checked_cells": int(checked_cells),
+                "ignored_start_cells": int(ignored_start_cells),
+            }
+        cell_xy = grid_cell_to_xy(cell, cfg.grid_cfg)
+        cell_distance = math.hypot(float(cell_xy[0]), float(cell_xy[1]))
+        cell_along = float(cell_xy[0]) * ux + float(cell_xy[1]) * uy
+        # Ignore the current origin area, not just the literal start cell.  A
+        # discretized inflated obstacle can occupy cells a few centimeters from
+        # the origin when the robot is already near the inflation boundary.
+        # That is useful diagnostics, but it should not be reported as the next
+        # commanded translation entering an obstacle.
+        if cell_along <= effective_start_ignore_m or cell_distance <= effective_start_ignore_m:
+            ignored_start_cells += 1
+            continue
+        checked_cells += 1
+        if bool(inflated[cell[0], cell[1]].item()):
+            return True, {
+                **base_meta,
+                "checked": True,
+                "reason": "immediate_sweep_inflated_occupancy_intersection",
+                "cell": list(cell),
+                "cell_xy_b": [float(cell_xy[0]), float(cell_xy[1])],
+                "distance_from_origin_m": float(cell_distance),
+                "distance_along_command_m": float(cell_along),
+                "raw_occupied_at_blocked_cell": bool(raw_occupied[cell[0], cell[1]].item()),
+                "inflated_occupied_at_blocked_cell": True,
+                "checked_cells": int(checked_cells),
+                "ignored_start_cells": int(ignored_start_cells),
+            }
+
+    return False, {
+        **base_meta,
+        "checked": True,
+        "reason": "clear",
+        "checked_cells": int(checked_cells),
+        "ignored_start_cells": int(ignored_start_cells),
+        "start_raw_occupied": bool(raw_occupied[start_cell[0], start_cell[1]].item()) if is_cell_in_bounds(start_cell, height=height, width=width) else None,
+        "start_inflated_occupied": bool(inflated[start_cell[0], start_cell[1]].item()) if is_cell_in_bounds(start_cell, height=height, width=width) else None,
+    }
 
 
 def remaining_path_blocked(
@@ -523,59 +621,20 @@ def remaining_path_blocked(
     expected_pose: PoseXYYaw = (0.0, 0.0, 0.0),
     current_action_index: int = 0,
 ) -> tuple[bool, dict[str, Any]]:
-    """Check whether the current inflated grid blocks the remaining planned path.
+    """Compatibility wrapper for old callers.
 
-    The cached A* path is stored in the body frame used at the last sync.  The
-    controller maintains a minimal expected pose inside that plan frame from the
-    commands it has issued.  This lets us express the remaining path in the
-    current body frame before checking it against the latest LiDAR occupancy.
+    The previous implementation checked the full transformed remaining path
+    against the current inflated grid.  That was frame-sensitive and caused
+    false ``path_blocked`` events.  The cleaned-up controller only checks the
+    next queued translation primitive.
     """
 
     cfg = cfg or StepwiseNavConfig()
-    if not cfg.path_block_check or plan is None or not plan.found:
-        return False, {"checked": False, "reason": "disabled_or_no_plan"}
-
-    path = plan.path_xy_b
-    if len(path) < 2:
-        return False, {"checked": False, "reason": "short_path"}
-
-    # Find the path index associated with the next queued action.  If metadata is
-    # missing, fall back to the beginning; this is conservative.
-    path_index = 1
-    if 0 <= int(current_action_index) < len(plan.actions):
-        try:
-            path_index = int(plan.actions[int(current_action_index)].metadata.get("path_index", 1))
-        except Exception:
-            path_index = 1
-    path_index = max(1, min(path_index, len(path) - 1))
-
-    remaining_plan_frame: list[PointXY] = [(float(expected_pose[0]), float(expected_pose[1]))]
-    remaining_plan_frame.extend(path[path_index:])
-    remaining_body = [_plan_to_body_xy(p, expected_pose) for p in remaining_plan_frame]
-    remaining_body = _path_prefix_with_lookahead(remaining_body, lookahead_m=float(cfg.path_block_lookahead_m))
-    if len(remaining_body) < 2:
-        return False, {"checked": False, "reason": "empty_remaining_path"}
-
-    inflated = _inflated_grid(occupancy_grid, cfg)
-    height, width = int(inflated.shape[0]), int(inflated.shape[1])
-    for seg_idx, (a, b) in enumerate(zip(remaining_body[:-1], remaining_body[1:])):
-        ca = xy_to_grid_cell(a, cfg.grid_cfg)
-        cb = xy_to_grid_cell(b, cfg.grid_cfg)
-        if not is_cell_in_bounds(ca, height=height, width=width) or not is_cell_in_bounds(cb, height=height, width=width):
-            return True, {"checked": True, "reason": "remaining_path_out_of_bounds", "segment_index": int(seg_idx)}
-        for cell in bresenham_cells(ca, cb):
-            if not is_cell_in_bounds(cell, height=height, width=width):
-                return True, {"checked": True, "reason": "remaining_path_out_of_bounds", "segment_index": int(seg_idx), "cell": list(cell)}
-            if bool(inflated[cell[0], cell[1]].item()):
-                return True, {
-                    "checked": True,
-                    "reason": "inflated_occupancy_intersection",
-                    "segment_index": int(seg_idx),
-                    "cell": list(cell),
-                    "cell_xy_b": list(grid_cell_to_xy(cell, cfg.grid_cfg)),
-                    "path_index": int(path_index),
-                }
-    return False, {"checked": True, "reason": "clear", "path_index": int(path_index), "checked_points": len(remaining_body)}
+    if plan is None or not plan.found:
+        return False, {"checked": False, "reason": "no_plan"}
+    if not (0 <= int(current_action_index) < len(plan.actions)):
+        return False, {"checked": False, "reason": "no_next_action"}
+    return translation_action_blocked_by_grid(plan.actions[int(current_action_index)], occupancy_grid, cfg=cfg)
 
 
 class StepwiseNavigator:
@@ -585,8 +644,8 @@ class StepwiseNavigator:
     - no target -> stop;
     - no plan / pending sync -> plan from latest target + grid;
     - active plan -> execute next queued command;
-    - path blocked / target mismatch / periodic trigger -> stop now, then
-      replan from fresh data on the next call.
+    - next translation blocked / target mismatch / periodic trigger -> stop
+      now, then replan from fresh data on the next call.
     """
 
     def __init__(self, cfg: StepwiseNavConfig | None = None) -> None:
@@ -817,13 +876,11 @@ class StepwiseNavigator:
         if float(self.cfg.replan_every_forward_m) > 0.0 and self.executed_forward_m_since_replan >= float(self.cfg.replan_every_forward_m):
             return self._request_sync_stop("periodic_replan_distance", front_min_distance_m=front_min_distance_m, metadata=meta)
 
-        blocked, block_info = remaining_path_blocked(
-            occupancy_grid,
-            self.last_plan,
-            cfg=self.cfg,
-            expected_pose=self.expected_pose_in_plan,
-            current_action_index=self.current_action_index,
-        )
+        if 0 <= self.current_action_index < len(self.action_queue):
+            next_action = self.action_queue[self.current_action_index]
+            blocked, block_info = translation_action_blocked_by_grid(next_action, occupancy_grid, cfg=self.cfg)
+        else:
+            blocked, block_info = False, {"checked": False, "reason": "no_next_action"}
         meta["path_block_check"] = block_info
         if blocked:
             return self._request_sync_stop("path_blocked", front_min_distance_m=front_min_distance_m, metadata=meta)
@@ -848,6 +905,7 @@ __all__ = [
     "front_clearance_from_points",
     "forward_action_blocked",
     "remaining_path_blocked",
+    "translation_action_blocked_by_grid",
     "path_to_stepwise_actions",
     "plan_stepwise_actions",
     "target_reached",

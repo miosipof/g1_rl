@@ -128,6 +128,10 @@ class StepwiseTargetNavPolicyRuntime:
             metadata={
                 "observation_timestamp_s": float(observation.timestamp_s),
                 "observation_has_lidar": bool(observation.has_lidar),
+                "observation_has_target_hint": bool(observation.target_hint is not None),
+                "observation_has_rgbd_frame": bool(observation.has_rgbd),
+                # Kept for compatibility with older trace consumers.  Prefer
+                # observation_has_rgbd_frame in new logs.
                 "observation_has_rgbd": bool(observation.has_rgbd),
                 "lidar_point_count": int(lidar_point_count),
                 "sensor_ages_s": observation.sensor_ages_s(),

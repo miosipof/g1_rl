@@ -5,6 +5,8 @@ import torch
 
 from g1_nav_rl.mapping.occupancy_grid import OccupancyGridCfg
 from g1_nav_rl.navigation.stepwise import (
+    MotionCommand,
+    StepwiseAction,
     StepwiseActionKind,
     StepwiseNavConfig,
     StepwiseNavigator,
@@ -13,6 +15,7 @@ from g1_nav_rl.navigation.stepwise import (
     path_to_stepwise_actions,
     plan_stepwise_actions,
     remaining_path_blocked,
+    translation_action_blocked_by_grid,
 )
 from g1_nav_rl.planning.grid_astar import GridAStarCfg, plan_grid_path_xy, xy_to_grid_cell
 
@@ -187,19 +190,109 @@ def test_grid_astar_can_disable_start_relocation_for_strict_callers():
     assert result.reason == "start_occupied"
 
 
-def test_remaining_path_blocked_uses_inflated_current_grid():
-    cfg = _cfg(astar_cfg=GridAStarCfg(inflation_radius=0.0), path_block_lookahead_m=2.0)
+def test_immediate_translation_block_check_uses_current_inflated_grid_only():
+    cfg = _cfg(astar_cfg=GridAStarCfg(inflation_radius=0.0), path_block_check=True)
+    grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
+    forward = StepwiseAction(
+        kind=StepwiseActionKind.FORWARD,
+        command=MotionCommand(0.35, 0.0, 0.0),
+        duration_s=1.0,
+        distance_m=0.35,
+    )
+
+    blocked_grid = torch.zeros_like(grid)
+    end_xy = (float(forward.command.vx) * float(forward.duration_s), float(forward.command.vy) * float(forward.duration_s))
+    cell = xy_to_grid_cell(end_xy, cfg.grid_cfg)
+    blocked_grid[cell[0], cell[1]] = 1.0
+
+    blocked, info = translation_action_blocked_by_grid(forward, blocked_grid, cfg=cfg)
+    assert blocked
+    assert info["reason"] == "immediate_sweep_inflated_occupancy_intersection"
+
+
+def test_immediate_translation_block_check_ignores_start_radius():
+    cfg = _cfg(astar_cfg=GridAStarCfg(inflation_radius=0.0), path_block_check=True)
+    grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
+    forward = StepwiseAction(
+        kind=StepwiseActionKind.FORWARD,
+        command=MotionCommand(0.35, 0.0, 0.0),
+        duration_s=1.0,
+        distance_m=0.35,
+    )
+
+    blocked_grid = torch.zeros_like(grid)
+    start_cell = xy_to_grid_cell((0.0, 0.0), cfg.grid_cfg)
+    blocked_grid[start_cell[0], start_cell[1]] = 1.0
+
+    blocked, info = translation_action_blocked_by_grid(forward, blocked_grid, cfg=cfg)
+    assert not blocked
+    assert info["reason"] in {"clear", "translation_within_start_ignore_radius"}
+    assert info["ignored_start_cells"] >= 1 or info["reason"] == "translation_within_start_ignore_radius"
+    assert info["start_inflated_occupied"]
+
+
+
+def test_immediate_translation_block_check_ignores_near_origin_cells_inside_radius():
+    cfg = _cfg(
+        astar_cfg=GridAStarCfg(inflation_radius=0.0),
+        path_block_check=True,
+        sweep_start_ignore_m=0.10,
+    )
+    grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
+    forward = StepwiseAction(
+        kind=StepwiseActionKind.FORWARD,
+        command=MotionCommand(0.35, 0.0, 0.0),
+        duration_s=1.0,
+        distance_m=0.35,
+    )
+
+    blocked_grid = torch.zeros_like(grid)
+    near_cell = xy_to_grid_cell((0.05, 0.0), cfg.grid_cfg)
+    blocked_grid[near_cell[0], near_cell[1]] = 1.0
+
+    blocked, info = translation_action_blocked_by_grid(forward, blocked_grid, cfg=cfg)
+    assert not blocked
+    assert info["reason"] in {"clear", "translation_within_start_ignore_radius"}
+
+
+def test_immediate_translation_block_check_blocks_after_start_ignore_radius():
+    cfg = _cfg(
+        astar_cfg=GridAStarCfg(inflation_radius=0.0),
+        path_block_check=True,
+        sweep_start_ignore_m=0.10,
+    )
+    grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
+    forward = StepwiseAction(
+        kind=StepwiseActionKind.FORWARD,
+        command=MotionCommand(0.35, 0.0, 0.0),
+        duration_s=1.0,
+        distance_m=0.35,
+    )
+
+    blocked_grid = torch.zeros_like(grid)
+    far_cell = xy_to_grid_cell((0.25, 0.0), cfg.grid_cfg)
+    blocked_grid[far_cell[0], far_cell[1]] = 1.0
+
+    blocked, info = translation_action_blocked_by_grid(forward, blocked_grid, cfg=cfg)
+    assert blocked
+    assert info["reason"] == "immediate_sweep_inflated_occupancy_intersection"
+    assert info["distance_along_command_m"] > info["start_ignore_m"]
+
+def test_remaining_path_blocked_is_compatibility_wrapper_for_next_action_only():
+    cfg = _cfg(astar_cfg=GridAStarCfg(inflation_radius=0.0), path_block_check=True)
     grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
     plan = plan_stepwise_actions(grid, (1.0, 0.0), cfg=cfg)
     assert plan.found
 
+    # A far obstacle on the old remaining path must not block the immediate
+    # primitive.  This prevents the previous false-positive full-path check.
     blocked_grid = torch.zeros_like(grid)
-    cell = xy_to_grid_cell((0.5, 0.0), cfg.grid_cfg)
-    blocked_grid[cell[0], cell[1]] = 1.0
+    far_cell = xy_to_grid_cell((0.5, 0.0), cfg.grid_cfg)
+    blocked_grid[far_cell[0], far_cell[1]] = 1.0
 
     blocked, info = remaining_path_blocked(blocked_grid, plan, cfg=cfg, current_action_index=0)
-    assert blocked
-    assert info["reason"] == "inflated_occupancy_intersection"
+    assert not blocked
+    assert info["reason"] in {"clear", "translation_within_start_ignore_radius"}
 
 
 def test_periodic_replan_stops_before_syncing_new_plan():
