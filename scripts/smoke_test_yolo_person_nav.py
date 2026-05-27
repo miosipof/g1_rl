@@ -495,6 +495,7 @@ parser.add_argument("--stepwise_front_x_max_m", type=float, default=1.0)
 parser.add_argument("--stepwise_front_y_abs_max_m", type=float, default=0.35)
 parser.add_argument("--stepwise_trace_jsonl", type=str, default="", help="Optional JSONL path for stepwise decisions. Default: <output_dir>/stepwise_trace.jsonl.")
 parser.add_argument("--stepwise_static_stream_world_target", action="store_true", help="Treat stream target_body_xy as an initial body/world target and recompute current body-frame target each cycle. Useful only for deterministic static Isaac stream smoke tests.")
+parser.add_argument("--stepwise_refresh_person_target", action="store_true", help="In stepwise non-stream person mode, refresh target through the existing RGB/YOLO/fallback perception path and TargetTracker instead of using only the frozen initial target.")
 
 parser.add_argument("--detection_stream_path", type=str, default="", help="Path to latest_tracks.json when --target_source=stream.")
 parser.add_argument("--detection_stream_max_age_s", type=float, default=1.0, help="Maximum age for stream target frames. Use a large value for static Isaac smoke files.")
@@ -3770,6 +3771,32 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
             )
 
         stepwise_runtime = _make_stepwise_runtime(grid_cfg=grid_cfg, astar_cfg=astar_cfg, success_radius=success_radius)
+        stepwise_person_tracker: TargetTracker | None = None
+        stepwise_person_tracker_last_meta: dict[str, Any] = dict(perception_meta or {})
+        if str(args_cli.target_source) != "stream" and bool(args_cli.stepwise_refresh_person_target):
+            stepwise_person_tracker = TargetTracker(
+                TargetTrackerConfig(
+                    refresh_period_steps=max(1, int(args_cli.redetect_every)) if int(args_cli.redetect_every) > 0 else 1,
+                    occlusion_grace_steps=max(0, int(args_cli.target_occlusion_grace_steps)),
+                    smoothing_alpha=float(args_cli.target_smoothing_alpha),
+                    max_jump_m=float(args_cli.target_max_jump_m),
+                )
+            )
+            initial_measurement = TargetMeasurement.from_xy(
+                (float(frozen_target_xy_w[0]), float(frozen_target_xy_w[1])),
+                step=0,
+                confidence=float((perception_meta or {}).get("selected_detection", {}).get("confidence", 1.0)),
+                source=str((perception_meta or {}).get("detection_source", str(args_cli.target_source))),
+                metadata=dict(perception_meta or {}),
+            )
+            stepwise_person_tracker.update(step=0, measurement=initial_measurement)
+            print(
+                f"[INFO]: stepwise person target tracking enabled: refresh_every={int(args_cli.redetect_every)}, "
+                f"occlusion_grace={int(args_cli.target_occlusion_grace_steps)}, "
+                f"smoothing_alpha={float(args_cli.target_smoothing_alpha):.3f}, "
+                f"max_jump={float(args_cli.target_max_jump_m):.3f}",
+                flush=True,
+            )
         stepwise_rows: list[dict[str, Any]] = []
         last_stepwise_path_xy_w: list[PointXY] = []
         target_xy_w_env0: PointXY = (
@@ -3881,13 +3908,64 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
                     target_meta["target"]["raw_stream_target_body_xy"] = list(target_meta["raw_stream_target_body_xy"])
                     target_meta["target"]["target_world_xy"] = list(target_world_xy_list)
             else:
-                target_body_xy = _target_body_from_world(proxy=proxy, target_xy_w=target_xy_w)
-                target_meta = {
-                    "detection_source": str(args_cli.target_source),
-                    "target_valid": True,
-                    "reason": "frozen_target_body_projection",
-                    "target": {"target_body_xy": [target_body_xy[0], target_body_xy[1]]},
-                }
+                if stepwise_person_tracker is not None:
+                    tracker_update = stepwise_person_tracker.last_update
+                    refresh_meta: dict[str, Any] | None = None
+                    measured_xy: PointXY | None = None
+                    if step_idx > 0 and stepwise_person_tracker.should_refresh(step_idx):
+                        measured_xy, refresh_meta = extract_periodic_redetection_target(scene, proxy, step_idx=step_idx)
+                        if measured_xy is None:
+                            tracker_update = stepwise_person_tracker.update(step=step_idx, measurement=None)
+                        else:
+                            measurement = TargetMeasurement.from_xy(
+                                measured_xy,
+                                step=step_idx,
+                                confidence=float((refresh_meta or {}).get("selected_detection", {}).get("confidence", 1.0)),
+                                source=str((refresh_meta or {}).get("detection_source", str(args_cli.target_source))),
+                                metadata=dict(refresh_meta or {}),
+                            )
+                            tracker_update = stepwise_person_tracker.update(step=step_idx, measurement=measurement)
+                            if tracker_update.accepted_measurement:
+                                stepwise_person_tracker_last_meta = dict(refresh_meta or {})
+                    active_target = tracker_update.active_target
+                    target_meta = {
+                        "detection_source": str(args_cli.target_source),
+                        "target_valid": active_target is not None,
+                        "reason": "stepwise_person_tracker",
+                        "stepwise_person_tracking": {
+                            "enabled": True,
+                            "state": tracker_update.state.value,
+                            "reason": tracker_update.reason,
+                            "accepted_measurement": bool(tracker_update.accepted_measurement),
+                            "rejected_measurement": bool(tracker_update.rejected_measurement),
+                            "last_seen_step": tracker_update.last_seen_step,
+                            "steps_since_seen": tracker_update.steps_since_seen,
+                            "jump_distance_m": tracker_update.jump_distance_m,
+                            "using_last_known": bool(not tracker_update.accepted_measurement and active_target is not None),
+                            "refreshed_this_step": refresh_meta is not None,
+                            "refresh_meta": refresh_meta,
+                            "last_valid_meta": stepwise_person_tracker_last_meta,
+                        },
+                    }
+                    if active_target is None:
+                        target_body_xy = None
+                        target_meta["reason"] = "stepwise_person_target_lost"
+                    else:
+                        target_xy_w = torch.tensor([[float(active_target.x), float(active_target.y)]], dtype=torch.float32, device=device)
+                        target_xy_w_env0 = (float(active_target.x), float(active_target.y))
+                        target_body_xy = _target_body_from_world(proxy=proxy, target_xy_w=target_xy_w)
+                        target_meta["target"] = {
+                            "target_body_xy": [float(target_body_xy[0]), float(target_body_xy[1])],
+                            "target_xy_w": [float(active_target.x), float(active_target.y)],
+                        }
+                else:
+                    target_body_xy = _target_body_from_world(proxy=proxy, target_xy_w=target_xy_w)
+                    target_meta = {
+                        "detection_source": str(args_cli.target_source),
+                        "target_valid": True,
+                        "reason": "frozen_target_body_projection",
+                        "target": {"target_body_xy": [target_body_xy[0], target_body_xy[1]]},
+                    }
 
             if target_body_xy is not None:
                 target_xy_w_env0 = _target_world_from_body(proxy=proxy, target_body_xy=target_body_xy)
