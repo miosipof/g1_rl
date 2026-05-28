@@ -1,4 +1,4 @@
-"""Synchronized plan-execute-replan navigation core.
+git"""Synchronized plan-execute-replan navigation core.
 
 The controller in this module is deliberately input-agnostic.  It does not know
 about Isaac Sim, RealSense, Livox, YOLO, Unitree SDK, or the real/sim command
@@ -136,7 +136,7 @@ class StepwiseNavConfig:
     astar_cfg: GridAStarCfg = field(default_factory=lambda: GridAStarCfg(inflation_radius=0.35))
 
     # Motion conversion.  Speeds are command magnitudes, not smoothing gains.
-    forward_segment_m: float = 0.35  # retained for CLI compatibility; A* cell sequence is not shortcut/coalesced
+    forward_segment_m: float = 0.35  # maximum committed translation segment emitted from the A* path
     forward_speed_mps: float = 0.35
     turn_speed_radps: float = 0.50
     turn_angle_max_rad: float = math.radians(35.0)  # retained for compatibility; not used as a cap
@@ -339,6 +339,68 @@ def _make_translation_action(local_xy: PointXY, *, cfg: StepwiseNavConfig, path_
     )
 
 
+def _sample_polyline_by_distance(points: Sequence[PointXY], *, step_m: float, min_tail_m: float) -> list[tuple[PointXY, int]]:
+    """Sample a polyline every ``step_m`` meters, preserving the final point.
+
+    Returns ``(point, source_path_index)`` pairs.  The source index is only
+    metadata for debugging; sampled points can lie inside a segment.
+    """
+
+    if len(points) < 2:
+        return []
+    step = max(float(step_m), float(min_tail_m), 1.0e-6)
+    samples: list[tuple[PointXY, int]] = []
+    prev = points[0]
+    remaining_to_next_sample = step
+
+    for idx in range(1, len(points)):
+        curr = points[idx]
+        seg_dx = curr[0] - prev[0]
+        seg_dy = curr[1] - prev[1]
+        seg_len = math.hypot(seg_dx, seg_dy)
+        if seg_len <= 1.0e-9:
+            prev = curr
+            continue
+        ux = seg_dx / seg_len
+        uy = seg_dy / seg_len
+        travelled = 0.0
+        while travelled + remaining_to_next_sample <= seg_len + 1.0e-9:
+            travelled += remaining_to_next_sample
+            samples.append(((prev[0] + ux * travelled, prev[1] + uy * travelled), idx))
+            remaining_to_next_sample = step
+        remaining_to_next_sample -= max(0.0, seg_len - travelled)
+        prev = curr
+
+    end = points[-1]
+    if not samples:
+        if math.hypot(end[0] - points[0][0], end[1] - points[0][1]) >= min_tail_m:
+            samples.append((end, len(points) - 1))
+    else:
+        last = samples[-1][0]
+        if math.hypot(end[0] - last[0], end[1] - last[1]) >= min_tail_m:
+            samples.append((end, len(points) - 1))
+    return samples
+
+
+def _make_forward_only_action(distance_m: float, *, cfg: StepwiseNavConfig, path_index: int) -> StepwiseAction:
+    distance = float(distance_m)
+    if distance <= 0.0:
+        raise ValueError("forward-only action distance must be positive")
+    duration = _duration_for_translation(distance, cfg)
+    return StepwiseAction(
+        kind=StepwiseActionKind.FORWARD,
+        command=MotionCommand(float(cfg.forward_speed_mps), 0.0, 0.0),
+        duration_s=duration,
+        distance_m=distance,
+        source=cfg.source,
+        metadata={
+            "path_index": int(path_index),
+            "mode": "sync_plan_lookahead_queue",
+            "forward_only": True,
+        },
+    )
+
+
 def path_to_stepwise_actions(
     path_xy_b: Sequence[Sequence[float]],
     *,
@@ -346,24 +408,46 @@ def path_to_stepwise_actions(
 ) -> list[StepwiseAction]:
     """Convert an A* body-frame path into a simple command queue.
 
-    The conversion follows the path in order.  For each next grid waypoint, the
-    virtual robot first yaws toward that waypoint when the bearing error exceeds
-    ``min_turn_angle_rad``; then it emits a translation command to that waypoint.
-    Small residual lateral components are kept in the translation command rather
-    than hidden by smoothing.  This implements the intended priority:
+    The real G1 does not reliably execute many 5 cm grid-cell commands.  This
+    converter therefore samples the A* polyline into short committed lookahead
+    segments, then emits ``Turn`` followed by pure ``Forward`` commands.  It does
+    not shortcut the path through obstacles; it follows the original A* polyline
+    at a coarser command resolution.
 
-    ``yaw first -> translate -> next path point``.
+    The command invariant is intentionally simple:
+
+    ``yaw toward the next sampled path point -> drive forward -> stop/observe``.
+
+    Lateral velocity is never emitted here.  If the A* start was relocated
+    because the inflated start cell was occupied, command generation still starts
+    from the real body origin; the immediate swept-footprint guard remains
+    responsible for rejecting unsafe first translations.
     """
 
     cfg = cfg or StepwiseNavConfig()
-    points = [_as_xy(p, name="path_xy_b point") for p in path_xy_b]
-    if len(points) < 2:
+    raw_points = [_as_xy(p, name="path_xy_b point") for p in path_xy_b]
+    if len(raw_points) < 2:
+        return []
+
+    start = _as_xy(cfg.start_xy_b, name="start_xy_b")
+    # Always generate commands from the actual robot body origin, not from a
+    # potentially relocated A* start cell.  This prevents the real runner from
+    # executing actions whose frame starts at a fictitious free cell.
+    points: list[PointXY] = [start]
+    points.extend(raw_points[1:] if math.hypot(raw_points[0][0] - start[0], raw_points[0][1] - start[1]) > 1.0e-6 else raw_points[1:])
+
+    sampled = _sample_polyline_by_distance(
+        points,
+        step_m=float(cfg.forward_segment_m),
+        min_tail_m=float(cfg.min_forward_m),
+    )
+    if not sampled:
         return []
 
     actions: list[StepwiseAction] = []
-    expected_pose: PoseXYYaw = (float(points[0][0]), float(points[0][1]), 0.0)
+    expected_pose: PoseXYYaw = (float(start[0]), float(start[1]), 0.0)
 
-    for path_index, waypoint in enumerate(points[1:], start=1):
+    for waypoint, path_index in sampled:
         local = _plan_to_body_xy(waypoint, expected_pose)
         distance = math.hypot(local[0], local[1])
         if distance < float(cfg.min_forward_m):
@@ -379,7 +463,7 @@ def path_to_stepwise_actions(
             if distance < float(cfg.min_forward_m):
                 continue
 
-        translate = _make_translation_action(local, cfg=cfg, path_index=path_index)
+        translate = _make_forward_only_action(distance, cfg=cfg, path_index=path_index)
         actions.append(translate)
         expected_pose = _apply_action_to_expected_pose(expected_pose, translate)
 

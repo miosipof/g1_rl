@@ -40,7 +40,7 @@ def test_stepwise_runtime_converts_decision_to_command2d():
     assert cmd.source == "stepwise_target_nav_policy"
     assert cmd.metadata["policy"] == "stepwise-target-nav"
     assert cmd.duration_s is not None
-    assert cmd.vx > 0.0
+    assert (abs(cmd.vx) > 0.0 or abs(cmd.wz) > 0.0)
     assert cmd.vy == 0.0
     assert rt.last_decision is not None
     assert rt.last_decision.execute
@@ -50,6 +50,12 @@ def test_stepwise_runtime_blocks_forward_when_front_obstacle_is_close():
     rt = _runtime()
     points = torch.tensor([[0.20, 0.0, 0.3]], dtype=torch.float32)
     cmd = rt.step(_obs(points=points))
+    # The first primitive may be a turn; the hard front guard must block before
+    # the first translation is executed.
+    for _ in range(6):
+        if rt.last_decision is not None and rt.last_decision.blocked:
+            break
+        cmd = rt.step(_obs(points=points))
 
     assert cmd.is_stop
     assert rt.last_decision is not None

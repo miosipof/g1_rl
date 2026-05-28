@@ -49,12 +49,11 @@ def test_path_to_stepwise_actions_builds_full_yaw_then_translate_queue():
     cfg = _cfg()
     actions = path_to_stepwise_actions([(0.0, 0.0), (0.0, 0.1), (0.0, 0.2)], cfg=cfg)
 
-    assert len(actions) == 3
-    assert actions[0].kind == StepwiseActionKind.TURN
+    assert [a.kind for a in actions] == [StepwiseActionKind.TURN, StepwiseActionKind.FORWARD]
     assert math.isclose(actions[0].angle_rad, math.pi / 2.0, abs_tol=1e-9)
     assert math.isclose(actions[0].duration_s, (math.pi / 2.0) / cfg.turn_speed_radps, abs_tol=1e-9)
-    assert actions[1].kind == StepwiseActionKind.FORWARD
-    assert actions[2].kind == StepwiseActionKind.FORWARD
+    assert math.isclose(actions[1].distance_m, 0.2, abs_tol=1e-9)
+    assert actions[1].command.vy == 0.0
     assert all(a.duration_s > 0.0 for a in actions)
 
 
@@ -62,9 +61,9 @@ def test_path_to_stepwise_actions_keeps_straight_path_as_forward_commands():
     cfg = _cfg()
     actions = path_to_stepwise_actions([(0.0, 0.0), (0.1, 0.0), (0.2, 0.0)], cfg=cfg)
 
-    assert [a.kind for a in actions] == [StepwiseActionKind.FORWARD, StepwiseActionKind.FORWARD]
-    assert math.isclose(actions[0].distance_m, 0.1, abs_tol=1e-9)
-    assert math.isclose(actions[0].duration_s, 0.1 / cfg.forward_speed_mps, abs_tol=1e-9)
+    assert [a.kind for a in actions] == [StepwiseActionKind.FORWARD]
+    assert math.isclose(actions[0].distance_m, 0.2, abs_tol=1e-9)
+    assert math.isclose(actions[0].duration_s, 0.2 / cfg.forward_speed_mps, abs_tol=1e-9)
     assert actions[0].command.vy == 0.0
 
 
@@ -150,6 +149,10 @@ def test_navigator_front_block_stops_and_marks_replan_pending():
     grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
 
     decision = nav.decide(target_xy_b=(1.0, 0.0), occupancy_grid=grid, front_min_distance_m=0.20)
+    if decision.action.kind == StepwiseActionKind.TURN:
+        # Turning away from/around an obstacle is allowed; the hard front guard
+        # applies to the next translation primitive.
+        decision = nav.decide(target_xy_b=(1.0, 0.0), occupancy_grid=grid, front_min_distance_m=0.20)
 
     assert not decision.execute
     assert decision.blocked
@@ -290,7 +293,12 @@ def test_remaining_path_blocked_is_compatibility_wrapper_for_next_action_only():
     far_cell = xy_to_grid_cell((0.5, 0.0), cfg.grid_cfg)
     blocked_grid[far_cell[0], far_cell[1]] = 1.0
 
-    blocked, info = remaining_path_blocked(blocked_grid, plan, cfg=cfg, current_action_index=0)
+    # The first action may be a yaw-only alignment step.  The compatibility
+    # wrapper should only evaluate the next translation primitive.
+    action_index = 0
+    if plan.actions and plan.actions[0].kind == StepwiseActionKind.TURN:
+        action_index = 1
+    blocked, info = remaining_path_blocked(blocked_grid, plan, cfg=cfg, current_action_index=action_index)
     assert not blocked
     assert info["reason"] in {"clear", "translation_within_start_ignore_radius"}
 
