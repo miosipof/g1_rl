@@ -159,13 +159,9 @@ class StepwiseNavConfig:
     path_block_inflation_radius_m: float | None = None
     sweep_start_ignore_m: float = 0.05  # ignore origin-cell inflation when checking the next commanded sweep
 
-    # Kept for compatibility. Missing target stops by default. For real
-    # hardware tests that intentionally lock the first detection as a fixed
-    # destination, the runner may allow the already-committed plan queue to
-    # continue after target loss. This does not create new plans without a
-    # target; it only executes the active queue.
+    # Kept for compatibility. Missing target stops; blind execution is not used
+    # in this synchronized controller.
     blind_plan_actions: int = 0
-    continue_active_plan_without_target: bool = False
 
     # Last-resort raw front guard before executing a forward/translation command.
     emergency_front_stop_m: float = 0.35
@@ -895,63 +891,45 @@ class StepwiseNavigator:
 
         meta = dict(metadata or {})
         target_visible = target_xy_b is not None
-        active_plan = self.last_plan is not None and self.current_action_index < len(self.action_queue)
-        continuing_without_target = False
 
-        if target_visible:
-            assert target_xy_b is not None
-            target_xy = _as_xy(target_xy_b, name="target_xy_b")
-            if target_reached(target_xy, cfg=self.cfg):
-                self.action_queue.clear()
-                self.current_action_index = 0
-                self.pending_replan_reason = None
-                return self._stop_decision(
-                    reason="target_reached",
-                    target_visible=True,
-                    target_reached_value=True,
-                    front_min_distance_m=front_min_distance_m,
-                    metadata=meta,
-                )
-        else:
-            target_xy = None
-            can_continue_active = (
-                bool(self.cfg.continue_active_plan_without_target)
-                and active_plan
-                and self.pending_replan_reason is None
+        if not target_visible:
+            self.action_queue.clear()
+            self.current_action_index = 0
+            self.pending_replan_reason = None
+            return self._stop_decision(
+                reason="target_missing_stop_observe",
+                target_visible=False,
+                front_min_distance_m=front_min_distance_m,
+                metadata=meta,
             )
-            if not can_continue_active:
-                self.action_queue.clear()
-                self.current_action_index = 0
-                self.pending_replan_reason = None
-                return self._stop_decision(
-                    reason="target_missing_stop_observe",
-                    target_visible=False,
-                    front_min_distance_m=front_min_distance_m,
-                    metadata=meta,
-                )
-            continuing_without_target = True
-            meta["continuing_active_plan_without_target"] = True
+
+        assert target_xy_b is not None
+        target_xy = _as_xy(target_xy_b, name="target_xy_b")
+        if target_reached(target_xy, cfg=self.cfg):
+            self.action_queue.clear()
+            self.current_action_index = 0
+            self.pending_replan_reason = None
+            return self._stop_decision(
+                reason="target_reached",
+                target_visible=True,
+                target_reached_value=True,
+                front_min_distance_m=front_min_distance_m,
+                metadata=meta,
+            )
 
         if occupancy_grid is None:
             return self._stop_decision(
                 reason="missing_occupancy_grid",
-                target_visible=bool(target_visible),
+                target_visible=True,
                 front_min_distance_m=front_min_distance_m,
                 replan_reason=self.pending_replan_reason,
                 metadata=meta,
             )
 
         if force_replan:
-            if not target_visible:
-                return self._stop_decision(
-                    reason="target_missing_stop_observe",
-                    target_visible=False,
-                    front_min_distance_m=front_min_distance_m,
-                    replan_reason="force_replan",
-                    metadata={**meta, "force_replan_without_target": True},
-                )
             return self._request_sync_stop("force_replan", front_min_distance_m=front_min_distance_m, metadata=meta)
 
+        active_plan = self.last_plan is not None and self.current_action_index < len(self.action_queue)
         need_immediate_replan_reason: str | None = None
         if self.pending_replan_reason is not None:
             need_immediate_replan_reason = self.pending_replan_reason
@@ -959,17 +937,6 @@ class StepwiseNavigator:
             need_immediate_replan_reason = "initial_sync" if self.last_plan is None else "queue_exhausted"
 
         if need_immediate_replan_reason is not None:
-            if target_xy is None:
-                self.action_queue.clear()
-                self.current_action_index = 0
-                self.pending_replan_reason = None
-                return self._stop_decision(
-                    reason="target_missing_stop_observe",
-                    target_visible=False,
-                    front_min_distance_m=front_min_distance_m,
-                    replan_reason=need_immediate_replan_reason,
-                    metadata={**meta, "replan_requires_target": True},
-                )
             plan = self._sync_replan(target_xy_b=target_xy, occupancy_grid=occupancy_grid, replan_reason=need_immediate_replan_reason)
             if not plan.found:
                 return self._stop_decision(
@@ -999,7 +966,7 @@ class StepwiseNavigator:
 
         assert self.last_plan is not None
 
-        if target_xy is not None and float(self.cfg.target_change_replan_m) > 0.0:
+        if float(self.cfg.target_change_replan_m) > 0.0:
             mismatch = _target_mismatch_m(
                 observed_target_xy_b=target_xy,
                 plan_target_xy_b=self.last_plan.target_xy_b,
@@ -1009,16 +976,11 @@ class StepwiseNavigator:
             if mismatch >= float(self.cfg.target_change_replan_m):
                 return self._request_sync_stop("target_changed", front_min_distance_m=front_min_distance_m, metadata=meta)
 
-        # Periodic replans require a current target.  When the real runner is
-        # intentionally executing the first-detection plan through occlusion,
-        # continue the active queue instead of stopping to request an impossible
-        # target-less replan.
-        if not continuing_without_target:
-            if int(self.cfg.replan_every_actions) > 0 and self.executed_actions_since_replan >= int(self.cfg.replan_every_actions):
-                return self._request_sync_stop("periodic_replan_actions", front_min_distance_m=front_min_distance_m, metadata=meta)
+        if int(self.cfg.replan_every_actions) > 0 and self.executed_actions_since_replan >= int(self.cfg.replan_every_actions):
+            return self._request_sync_stop("periodic_replan_actions", front_min_distance_m=front_min_distance_m, metadata=meta)
 
-            if float(self.cfg.replan_every_forward_m) > 0.0 and self.executed_forward_m_since_replan >= float(self.cfg.replan_every_forward_m):
-                return self._request_sync_stop("periodic_replan_distance", front_min_distance_m=front_min_distance_m, metadata=meta)
+        if float(self.cfg.replan_every_forward_m) > 0.0 and self.executed_forward_m_since_replan >= float(self.cfg.replan_every_forward_m):
+            return self._request_sync_stop("periodic_replan_distance", front_min_distance_m=front_min_distance_m, metadata=meta)
 
         if 0 <= self.current_action_index < len(self.action_queue):
             next_action = self.action_queue[self.current_action_index]
@@ -1030,7 +992,7 @@ class StepwiseNavigator:
             return self._request_sync_stop("path_blocked", front_min_distance_m=front_min_distance_m, metadata=meta)
 
         return self._execute_next_action(
-            target_visible=bool(target_visible),
+            target_visible=True,
             front_min_distance_m=front_min_distance_m,
             replan_reason=None,
             replan_attempted=False,

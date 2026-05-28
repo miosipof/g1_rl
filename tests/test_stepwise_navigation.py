@@ -344,37 +344,3 @@ def test_immediate_translation_block_check_can_use_smaller_guard_inflation_than_
     assert info["reason"] == "clear"
     assert info["planning_inflation_radius_m"] == 0.69
     assert info["guard_inflation_radius_m"] == 0.10
-
-
-def test_navigator_can_continue_active_plan_without_target_when_enabled():
-    cfg = _cfg(continue_active_plan_without_target=True, replan_every_forward_m=0.0)
-    nav = StepwiseNavigator(cfg)
-    grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
-
-    first = nav.decide(target_xy_b=(1.0, 0.0), occupancy_grid=grid, front_min_distance_m=1.0)
-    assert first.execute
-
-    second = nav.decide(target_xy_b=None, occupancy_grid=grid, front_min_distance_m=1.0)
-    assert second.execute
-    assert second.target_visible is False
-    assert second.reason == "execute_action"
-    assert second.metadata["continuing_active_plan_without_target"] is True
-
-
-def test_navigator_does_not_create_new_plan_without_target_in_continue_mode():
-    cfg = _cfg(continue_active_plan_without_target=True, forward_segment_m=2.0, success_radius_m=0.05)
-    nav = StepwiseNavigator(cfg)
-    grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
-
-    first = nav.decide(target_xy_b=(0.5, 0.0), occupancy_grid=grid, front_min_distance_m=1.0)
-    assert first.execute
-    last = first
-    for _ in range(20):
-        last = nav.decide(target_xy_b=None, occupancy_grid=grid, front_min_distance_m=1.0)
-        if not last.execute:
-            break
-    # Once the committed queue is exhausted, missing target must stop rather
-    # than fabricate a new plan.
-    assert not last.execute
-    assert last.reason == "target_missing_stop_observe"
-    assert last.replan_reason in {None, "queue_exhausted"}
