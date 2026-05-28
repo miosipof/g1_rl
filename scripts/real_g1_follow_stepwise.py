@@ -172,6 +172,21 @@ def _xy_from_target(target: Target2D | None) -> list[float] | None:
     return [float(target.x), float(target.y)]
 
 
+def _replace_observation_target(obs: RobotObservation, target: Target2D | None, *, metadata_update: Mapping[str, Any]) -> RobotObservation:
+    meta = dict(obs.metadata)
+    meta.update(dict(metadata_update))
+    return RobotObservation(
+        timestamp_s=obs.timestamp_s,
+        pose=obs.pose,
+        rgbd=obs.rgbd,
+        lidar=obs.lidar,
+        robot_state=obs.robot_state,
+        target_hint=target,
+        statuses=obs.statuses,
+        metadata=meta,
+    )
+
+
 def _command_dict(cmd: Command2D | None) -> dict[str, Any] | None:
     if cmd is None:
         return None
@@ -200,6 +215,12 @@ def _make_stepwise_cfg(args: argparse.Namespace, grid_cfg: OccupancyGridCfg) -> 
         inflation = float(args.astar_inflation_m)
     else:
         inflation = float(args.body_radius_m) + float(args.safety_margin_m)
+    forward_segment_m = float(args.forward_segment_m)
+    if float(getattr(args, "forward_duration_s", 0.0) or 0.0) > 0.0:
+        forward_segment_m = float(args.forward_speed_mps) * float(args.forward_duration_s)
+    target_change_replan_m = float(args.target_change_replan_m)
+    if bool(getattr(args, "first_detection_plan_only", False)):
+        target_change_replan_m = 0.0
     return StepwiseNavConfig(
         grid_cfg=grid_cfg,
         astar_cfg=GridAStarCfg(
@@ -209,7 +230,7 @@ def _make_stepwise_cfg(args: argparse.Namespace, grid_cfg: OccupancyGridCfg) -> 
             heuristic_weight=float(args.astar_heuristic_weight),
             max_expansions=int(args.astar_max_expansions),
         ),
-        forward_segment_m=float(args.forward_segment_m),
+        forward_segment_m=float(forward_segment_m),
         forward_speed_mps=float(args.forward_speed_mps),
         turn_speed_radps=float(args.turn_speed_radps),
         turn_angle_max_rad=math.radians(float(args.turn_angle_max_deg)),
@@ -217,12 +238,13 @@ def _make_stepwise_cfg(args: argparse.Namespace, grid_cfg: OccupancyGridCfg) -> 
         min_forward_m=float(args.min_forward_m),
         replan_every_actions=int(args.replan_every_actions),
         replan_every_forward_m=float(args.replan_every_forward_m),
-        target_change_replan_m=float(args.target_change_replan_m),
+        target_change_replan_m=float(target_change_replan_m),
         path_block_check=not bool(args.disable_path_block_check),
         path_block_inflation_radius_m=None if args.path_block_inflation_m is None else float(args.path_block_inflation_m),
         sweep_start_ignore_m=float(args.sweep_start_ignore_m),
         emergency_front_stop_m=float(args.emergency_front_stop_m),
         success_radius_m=float(args.target_reached_radius_m),
+        continue_active_plan_without_target=bool(getattr(args, "first_detection_plan_only", False)),
         allow_goal_relocation=not bool(args.disable_goal_relocation),
         allow_start_relocation=not bool(args.disable_start_relocation),
         source="real_g1_follow_stepwise",
@@ -367,6 +389,15 @@ def main() -> int:
     parser.add_argument("--target-source", choices=("yolo", "stream"), default="yolo", help="Inline RGB-D YOLO or external latest_tracks.json stream.")
     parser.add_argument("--target-class", default="person", help="Target class to follow.")
     parser.add_argument("--stand-off-m", type=float, default=0.80, help="Standoff from detected object; inline YOLO applies this before planning.")
+    parser.add_argument(
+        "--first-detection-plan-only",
+        action="store_true",
+        help=(
+            "Real-test simplification: use the first valid detection only to seed one plan, "
+            "then keep executing the active queue through target loss/track-id churn. No new "
+            "plans are created without a current target."
+        ),
+    )
     parser.add_argument("--max-steps", "--steps", dest="max_steps", type=int, default=30, help="Maximum stop-observe-plan-execute cycles.")
     parser.add_argument("--settle-s", type=float, default=0.50, help="Sleep after stop before observation.")
     parser.add_argument("--stop-after-action-s", type=float, default=0.05, help="Short pause after post-action stop.")
@@ -417,6 +448,12 @@ def main() -> int:
     parser.add_argument("--astar-heuristic-weight", type=float, default=1.0)
     parser.add_argument("--astar-max-expansions", type=int, default=0)
     parser.add_argument("--forward-segment-m", type=float, default=0.35)
+    parser.add_argument(
+        "--forward-duration-s",
+        type=float,
+        default=0.0,
+        help="If >0, derive forward_segment_m = forward_speed_mps * forward_duration_s, useful for 2-3 s committed real steps.",
+    )
     parser.add_argument("--forward-speed-mps", type=float, default=0.25)
     parser.add_argument("--turn-speed-radps", type=float, default=0.35)
     parser.add_argument("--turn-angle-max-deg", type=float, default=35.0)
@@ -617,7 +654,9 @@ def main() -> int:
     print(f"[INFO]: target_source={args.target_source} target_class={args.target_class}")
     print(f"[INFO]: real_motion={real_motion} run_id={run_id}")
     print(f"[INFO]: stepwise inflation={stepwise_cfg.astar_cfg.inflation_radius:.3f} grid_resolution={grid_cfg.resolution:.3f}")
-    print(f"[INFO]: motion: forward_speed={args.forward_speed_mps} turn_speed={args.turn_speed_radps} replan_forward={args.replan_every_forward_m}")
+    print(f"[INFO]: motion: forward_speed={args.forward_speed_mps} forward_segment={stepwise_cfg.forward_segment_m} turn_speed={args.turn_speed_radps} replan_forward={args.replan_every_forward_m}")
+    if args.first_detection_plan_only:
+        print("[INFO]: first_detection_plan_only enabled: first valid target seeds one committed plan; later target loss will not stop the active queue")
     print(f"[INFO]: command mapping: vx_scale={args.command_vx_scale} vy_scale={args.command_vy_scale} wz_scale={args.command_wz_scale}")
     if not real_motion:
         print("[INFO]: dry-run mode: no Unitree Move command will be sent")
@@ -632,6 +671,8 @@ def main() -> int:
         if command_rows_path.exists():
             command_rows_path.unlink()
 
+    first_detection_target: Target2D | None = None
+
     try:
         for step in range(int(args.max_steps)):
             stop_before = sink.stop(timestamp_s=time.monotonic())
@@ -639,6 +680,37 @@ def main() -> int:
                 time.sleep(float(args.settle_s))
 
             obs = observation_provider.read_observation()
+            if bool(args.first_detection_plan_only):
+                raw_target = obs.target_hint
+                if first_detection_target is None and raw_target is not None:
+                    first_detection_target = raw_target
+                if first_detection_target is None:
+                    obs = _replace_observation_target(
+                        obs,
+                        None,
+                        metadata_update={
+                            "first_detection_plan_only": {
+                                "state": "waiting_for_first_detection",
+                                "fixed_target_xy_b": None,
+                                "raw_target_xy_b": _xy_from_target(raw_target),
+                            }
+                        },
+                    )
+                else:
+                    seed_required = stepwise_runtime.navigator.last_plan is None and stepwise_runtime.navigator.pending_replan_reason is None
+                    target_for_step = first_detection_target if seed_required else None
+                    obs = _replace_observation_target(
+                        obs,
+                        target_for_step,
+                        metadata_update={
+                            "first_detection_plan_only": {
+                                "state": "seeding_initial_plan" if seed_required else "executing_active_plan_without_target",
+                                "fixed_target_xy_b": _xy_from_target(first_detection_target),
+                                "raw_target_xy_b": _xy_from_target(raw_target),
+                                "target_hint_passed_to_stepwise": _xy_from_target(target_for_step),
+                            }
+                        },
+                    )
             command = stepwise_runtime.step(obs)
             decision = stepwise_runtime.last_decision
             detections = None
