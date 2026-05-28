@@ -318,3 +318,29 @@ def test_periodic_replan_stops_before_syncing_new_plan():
     assert third.execute
     assert third.replan_attempted
     assert third.replan_reason == "periodic_replan_actions"
+
+def test_immediate_translation_block_check_can_use_smaller_guard_inflation_than_planner():
+    cfg = _cfg(
+        astar_cfg=GridAStarCfg(inflation_radius=0.69),
+        path_block_check=True,
+        path_block_inflation_radius_m=0.10,
+        sweep_start_ignore_m=0.10,
+    )
+    grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
+    forward = StepwiseAction(
+        kind=StepwiseActionKind.FORWARD,
+        command=MotionCommand(0.45, 0.0, 0.0),
+        duration_s=1.0,
+        distance_m=0.45,
+    )
+
+    # Occupancy close enough to intersect A* planning inflation, but outside the
+    # smaller imminent-collision guard inflation used for real execution.
+    near_margin_cell = xy_to_grid_cell((0.125, 0.45), cfg.grid_cfg)
+    grid[near_margin_cell[0], near_margin_cell[1]] = 1.0
+
+    blocked, info = translation_action_blocked_by_grid(forward, grid, cfg=cfg)
+    assert not blocked
+    assert info["reason"] == "clear"
+    assert info["planning_inflation_radius_m"] == 0.69
+    assert info["guard_inflation_radius_m"] == 0.10

@@ -219,6 +219,7 @@ def _make_stepwise_cfg(args: argparse.Namespace, grid_cfg: OccupancyGridCfg) -> 
         replan_every_forward_m=float(args.replan_every_forward_m),
         target_change_replan_m=float(args.target_change_replan_m),
         path_block_check=not bool(args.disable_path_block_check),
+        path_block_inflation_radius_m=None if args.path_block_inflation_m is None else float(args.path_block_inflation_m),
         sweep_start_ignore_m=float(args.sweep_start_ignore_m),
         emergency_front_stop_m=float(args.emergency_front_stop_m),
         success_radius_m=float(args.target_reached_radius_m),
@@ -425,6 +426,17 @@ def main() -> int:
     parser.add_argument("--replan-every-forward-m", type=float, default=0.60)
     parser.add_argument("--target-change-replan-m", type=float, default=0.50)
     parser.add_argument("--disable-path-block-check", action="store_true")
+    parser.add_argument(
+        "--path-block-inflation-m",
+        type=float,
+        default=None,
+        help=(
+            "Inflation radius used only by the immediate execution sweep guard. "
+            "Defaults to the A* planning inflation. For real tests, use a smaller "
+            "value such as 0.20-0.35 so path_block detects imminent collision, "
+            "not planning-margin contact."
+        ),
+    )
     parser.add_argument("--sweep-start-ignore-m", type=float, default=0.05)
     parser.add_argument("--emergency-front-stop-m", type=float, default=0.40)
     parser.add_argument("--target-reached-radius-m", type=float, default=0.75)

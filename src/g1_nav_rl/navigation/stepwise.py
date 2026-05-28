@@ -1,4 +1,4 @@
-git"""Synchronized plan-execute-replan navigation core.
+"""Synchronized plan-execute-replan navigation core.
 
 The controller in this module is deliberately input-agnostic.  It does not know
 about Isaac Sim, RealSense, Livox, YOLO, Unitree SDK, or the real/sim command
@@ -152,6 +152,11 @@ class StepwiseNavConfig:
     target_change_replan_m: float = 0.50
     path_block_check: bool = True
     path_block_lookahead_m: float = 1.50  # retained for old configs; immediate guard does not use it
+    # Immediate-sweep guard inflation is separate from A* planning inflation.
+    # A* may use robot_radius + safety_margin, but the current-frame execution
+    # guard should detect imminent collision, not merely that the robot is inside
+    # the conservative planning margin.  None preserves legacy behavior.
+    path_block_inflation_radius_m: float | None = None
     sweep_start_ignore_m: float = 0.05  # ignore origin-cell inflation when checking the next commanded sweep
 
     # Kept for compatibility. Missing target stops; blind execution is not used
@@ -186,6 +191,10 @@ class StepwiseNavConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"StepwiseNavConfig.{name} must be finite and non-negative")
+        if self.path_block_inflation_radius_m is not None:
+            value = float(self.path_block_inflation_radius_m)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError("StepwiseNavConfig.path_block_inflation_radius_m must be finite and non-negative or None")
         if self.forward_speed_mps <= 0.0:
             raise ValueError("forward_speed_mps must be positive")
         if self.turn_speed_radps <= 0.0:
@@ -562,7 +571,12 @@ def _target_mismatch_m(*, observed_target_xy_b: PointXY, plan_target_xy_b: Point
     )
 
 
-def _inflated_grid(occupancy_grid: torch.Tensor, cfg: StepwiseNavConfig) -> torch.Tensor:
+def _inflated_grid(
+    occupancy_grid: torch.Tensor,
+    cfg: StepwiseNavConfig,
+    *,
+    inflation_radius: float | None = None,
+) -> torch.Tensor:
     grid = occupancy_grid
     if grid.ndim == 3:
         if grid.shape[0] != 1:
@@ -573,7 +587,7 @@ def _inflated_grid(occupancy_grid: torch.Tensor, cfg: StepwiseNavConfig) -> torc
     return inflate_occupancy_grid(
         grid,
         cfg=cfg.grid_cfg,
-        inflation_radius=cfg.astar_cfg.inflation_radius,
+        inflation_radius=float(cfg.astar_cfg.inflation_radius if inflation_radius is None else inflation_radius),
         occupancy_threshold=cfg.astar_cfg.occupancy_threshold,
     ).to(dtype=torch.bool, device="cpu")
 
@@ -614,14 +628,22 @@ def translation_action_blocked_by_grid(
     if grid.ndim != 2:
         raise ValueError(f"occupancy_grid must have shape [H,W] or [1,H,W], got {tuple(occupancy_grid.shape)}")
     raw_occupied = (grid.detach().cpu() > float(cfg.astar_cfg.occupancy_threshold)).to(dtype=torch.bool)
-    inflated = _inflated_grid(grid, cfg)
+    guard_inflation_radius = (
+        float(cfg.astar_cfg.inflation_radius)
+        if cfg.path_block_inflation_radius_m is None
+        else float(cfg.path_block_inflation_radius_m)
+    )
+    inflated = _inflated_grid(grid, cfg, inflation_radius=guard_inflation_radius)
     height, width = int(inflated.shape[0]), int(inflated.shape[1])
     start_cell = xy_to_grid_cell((0.0, 0.0), cfg.grid_cfg)
     end_cell = xy_to_grid_cell((dx, dy), cfg.grid_cfg)
     effective_start_ignore_m = max(float(cfg.sweep_start_ignore_m), 2.0 * float(cfg.grid_cfg.resolution))
     base_meta: dict[str, Any] = {
         "grid_resolution_m": float(cfg.grid_cfg.resolution),
-        "inflation_radius_m": float(cfg.astar_cfg.inflation_radius),
+        "planning_inflation_radius_m": float(cfg.astar_cfg.inflation_radius),
+        "guard_inflation_radius_m": float(guard_inflation_radius),
+        # Compatibility alias; new readers should prefer guard_inflation_radius_m.
+        "inflation_radius_m": float(guard_inflation_radius),
         "occupancy_threshold": float(cfg.astar_cfg.occupancy_threshold),
         "start_ignore_m": float(effective_start_ignore_m),
         "start_cell": list(start_cell),
