@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC = _REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
 
 from adapters import (
     Command2D,
@@ -30,6 +36,8 @@ from adapters import (
     Target2D,
     LidarTargetNavPolicyRuntime,
     LidarTargetNavPolicyRuntimeConfig,
+    RLResidualTargetNavPolicyRuntime,
+    RLResidualTargetNavPolicyRuntimeConfig,
     RealBridge,
     RealBridgeConfig,
     CompositeDryRunObservationProvider,
@@ -44,6 +52,7 @@ from adapters import (
     write_run_info,
 )
 from adapters.safety_supervisor import SafetySupervisor, SafetySupervisorConfig
+from g1_nav_rl.policies.rl_residual_policy import RLResidualPolicyCfg
 from adapters.real_livox import LivoxAdapterConfig, NpyLivoxReplayAdapter, UnitreeVibesLivox2Adapter, UnitreeVibesLivox2AdapterConfig
 
 
@@ -145,7 +154,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=_default_config_path(), help="Adapter YAML config path.")
     parser.add_argument("--steps", type=int, default=5, help="Number of bridge iterations.")
     parser.add_argument("--dt", type=float, default=0.10, help="Sleep between iterations.")
-    parser.add_argument("--policy", choices=("constant", "target-nav"), default="constant", help="Policy/runtime used to propose commands.")
+    parser.add_argument("--policy", choices=("constant", "target-nav", "rl-residual"), default="constant", help="Policy/runtime used to propose commands.")
     parser.add_argument("--vx", type=float, default=0.05, help="Requested policy vx in m/s for --policy constant.")
     parser.add_argument("--vy", type=float, default=0.0, help="Requested policy vy in m/s for --policy constant.")
     parser.add_argument("--wz", type=float, default=0.0, help="Requested policy wz in rad/s for --policy constant.")
@@ -156,6 +165,11 @@ def main() -> int:
     parser.add_argument("--target-nav-inflation", type=float, default=0.35, help="A* inflation radius in meters for --policy target-nav.")
     parser.add_argument("--target-nav-max-wz", type=float, default=None, help="Override target-nav policy max yaw rate before final Unitree command scaling.")
     parser.add_argument("--target-nav-command-mode", choices=("holonomic", "heading_aligned"), default="holonomic", help="Waypoint-to-command controller for --policy target-nav. heading_aligned prefers vx+wz and damps vy.")
+    parser.add_argument("--rl-residual-checkpoint", type=Path, default=None, help="Optional Torch checkpoint for --policy rl-residual; omitted means zero residual and deterministic nominal behavior.")
+    parser.add_argument("--rl-residual-limit-vx", type=float, default=0.10, help="Max |Δvx| residual for --policy rl-residual.")
+    parser.add_argument("--rl-residual-limit-vy", type=float, default=0.10, help="Max |Δvy| residual for --policy rl-residual.")
+    parser.add_argument("--rl-residual-limit-wz", type=float, default=0.25, help="Max |Δwz| residual for --policy rl-residual.")
+    parser.add_argument("--rl-path-points", type=int, default=8, help="Number of A* path samples used by --policy rl-residual features.")
     parser.add_argument("--heading-lookahead-m", type=float, default=0.60, help="Path lookahead distance used by heading_aligned mode to smooth local grid-cell turns.")
     parser.add_argument("--heading-slow-angle-rad", type=float, default=0.35, help="Bearing error above which heading_aligned starts reducing vx/vy.")
     parser.add_argument("--heading-rotate-in-place-angle-rad", type=float, default=0.80, help="Bearing error above which heading_aligned commands turn-first behavior.")
@@ -225,6 +239,10 @@ def main() -> int:
         raise SystemExit("--target-nav-inflation must be >= 0")
     if args.target_nav_max_wz is not None and args.target_nav_max_wz <= 0.0:
         raise SystemExit("--target-nav-max-wz must be positive when provided")
+    if args.rl_residual_limit_vx < 0.0 or args.rl_residual_limit_vy < 0.0 or args.rl_residual_limit_wz < 0.0:
+        raise SystemExit("--rl-residual-limit-vx/vy/wz must be non-negative")
+    if args.rl_path_points < 1:
+        raise SystemExit("--rl-path-points must be >= 1")
     if args.heading_lookahead_m < 0.0:
         raise SystemExit("--heading-lookahead-m must be >= 0")
     if args.heading_slow_angle_rad < 0.0:
@@ -306,7 +324,7 @@ def main() -> int:
 
     if args.policy == "constant":
         policy = ConstantVelocityPolicy(args.vx, args.vy, args.wz)
-    else:
+    elif args.policy == "target-nav":
         policy_cfg = LidarTargetNavPolicyRuntimeConfig.from_runtime_config(
             cfg,
             target=Target2D(float(args.target_x), float(args.target_y)),
@@ -324,6 +342,25 @@ def main() -> int:
             path_lookahead_m=float(args.heading_lookahead_m),
         )
         policy = LidarTargetNavPolicyRuntime(policy_cfg)
+    else:
+        residual_cfg = RLResidualPolicyCfg(
+            path_points=int(args.rl_path_points),
+            residual_limit_vx=float(args.rl_residual_limit_vx),
+            residual_limit_vy=float(args.rl_residual_limit_vy),
+            residual_limit_wz=float(args.rl_residual_limit_wz),
+        )
+        policy_cfg = RLResidualTargetNavPolicyRuntimeConfig.from_runtime_config(
+            cfg,
+            target=Target2D(float(args.target_x), float(args.target_y)),
+            checkpoint_path=None if args.rl_residual_checkpoint is None else str(args.rl_residual_checkpoint),
+            residual_policy_cfg=residual_cfg,
+            enable_replanning=bool(args.target_nav_enable_replanning or args.target_nav_replan_every > 0),
+            replan_every=int(args.target_nav_replan_every),
+            inflation_radius_m=float(args.target_nav_inflation),
+            max_wz=args.target_nav_max_wz,
+            command_mode=args.target_nav_command_mode,
+        )
+        policy = RLResidualTargetNavPolicyRuntime(policy_cfg)
 
     supervisor = SafetySupervisor.from_runtime_config(
         cfg,
@@ -350,7 +387,7 @@ def main() -> int:
 
     lidar_debug_writer = None
     if lidar_debug_dir is not None:
-        debug_grid_cfg = policy.config.grid_cfg if isinstance(policy, LidarTargetNavPolicyRuntime) else cfg_to_default_grid_cfg()
+        debug_grid_cfg = policy.config.grid_cfg if hasattr(policy, "config") and hasattr(policy.config, "grid_cfg") else cfg_to_default_grid_cfg()
         lidar_debug_writer = LidarDebugWriter(lidar_debug_dir, grid_cfg=debug_grid_cfg)
 
     rgbd_debug_writer = RGBDDebugWriter(rgbd_debug_dir) if rgbd_debug_dir is not None else None
@@ -387,7 +424,7 @@ def main() -> int:
             print(f"[INFO]: bridge command: follow -> {status.health.value}: {status.message}")
             print(f"[INFO]: observation_source={args.observation_source}")
             print(f"[INFO]: policy={args.policy}")
-            if args.policy == "target-nav":
+            if args.policy in {"target-nav", "rl-residual"}:
                 print(
                     f"[INFO]: target-nav target=({args.target_x:.3f}, {args.target_y:.3f}) "
                     f"replan_every={args.target_nav_replan_every} inflation={args.target_nav_inflation:.3f} "
@@ -417,7 +454,7 @@ def main() -> int:
             result = bridge.step()
             debug_paths = None
             if lidar_debug_writer is not None:
-                debug_paths = lidar_debug_writer.write_step(i, result, policy=policy if isinstance(policy, LidarTargetNavPolicyRuntime) else None)
+                debug_paths = lidar_debug_writer.write_step(i, result, policy=policy if hasattr(policy, "last_debug") else None)
             rgbd_debug_paths = None
             if rgbd_debug_writer is not None:
                 rgbd_debug_paths = rgbd_debug_writer.write_step(i, result, detector=rgbd_debug_detector)

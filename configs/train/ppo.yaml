@@ -1,0 +1,69 @@
+# Initial A*-conditioned residual-policy training config.
+# This file defines the policy seam and PPO hyperparameters, but the repository
+# entry point currently supports behavior-cloning pretraining from teacher data.
+algorithm: ppo
+
+policy:
+  type: rl_residual
+  path_points: 8
+  hidden_sizes: [128, 128]
+  activation: elu
+  residual_limits:
+    vx: 0.10
+    vy: 0.10
+    wz: 0.25
+  use_clearance_features: true
+  use_curvature_features: true
+
+env:
+  type: nav_residual_core
+  num_envs: 128
+  episode_length: 500
+  control_dt: 0.10
+  observation_type: compact
+  use_occupancy_grid: true
+  use_rgb: false
+  use_depth: false
+  use_raw_lidar: false
+
+planner:
+  astar:
+    inflation_radius: 0.35
+    allow_diagonal: true
+    heuristic_weight: 1.0
+  nav:
+    command_mode: heading_aligned
+    max_vx: 0.30
+    max_vy: 0.20
+    max_wz: 0.60
+    path_lookahead_m: 0.40
+  runtime:
+    enable_replanning: true
+    replan_every: 20
+
+reward:
+  progress_weight: 1.0
+  command_penalty_weight: 0.01
+  success_bonus: 5.0
+  collision_penalty: 10.0
+  near_obstacle_penalty_weight: 0.5
+  safety_intervention_penalty: 2.0
+  residual_penalty_weight: 0.05
+  command_delta_penalty_weight: 0.05
+  target_lost_motion_penalty_weight: 0.5
+  time_penalty: 0.001
+
+training:
+  total_steps: 5000000
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  entropy_coef: 0.005
+  value_loss_coef: 1.0
+  max_grad_norm: 1.0
+
+logging:
+  log_interval: 10
+  eval_interval: 25
+  checkpoint_interval: 50

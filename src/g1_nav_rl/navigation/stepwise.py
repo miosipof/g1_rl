@@ -136,7 +136,7 @@ class StepwiseNavConfig:
     astar_cfg: GridAStarCfg = field(default_factory=lambda: GridAStarCfg(inflation_radius=0.35))
 
     # Motion conversion.  Speeds are command magnitudes, not smoothing gains.
-    forward_segment_m: float = 0.35  # maximum committed translation segment emitted from the A* path
+    forward_segment_m: float = 0.35  # retained for CLI compatibility; A* cell sequence is not shortcut/coalesced
     forward_speed_mps: float = 0.35
     turn_speed_radps: float = 0.50
     turn_angle_max_rad: float = math.radians(35.0)  # retained for compatibility; not used as a cap
@@ -152,11 +152,6 @@ class StepwiseNavConfig:
     target_change_replan_m: float = 0.50
     path_block_check: bool = True
     path_block_lookahead_m: float = 1.50  # retained for old configs; immediate guard does not use it
-    # Immediate-sweep guard inflation is separate from A* planning inflation.
-    # A* may use robot_radius + safety_margin, but the current-frame execution
-    # guard should detect imminent collision, not merely that the robot is inside
-    # the conservative planning margin.  None preserves legacy behavior.
-    path_block_inflation_radius_m: float | None = None
     sweep_start_ignore_m: float = 0.05  # ignore origin-cell inflation when checking the next commanded sweep
 
     # Kept for compatibility. Missing target stops; blind execution is not used
@@ -191,10 +186,6 @@ class StepwiseNavConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"StepwiseNavConfig.{name} must be finite and non-negative")
-        if self.path_block_inflation_radius_m is not None:
-            value = float(self.path_block_inflation_radius_m)
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError("StepwiseNavConfig.path_block_inflation_radius_m must be finite and non-negative or None")
         if self.forward_speed_mps <= 0.0:
             raise ValueError("forward_speed_mps must be positive")
         if self.turn_speed_radps <= 0.0:
@@ -348,68 +339,6 @@ def _make_translation_action(local_xy: PointXY, *, cfg: StepwiseNavConfig, path_
     )
 
 
-def _sample_polyline_by_distance(points: Sequence[PointXY], *, step_m: float, min_tail_m: float) -> list[tuple[PointXY, int]]:
-    """Sample a polyline every ``step_m`` meters, preserving the final point.
-
-    Returns ``(point, source_path_index)`` pairs.  The source index is only
-    metadata for debugging; sampled points can lie inside a segment.
-    """
-
-    if len(points) < 2:
-        return []
-    step = max(float(step_m), float(min_tail_m), 1.0e-6)
-    samples: list[tuple[PointXY, int]] = []
-    prev = points[0]
-    remaining_to_next_sample = step
-
-    for idx in range(1, len(points)):
-        curr = points[idx]
-        seg_dx = curr[0] - prev[0]
-        seg_dy = curr[1] - prev[1]
-        seg_len = math.hypot(seg_dx, seg_dy)
-        if seg_len <= 1.0e-9:
-            prev = curr
-            continue
-        ux = seg_dx / seg_len
-        uy = seg_dy / seg_len
-        travelled = 0.0
-        while travelled + remaining_to_next_sample <= seg_len + 1.0e-9:
-            travelled += remaining_to_next_sample
-            samples.append(((prev[0] + ux * travelled, prev[1] + uy * travelled), idx))
-            remaining_to_next_sample = step
-        remaining_to_next_sample -= max(0.0, seg_len - travelled)
-        prev = curr
-
-    end = points[-1]
-    if not samples:
-        if math.hypot(end[0] - points[0][0], end[1] - points[0][1]) >= min_tail_m:
-            samples.append((end, len(points) - 1))
-    else:
-        last = samples[-1][0]
-        if math.hypot(end[0] - last[0], end[1] - last[1]) >= min_tail_m:
-            samples.append((end, len(points) - 1))
-    return samples
-
-
-def _make_forward_only_action(distance_m: float, *, cfg: StepwiseNavConfig, path_index: int) -> StepwiseAction:
-    distance = float(distance_m)
-    if distance <= 0.0:
-        raise ValueError("forward-only action distance must be positive")
-    duration = _duration_for_translation(distance, cfg)
-    return StepwiseAction(
-        kind=StepwiseActionKind.FORWARD,
-        command=MotionCommand(float(cfg.forward_speed_mps), 0.0, 0.0),
-        duration_s=duration,
-        distance_m=distance,
-        source=cfg.source,
-        metadata={
-            "path_index": int(path_index),
-            "mode": "sync_plan_lookahead_queue",
-            "forward_only": True,
-        },
-    )
-
-
 def path_to_stepwise_actions(
     path_xy_b: Sequence[Sequence[float]],
     *,
@@ -417,46 +346,24 @@ def path_to_stepwise_actions(
 ) -> list[StepwiseAction]:
     """Convert an A* body-frame path into a simple command queue.
 
-    The real G1 does not reliably execute many 5 cm grid-cell commands.  This
-    converter therefore samples the A* polyline into short committed lookahead
-    segments, then emits ``Turn`` followed by pure ``Forward`` commands.  It does
-    not shortcut the path through obstacles; it follows the original A* polyline
-    at a coarser command resolution.
+    The conversion follows the path in order.  For each next grid waypoint, the
+    virtual robot first yaws toward that waypoint when the bearing error exceeds
+    ``min_turn_angle_rad``; then it emits a translation command to that waypoint.
+    Small residual lateral components are kept in the translation command rather
+    than hidden by smoothing.  This implements the intended priority:
 
-    The command invariant is intentionally simple:
-
-    ``yaw toward the next sampled path point -> drive forward -> stop/observe``.
-
-    Lateral velocity is never emitted here.  If the A* start was relocated
-    because the inflated start cell was occupied, command generation still starts
-    from the real body origin; the immediate swept-footprint guard remains
-    responsible for rejecting unsafe first translations.
+    ``yaw first -> translate -> next path point``.
     """
 
     cfg = cfg or StepwiseNavConfig()
-    raw_points = [_as_xy(p, name="path_xy_b point") for p in path_xy_b]
-    if len(raw_points) < 2:
-        return []
-
-    start = _as_xy(cfg.start_xy_b, name="start_xy_b")
-    # Always generate commands from the actual robot body origin, not from a
-    # potentially relocated A* start cell.  This prevents the real runner from
-    # executing actions whose frame starts at a fictitious free cell.
-    points: list[PointXY] = [start]
-    points.extend(raw_points[1:] if math.hypot(raw_points[0][0] - start[0], raw_points[0][1] - start[1]) > 1.0e-6 else raw_points[1:])
-
-    sampled = _sample_polyline_by_distance(
-        points,
-        step_m=float(cfg.forward_segment_m),
-        min_tail_m=float(cfg.min_forward_m),
-    )
-    if not sampled:
+    points = [_as_xy(p, name="path_xy_b point") for p in path_xy_b]
+    if len(points) < 2:
         return []
 
     actions: list[StepwiseAction] = []
-    expected_pose: PoseXYYaw = (float(start[0]), float(start[1]), 0.0)
+    expected_pose: PoseXYYaw = (float(points[0][0]), float(points[0][1]), 0.0)
 
-    for waypoint, path_index in sampled:
+    for path_index, waypoint in enumerate(points[1:], start=1):
         local = _plan_to_body_xy(waypoint, expected_pose)
         distance = math.hypot(local[0], local[1])
         if distance < float(cfg.min_forward_m):
@@ -472,7 +379,7 @@ def path_to_stepwise_actions(
             if distance < float(cfg.min_forward_m):
                 continue
 
-        translate = _make_forward_only_action(distance, cfg=cfg, path_index=path_index)
+        translate = _make_translation_action(local, cfg=cfg, path_index=path_index)
         actions.append(translate)
         expected_pose = _apply_action_to_expected_pose(expected_pose, translate)
 
@@ -571,12 +478,7 @@ def _target_mismatch_m(*, observed_target_xy_b: PointXY, plan_target_xy_b: Point
     )
 
 
-def _inflated_grid(
-    occupancy_grid: torch.Tensor,
-    cfg: StepwiseNavConfig,
-    *,
-    inflation_radius: float | None = None,
-) -> torch.Tensor:
+def _inflated_grid(occupancy_grid: torch.Tensor, cfg: StepwiseNavConfig) -> torch.Tensor:
     grid = occupancy_grid
     if grid.ndim == 3:
         if grid.shape[0] != 1:
@@ -587,7 +489,7 @@ def _inflated_grid(
     return inflate_occupancy_grid(
         grid,
         cfg=cfg.grid_cfg,
-        inflation_radius=float(cfg.astar_cfg.inflation_radius if inflation_radius is None else inflation_radius),
+        inflation_radius=cfg.astar_cfg.inflation_radius,
         occupancy_threshold=cfg.astar_cfg.occupancy_threshold,
     ).to(dtype=torch.bool, device="cpu")
 
@@ -628,22 +530,14 @@ def translation_action_blocked_by_grid(
     if grid.ndim != 2:
         raise ValueError(f"occupancy_grid must have shape [H,W] or [1,H,W], got {tuple(occupancy_grid.shape)}")
     raw_occupied = (grid.detach().cpu() > float(cfg.astar_cfg.occupancy_threshold)).to(dtype=torch.bool)
-    guard_inflation_radius = (
-        float(cfg.astar_cfg.inflation_radius)
-        if cfg.path_block_inflation_radius_m is None
-        else float(cfg.path_block_inflation_radius_m)
-    )
-    inflated = _inflated_grid(grid, cfg, inflation_radius=guard_inflation_radius)
+    inflated = _inflated_grid(grid, cfg)
     height, width = int(inflated.shape[0]), int(inflated.shape[1])
     start_cell = xy_to_grid_cell((0.0, 0.0), cfg.grid_cfg)
     end_cell = xy_to_grid_cell((dx, dy), cfg.grid_cfg)
     effective_start_ignore_m = max(float(cfg.sweep_start_ignore_m), 2.0 * float(cfg.grid_cfg.resolution))
     base_meta: dict[str, Any] = {
         "grid_resolution_m": float(cfg.grid_cfg.resolution),
-        "planning_inflation_radius_m": float(cfg.astar_cfg.inflation_radius),
-        "guard_inflation_radius_m": float(guard_inflation_radius),
-        # Compatibility alias; new readers should prefer guard_inflation_radius_m.
-        "inflation_radius_m": float(guard_inflation_radius),
+        "inflation_radius_m": float(cfg.astar_cfg.inflation_radius),
         "occupancy_threshold": float(cfg.astar_cfg.occupancy_threshold),
         "start_ignore_m": float(effective_start_ignore_m),
         "start_cell": list(start_cell),

@@ -25,9 +25,12 @@ import numpy as np
 import torch
 
 from g1_nav_rl.mapping.occupancy_grid import OccupancyGridCfg, rasterize_points_to_occupancy_grid
+from g1_nav_rl.envs.nav_residual_core import NavResidualCore, NavResidualCoreCfg, NavResidualCoreStep
 from g1_nav_rl.navigation.runtime import NavRuntime, NavRuntimeConfig, NavRuntimeStep
 from g1_nav_rl.navigation.simple_nav import Pose2D, SimpleNavConfig, SimpleNavigator, Target2D
 from g1_nav_rl.planning.grid_astar import GridAStarCfg
+from g1_nav_rl.policies.local_command_policy import TrackerState, tracker_state_from_value
+from g1_nav_rl.policies.rl_residual_policy import RLResidualPolicy, RLResidualPolicyCfg
 
 from .config import AdapterRuntimeConfig
 from .types import Command2D, LidarFrame, RobotObservation
@@ -250,6 +253,156 @@ class LidarTargetNavPolicyRuntime:
         )
 
 
+
+
+@dataclass(frozen=True)
+class RLResidualTargetNavPolicyRuntimeConfig(LidarTargetNavPolicyRuntimeConfig):
+    """Configuration for A* + learned bounded-residual local command runtime."""
+
+    residual_policy_cfg: RLResidualPolicyCfg = field(default_factory=RLResidualPolicyCfg)
+    checkpoint_path: str | None = None
+    device: str = "cpu"
+    source: str = "rl_residual_target_nav_policy"
+
+    @classmethod
+    def from_runtime_config(
+        cls,
+        runtime_config: AdapterRuntimeConfig,
+        *,
+        target: Target2D,
+        checkpoint_path: str | None = None,
+        residual_policy_cfg: RLResidualPolicyCfg | None = None,
+        enable_replanning: bool = False,
+        replan_every: int = 0,
+        inflation_radius_m: float | None = None,
+        max_vx: float | None = None,
+        max_vy: float | None = None,
+        max_wz: float | None = None,
+        command_mode: str = "heading_aligned",
+        device: str = "cpu",
+    ) -> "RLResidualTargetNavPolicyRuntimeConfig":
+        base = LidarTargetNavPolicyRuntimeConfig.from_runtime_config(
+            runtime_config,
+            target=target,
+            enable_replanning=enable_replanning,
+            replan_every=replan_every,
+            inflation_radius_m=inflation_radius_m,
+            max_vx=max_vx,
+            max_vy=max_vy,
+            max_wz=max_wz,
+            command_mode=command_mode,
+        )
+        residual_cfg = residual_policy_cfg or RLResidualPolicyCfg(grid_cfg=base.grid_cfg)
+        residual_cfg = replace(residual_cfg, grid_cfg=base.grid_cfg)
+        return cls(
+            target=base.target,
+            grid_cfg=base.grid_cfg,
+            astar_cfg=base.astar_cfg,
+            nav_cfg=base.nav_cfg,
+            runtime_cfg=base.runtime_cfg,
+            require_lidar=base.require_lidar,
+            require_pose=base.require_pose,
+            default_pose=base.default_pose,
+            residual_policy_cfg=residual_cfg,
+            checkpoint_path=checkpoint_path,
+            device=str(device),
+        )
+
+
+class RLResidualTargetNavPolicyRuntime:
+    """Real/replay runtime for ``A* nominal command + bounded RL residual``.
+
+    This class keeps the same adapter inputs/outputs as
+    :class:`LidarTargetNavPolicyRuntime`, but routes the deterministic command
+    through :class:`g1_nav_rl.policies.RLResidualPolicy` before the external
+    safety supervisor sees it.
+    """
+
+    def __init__(self, config: RLResidualTargetNavPolicyRuntimeConfig) -> None:
+        self.config = config
+        residual_cfg = replace(config.residual_policy_cfg, grid_cfg=config.grid_cfg)
+        policy = RLResidualPolicy(
+            residual_cfg,
+            checkpoint_path=config.checkpoint_path,
+            device=config.device,
+        )
+        core_cfg = NavResidualCoreCfg(
+            grid_cfg=config.grid_cfg,
+            astar_cfg=config.astar_cfg,
+            nav_cfg=config.nav_cfg,
+            runtime_cfg=config.runtime_cfg,
+            residual_policy_cfg=residual_cfg,
+            path_points=int(residual_cfg.path_points),
+        )
+        self.core = NavResidualCore(core_cfg, policy=policy, device=config.device)
+        self._last_target: Target2D = config.target
+        self.last_debug: dict[str, Any] | None = None
+
+    def reset(self) -> None:
+        self.core.reset()
+        self._last_target = self.config.target
+        self.last_debug = None
+
+    def step(self, observation: RobotObservation) -> Command2D:
+        pose = pose_from_observation(
+            observation,
+            default_pose=self.config.default_pose,
+            require_pose=self.config.require_pose,
+        )
+        target = observation.target_hint or self.config.target
+        if target.xy != self._last_target.xy:
+            self.core.reset()
+            self._last_target = target
+
+        occupancy_grid, point_count = occupancy_grid_from_observation(
+            observation,
+            grid_cfg=self.config.grid_cfg,
+            require_lidar=self.config.require_lidar,
+        )
+        target_visible = _metadata_bool(observation.metadata, "target_visible", default=True)
+        target_age_s = _metadata_float(observation.metadata, "target_age_s", default=0.0)
+        tracker_state = _metadata_tracker_state(observation.metadata, default=TrackerState.TRACKING)
+
+        core_step = self.core.step(
+            pose=pose,
+            target=target,
+            occupancy_grid=occupancy_grid,
+            target_visible=target_visible,
+            target_age_s=target_age_s,
+            tracker_state=tracker_state,
+        )
+        command_tensor = core_step.command.detach().cpu()[0]
+        nominal_tensor = core_step.nominal_command.detach().cpu()[0]
+        residual_tensor = None if core_step.residual is None else core_step.residual.detach().cpu()[0]
+        command_tuple = tuple(float(v) for v in command_tensor.tolist())
+
+        nav_debug = make_lidar_nav_debug(
+            runtime_step=core_step.runtime_step,
+            pose=pose,
+            target=target,
+            occupancy_grid=occupancy_grid,
+            lidar_point_count=point_count,
+            command_tuple=command_tuple,
+        ).to_dict()
+        debug = {
+            **nav_debug,
+            "policy": "rl-residual-target-nav",
+            "nominal_command": [float(v) for v in nominal_tensor.tolist()],
+            "residual": None if residual_tensor is None else [float(v) for v in residual_tensor.tolist()],
+            "target_visible": bool(target_visible),
+            "target_age_s": float(target_age_s),
+            "tracker_state": int(tracker_state),
+        }
+        self.last_debug = debug
+        return Command2D(
+            vx=command_tuple[0],
+            vy=command_tuple[1],
+            wz=command_tuple[2],
+            timestamp_s=observation.timestamp_s,
+            source=self.config.source,
+            metadata=debug,
+        )
+
 # Backwards-compatible alias for shorter imports in scripts/tests.
 TargetNavPolicyRuntime = LidarTargetNavPolicyRuntime
 TargetNavPolicyRuntimeConfig = LidarTargetNavPolicyRuntimeConfig
@@ -333,11 +486,40 @@ def make_lidar_nav_debug(
     )
 
 
+def _metadata_bool(metadata: Mapping[str, Any], key: str, *, default: bool) -> bool:
+    value = metadata.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "visible", "tracking"}
+    return bool(value)
+
+
+def _metadata_float(metadata: Mapping[str, Any], key: str, *, default: float) -> float:
+    value = metadata.get(key, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _metadata_tracker_state(metadata: Mapping[str, Any], *, default: TrackerState) -> TrackerState:
+    for key in ("tracker_state", "target_tracker_state", "target_state"):
+        if key in metadata:
+            try:
+                return tracker_state_from_value(metadata[key])
+            except ValueError:
+                return default
+    if not _metadata_bool(metadata, "target_visible", default=True):
+        return TrackerState.LOST
+    return default
+
+
 __all__ = [
     "ConstantVelocityPolicy",
     "LidarTargetNavDebug",
     "LidarTargetNavPolicyRuntime",
     "LidarTargetNavPolicyRuntimeConfig",
+    "RLResidualTargetNavPolicyRuntime",
+    "RLResidualTargetNavPolicyRuntimeConfig",
     "TargetNavPolicyRuntime",
     "TargetNavPolicyRuntimeConfig",
     "make_lidar_nav_debug",

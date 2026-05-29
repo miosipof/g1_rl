@@ -50,6 +50,16 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+
+
+def _debug_value(debug: Any, key: str, default: Any = None) -> Any:
+    if debug is None:
+        return default
+    if isinstance(debug, Mapping):
+        return debug.get(key, default)
+    return getattr(debug, key, default)
+
+
 def _grid_to_uint8_rgb(occupancy_grid: torch.Tensor | np.ndarray) -> np.ndarray:
     """Convert a 2D occupancy grid to an RGB image array."""
 
@@ -292,7 +302,9 @@ class LidarDebugWriter:
         policy_debug = None
         if policy is not None and hasattr(policy, "last_debug"):
             debug = getattr(policy, "last_debug")
-            if debug is not None and hasattr(debug, "to_dict"):
+            if isinstance(debug, Mapping):
+                policy_debug = dict(debug)
+            elif debug is not None and hasattr(debug, "to_dict"):
                 policy_debug = debug.to_dict()
 
         return _json_safe(
@@ -354,19 +366,19 @@ class LidarDebugWriter:
             "safe_wz": "" if safe is None else f"{float(safe.wz):.6f}",
             "lidar_points": 0 if obs is None or obs.lidar is None else obs.lidar.point_count,
             "occupied_cells": int((occupancy_grid > 0.0).sum().item()),
-            "plan_found": "" if policy_debug is None else bool(policy_debug.plan_found),
-            "waypoint_index": "" if policy_debug is None else int(policy_debug.waypoint_index),
-            "waypoint_count": "" if policy_debug is None else int(policy_debug.waypoint_count),
-            "target_distance": "" if policy_debug is None else f"{float(policy_debug.target_distance):.6f}",
-            "command_mode": "" if policy_debug is None else str(getattr(policy_debug, "command_mode", "")),
-            "waypoint_x_b": "" if policy_debug is None or getattr(policy_debug, "waypoint_xy_b", None) is None else f"{float(policy_debug.waypoint_xy_b[0]):.6f}",
-            "waypoint_y_b": "" if policy_debug is None or getattr(policy_debug, "waypoint_xy_b", None) is None else f"{float(policy_debug.waypoint_xy_b[1]):.6f}",
-            "bearing_error": "" if policy_debug is None or getattr(policy_debug, "bearing_error", None) is None else f"{float(policy_debug.bearing_error):.6f}",
-            "heading_alignment_scale": "" if policy_debug is None or getattr(policy_debug, "heading_alignment_scale", None) is None else f"{float(policy_debug.heading_alignment_scale):.6f}",
-            "heading_turn_in_place": "" if policy_debug is None else bool(getattr(policy_debug, "heading_turn_in_place", False)),
-            "raw_vx": "" if policy_debug is None or getattr(policy_debug, "raw_command", None) is None else f"{float(policy_debug.raw_command[0]):.6f}",
-            "raw_vy": "" if policy_debug is None or getattr(policy_debug, "raw_command", None) is None else f"{float(policy_debug.raw_command[1]):.6f}",
-            "raw_wz": "" if policy_debug is None or getattr(policy_debug, "raw_command", None) is None else f"{float(policy_debug.raw_command[2]):.6f}",
+            "plan_found": "" if policy_debug is None else bool(_debug_value(policy_debug, "plan_found", False)),
+            "waypoint_index": "" if policy_debug is None else int(_debug_value(policy_debug, "waypoint_index", 0)),
+            "waypoint_count": "" if policy_debug is None else int(_debug_value(policy_debug, "waypoint_count", 0)),
+            "target_distance": "" if policy_debug is None else f"{float(_debug_value(policy_debug, 'target_distance', 0.0)):.6f}",
+            "command_mode": "" if policy_debug is None else str(_debug_value(policy_debug, "command_mode", "")),
+            "waypoint_x_b": "" if policy_debug is None or _debug_value(policy_debug, "waypoint_xy_b") is None else f"{float(_debug_value(policy_debug, 'waypoint_xy_b')[0]):.6f}",
+            "waypoint_y_b": "" if policy_debug is None or _debug_value(policy_debug, "waypoint_xy_b") is None else f"{float(_debug_value(policy_debug, 'waypoint_xy_b')[1]):.6f}",
+            "bearing_error": "" if policy_debug is None or _debug_value(policy_debug, "bearing_error") is None else f"{float(_debug_value(policy_debug, 'bearing_error')):.6f}",
+            "heading_alignment_scale": "" if policy_debug is None or _debug_value(policy_debug, "heading_alignment_scale") is None else f"{float(_debug_value(policy_debug, 'heading_alignment_scale')):.6f}",
+            "heading_turn_in_place": "" if policy_debug is None else bool(_debug_value(policy_debug, "heading_turn_in_place", False)),
+            "raw_vx": "" if policy_debug is None or _debug_value(policy_debug, "raw_command") is None else f"{float(_debug_value(policy_debug, 'raw_command')[0]):.6f}",
+            "raw_vy": "" if policy_debug is None or _debug_value(policy_debug, "raw_command") is None else f"{float(_debug_value(policy_debug, 'raw_command')[1]):.6f}",
+            "raw_wz": "" if policy_debug is None or _debug_value(policy_debug, "raw_command") is None else f"{float(_debug_value(policy_debug, 'raw_command')[2]):.6f}",
             "safety_reasons": "" if decision is None else ";".join(decision.reasons),
             "safety_warnings": "" if decision is None else ";".join(decision.warnings),
         }
