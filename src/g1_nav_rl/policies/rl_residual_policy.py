@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -35,6 +35,52 @@ class RLResidualPolicyCfg:
     activation: str = "elu"
     grid_cfg: OccupancyGridCfg = field(default_factory=OccupancyGridCfg)
     source: str = "rl_residual_policy"
+
+    @classmethod
+    def from_mapping(cls, cfg: Mapping[str, Any] | None) -> "RLResidualPolicyCfg":
+        """Build a policy config from YAML/checkpoint mappings.
+
+        Accepted keys use either the public training-config names
+        (``residual_limits: {vx, vy, wz}``) or the dataclass field names.
+        """
+        if cfg is None:
+            return cls()
+        grid_raw = cfg.get("grid_cfg", cfg.get("grid")) if isinstance(cfg, Mapping) else None
+        if isinstance(grid_raw, OccupancyGridCfg):
+            grid_cfg = grid_raw
+        elif isinstance(grid_raw, Mapping):
+            grid_cfg = OccupancyGridCfg.from_mapping(grid_raw)
+        else:
+            grid_cfg = OccupancyGridCfg()
+        limits = cfg.get("residual_limits", {}) if isinstance(cfg.get("residual_limits", {}), Mapping) else {}
+        hidden = cfg.get("hidden_sizes", cls.hidden_sizes)
+        return cls(
+            path_points=int(cfg.get("path_points", cls.path_points)),
+            use_clearance_features=bool(cfg.get("use_clearance_features", cls.use_clearance_features)),
+            use_curvature_features=bool(cfg.get("use_curvature_features", cls.use_curvature_features)),
+            residual_limit_vx=float(limits.get("vx", cfg.get("residual_limit_vx", cls.residual_limit_vx))),
+            residual_limit_vy=float(limits.get("vy", cfg.get("residual_limit_vy", cls.residual_limit_vy))),
+            residual_limit_wz=float(limits.get("wz", cfg.get("residual_limit_wz", cls.residual_limit_wz))),
+            hidden_sizes=tuple(int(v) for v in hidden),
+            activation=str(cfg.get("activation", cls.activation)),
+            grid_cfg=grid_cfg,
+            source=str(cfg.get("source", cls.source)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a checkpoint/YAML-safe representation."""
+        return {
+            "path_points": int(self.path_points),
+            "use_clearance_features": bool(self.use_clearance_features),
+            "use_curvature_features": bool(self.use_curvature_features),
+            "residual_limit_vx": float(self.residual_limit_vx),
+            "residual_limit_vy": float(self.residual_limit_vy),
+            "residual_limit_wz": float(self.residual_limit_wz),
+            "hidden_sizes": [int(v) for v in self.hidden_sizes],
+            "activation": str(self.activation),
+            "grid_cfg": asdict(self.grid_cfg),
+            "source": str(self.source),
+        }
 
     def feature_dim(self) -> int:
         # target xy + distance + bearing
@@ -127,7 +173,27 @@ def build_compact_residual_features(policy_input: LocalPolicyInput, cfg: RLResid
         if x.occupancy_grid is None:
             clearance = torch.full((n, 3), 6.0, dtype=torch.float32, device=device)
         else:
-            clearance = clearance_sectors_from_grid(x.occupancy_grid, cfg.grid_cfg).to(device=device)
+            grid_for_features = cfg.grid_cfg
+            if (
+                x.occupancy_grid.shape[1] != cfg.grid_cfg.height
+                or x.occupancy_grid.shape[2] != cfg.grid_cfg.width
+            ):
+                # Checkpoints may be trained with a coarser synthetic grid than
+                # the real runtime grid. Clearance features only need the same
+                # body-frame extent, so infer resolution from the actual tensor
+                # instead of failing on shape mismatch.
+                inferred_res_x = (float(cfg.grid_cfg.x_max) - float(cfg.grid_cfg.x_min)) / float(x.occupancy_grid.shape[1])
+                inferred_res_y = (float(cfg.grid_cfg.y_max) - float(cfg.grid_cfg.y_min)) / float(x.occupancy_grid.shape[2])
+                inferred_res = 0.5 * (inferred_res_x + inferred_res_y)
+                grid_for_features = OccupancyGridCfg(
+                    x_min=cfg.grid_cfg.x_min,
+                    x_max=cfg.grid_cfg.x_max,
+                    y_min=cfg.grid_cfg.y_min,
+                    y_max=cfg.grid_cfg.y_max,
+                    resolution=inferred_res,
+                    occupied_value=cfg.grid_cfg.occupied_value,
+                )
+            clearance = clearance_sectors_from_grid(x.occupancy_grid, grid_for_features).to(device=device)
             # Normalize to roughly [0,1] without losing monotonicity.
             clearance = clearance / 6.0
         parts.append(clearance)
@@ -171,6 +237,13 @@ class RLResidualPolicy:
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> None:
         checkpoint = torch.load(Path(checkpoint_path), map_location=self.device)
+        if isinstance(checkpoint, Mapping) and "policy_cfg" in checkpoint and isinstance(checkpoint["policy_cfg"], Mapping):
+            loaded_cfg = RLResidualPolicyCfg.from_mapping(checkpoint["policy_cfg"])
+            if loaded_cfg.feature_dim() != self.cfg.feature_dim() or tuple(loaded_cfg.hidden_sizes) != tuple(self.cfg.hidden_sizes):
+                self.cfg = loaded_cfg
+                self.model = ResidualMLP(self.cfg.model_cfg()).to(self.device)
+            else:
+                self.cfg = loaded_cfg
         if isinstance(checkpoint, Mapping) and "model_state_dict" in checkpoint:
             state_dict = checkpoint["model_state_dict"]
         elif isinstance(checkpoint, Mapping) and "policy_state_dict" in checkpoint:
@@ -178,6 +251,7 @@ class RLResidualPolicy:
         else:
             state_dict = checkpoint
         self.model.load_state_dict(state_dict)
+        self.model.to(self.device)
 
     def step(self, policy_input: LocalPolicyInput) -> LocalPolicyOutput:
         x = policy_input.to(self.device)

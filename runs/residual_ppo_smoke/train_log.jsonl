@@ -1,0 +1,1 @@
+{"iteration": 1, "steps": 128, "mean_reward": 0.000649500114377588, "mean_return": 0.10480562597513199, "success_rate_terminal": 0.0, "success_count": 0.0, "collision_count": 0.0, "timeout_count": 0.0, "mean_distance": 3.8658141158521175, "approx_kl": 0.3617820143699646, "log_std": [-0.7002978920936584, -0.7002978920936584, -0.7002978920936584]}

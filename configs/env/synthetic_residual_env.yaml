@@ -1,0 +1,48 @@
+# Fast Isaac-independent residual-navigation training environment.
+# This uses the same compact feature schema as the real runtime, but a coarser
+# occupancy grid so local PPO/BC data generation is practical on CPU.
+grid:
+  x_min: -2.0
+  x_max: 6.0
+  y_min: -4.0
+  y_max: 4.0
+  resolution: 0.10
+  occupied_value: 1.0
+
+residual_policy:
+  path_points: 8
+  path_spacing_m: 0.25
+  residual_limit_vx: 0.10
+  residual_limit_vy: 0.10
+  residual_limit_wz: 0.25
+  hidden_sizes: [128, 128]
+  activation: elu
+  use_clearance_features: true
+  use_curvature_features: true
+
+env:
+  type: synthetic_residual_nav
+  num_envs: 32
+  episode_length: 300
+  control_dt: 0.10
+  success_radius: 0.55
+  robot_radius: 0.30
+  obstacle_count: 2
+  replan_every: 10
+  command_delay_steps_max: 1
+  target_occlusion_prob: 0.10
+  noisy_target_std_m: 0.02
+  lidar_dropout_prob: 0.00
+
+planner:
+  astar:
+    inflation_radius: 0.35
+    allow_diagonal: true
+    heuristic_weight: 1.0
+    max_expansions: 20000
+  nav:
+    command_mode: heading_aligned
+    max_vx: 0.30
+    max_vy: 0.20
+    max_wz: 0.60
+    path_lookahead_m: 0.40

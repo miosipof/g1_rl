@@ -1,0 +1,17 @@
+{
+  "total_steps": 64,
+  "rollout_steps": 64,
+  "learning_rate": 0.0003,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "entropy_coef": 0.005,
+  "value_loss_coef": 1.0,
+  "max_grad_norm": 1.0,
+  "update_epochs": 4,
+  "minibatch_size": 512,
+  "target_kl": 0.05,
+  "log_interval": 5,
+  "checkpoint_interval": 25,
+  "seed": 0
+}
