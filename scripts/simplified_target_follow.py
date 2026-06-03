@@ -147,8 +147,15 @@ def _read_best_stream_target(
 
     best = max(candidates, key=lambda t: float(t.confidence))
     x, y = best.target_body_xy  # type: ignore[misc]
-    target = Target2D(x=float(x), y=float(y), confidence=float(best.confidence), source="stream_best_detection")
+
+    # Target2D in this repo baseline is intentionally minimal: only x/y.
+    # Keep confidence/source/track details in stream metadata, not in the
+    # navigation target object.
+    target = Target2D(float(x), float(y))
     meta["selected_track"] = best.to_dict()
+    meta["selected_target_xy_b"] = [float(x), float(y)]
+    meta["selected_confidence"] = float(best.confidence)
+    meta["selected_source"] = "stream_best_detection"
     return target, meta
 
 
