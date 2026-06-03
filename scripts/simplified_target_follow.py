@@ -17,7 +17,7 @@ Deliberately omitted in this script:
   - command odometry
   - continuous SafetySupervisor
   - lateral velocity commands
-  - start/goal relocation by default
+  - start relocation by default; goal-only relocation is allowed for occupied target stand-off cells
   - stop after every primitive
 
 The only runtime guard kept is an optional raw front-distance emergency stop.
@@ -378,6 +378,167 @@ def _make_burst_commands(
     }
 
 
+
+
+def _angle_normalize(rad: float) -> float:
+    return math.atan2(math.sin(float(rad)), math.cos(float(rad)))
+
+
+def _cumulative_path_lengths(path_xy_b: Sequence[Sequence[float]]) -> list[float]:
+    lengths = [0.0]
+    for prev, curr in zip(path_xy_b[:-1], path_xy_b[1:]):
+        lengths.append(lengths[-1] + math.hypot(float(curr[0]) - float(prev[0]), float(curr[1]) - float(prev[1])))
+    return lengths
+
+
+def _sample_path_at_distance(path_xy_b: Sequence[Sequence[float]], distance_m: float) -> tuple[float, float] | None:
+    if not path_xy_b:
+        return None
+    if len(path_xy_b) == 1 or float(distance_m) <= 0.0:
+        return (float(path_xy_b[0][0]), float(path_xy_b[0][1]))
+    remaining = float(distance_m)
+    prev = path_xy_b[0]
+    for curr in path_xy_b[1:]:
+        seg = math.hypot(float(curr[0]) - float(prev[0]), float(curr[1]) - float(prev[1]))
+        if seg <= 1e-9:
+            prev = curr
+            continue
+        if remaining <= seg:
+            t = remaining / seg
+            return (
+                float(prev[0]) + t * (float(curr[0]) - float(prev[0])),
+                float(prev[1]) + t * (float(curr[1]) - float(prev[1])),
+            )
+        remaining -= seg
+        prev = curr
+    return (float(path_xy_b[-1][0]), float(path_xy_b[-1][1]))
+
+
+def _make_open_loop_command_queue(
+    *,
+    plan: GridAStarResult,
+    target: Target2D,
+    forward_speed_mps: float,
+    checkpoint_period_s: float,
+    waypoint_spacing_m: float,
+    min_turn_angle_rad: float,
+    turn_speed_radps: float,
+    turn_angle_max_rad: float,
+    target_reached_radius_m: float,
+) -> tuple[list[Command2D], dict[str, Any]]:
+    """Convert a fresh body-frame A* path into a relative yaw/forward queue.
+
+    This queue is only generated from a fresh target observation.  If the target
+    is later temporarily missing, the runner may continue this already-committed
+    queue, but it must not run a new A* plan to an old body-frame target.  This
+    is the key distinction that keeps occlusion handling geometrically sane
+    without relying on command odometry.
+    """
+    dist_to_target = math.hypot(float(target.x), float(target.y))
+    if dist_to_target <= float(target_reached_radius_m):
+        return [], {"reason": "target_reached", "target_distance_m": dist_to_target}
+    if not plan.found or len(plan.path_xy_b) < 2:
+        return [], {"reason": "no_plan", "plan_reason": plan.reason}
+
+    path_len = _path_length(plan.path_xy_b)
+    if path_len <= 1e-6:
+        return [], {"reason": "empty_path", "path_length_m": path_len}
+
+    spacing = max(0.15, float(waypoint_spacing_m))
+    sample_distances = []
+    d = spacing
+    while d < path_len:
+        sample_distances.append(d)
+        d += spacing
+    sample_distances.append(path_len)
+
+    x = 0.0
+    y = 0.0
+    theta = 0.0
+    commands: list[Command2D] = []
+    waypoints: list[list[float]] = []
+
+    for d in sample_distances:
+        sample = _sample_path_at_distance(plan.path_xy_b, d)
+        if sample is None:
+            continue
+        wx, wy = float(sample[0]), float(sample[1])
+        dx = wx - x
+        dy = wy - y
+        dist = math.hypot(dx, dy)
+        if dist < 0.05:
+            continue
+        desired = math.atan2(dy, dx)
+        turn_remaining = _angle_normalize(desired - theta)
+        while abs(turn_remaining) >= float(min_turn_angle_rad):
+            step = max(-float(turn_angle_max_rad), min(float(turn_angle_max_rad), turn_remaining))
+            duration = abs(step) / max(1e-6, float(turn_speed_radps))
+            wz = math.copysign(float(turn_speed_radps), step)
+            commands.append(Command2D(0.0, 0.0, wz, duration_s=max(0.05, duration), source="simplified_target_follow_turn", metadata={"turn_angle_rad": step, "waypoint_xy_b": [wx, wy]}))
+            theta = _angle_normalize(theta + step)
+            turn_remaining = _angle_normalize(desired - theta)
+            # Avoid pathological command queues if turn_angle_max is tiny.
+            if len(commands) > 512:
+                break
+        forward_duration = dist / max(1e-6, float(forward_speed_mps))
+        if forward_duration >= 0.10:
+            commands.append(Command2D(float(forward_speed_mps), 0.0, 0.0, duration_s=forward_duration, source="simplified_target_follow_forward", metadata={"waypoint_xy_b": [wx, wy]}))
+        # The command queue is an open-loop approximation of the planned path.
+        # Advance the virtual pose to the sampled path waypoint.
+        x, y = wx, wy
+        waypoints.append([wx, wy])
+
+    return commands, {
+        "reason": "queue_ready" if commands else "empty_command_queue",
+        "target_distance_m": dist_to_target,
+        "path_length_m": path_len,
+        "queue_command_count": len(commands),
+        "waypoint_count": len(waypoints),
+        "waypoint_spacing_m": spacing,
+        "checkpoint_period_s": float(checkpoint_period_s),
+        "first_waypoint_xy_b": None if not waypoints else waypoints[0],
+        "last_waypoint_xy_b": None if not waypoints else waypoints[-1],
+    }
+
+
+def _copy_command_with_duration(command: Command2D, duration_s: float) -> Command2D:
+    return Command2D(
+        float(command.vx),
+        float(command.vy),
+        float(command.wz),
+        timestamp_s=command.timestamp_s,
+        duration_s=float(duration_s),
+        source=command.source,
+        metadata=dict(command.metadata),
+    )
+
+
+def _pop_command_burst(queue: list[Command2D], max_duration_s: float) -> tuple[list[Command2D], dict[str, Any]]:
+    """Pop commands from a persistent queue, splitting long commands if needed."""
+    remaining = max(0.0, float(max_duration_s))
+    burst: list[Command2D] = []
+    consumed = 0.0
+    while queue and remaining > 1e-6:
+        cmd = queue[0]
+        dur = float(cmd.duration_s or 0.0)
+        if dur <= 1e-6:
+            queue.pop(0)
+            continue
+        if dur <= remaining + 1e-6:
+            burst.append(queue.pop(0))
+            remaining -= dur
+            consumed += dur
+        else:
+            burst.append(_copy_command_with_duration(cmd, remaining))
+            queue[0] = _copy_command_with_duration(cmd, dur - remaining)
+            consumed += remaining
+            remaining = 0.0
+    return burst, {
+        "burst_duration_s": consumed,
+        "queue_remaining_commands": len(queue),
+        "queue_empty_after_pop": not bool(queue),
+    }
+
 def _send_command_for_duration(
     *,
     sink: UnitreeLocoAdapter,
@@ -442,7 +603,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-min-confidence", type=float, default=0.10)
     p.add_argument("--target-min-depth-valid-ratio", type=float, default=0.0)
     p.add_argument("--initial-target-timeout-s", type=float, default=20.0)
-    p.add_argument("--target-missing-policy", choices=["reuse_last", "stop"], default="reuse_last")
+    p.add_argument(
+        "--target-missing-policy",
+        choices=["continue_plan", "stop", "reuse_last"],
+        default="continue_plan",
+        help="When the stream has no current target at a checkpoint: continue_plan executes the previously generated open-loop queue; stop stops. reuse_last is accepted as a deprecated alias for continue_plan and does not replan to stale body-frame coordinates.",
+    )
 
     p.add_argument("--max-cycles", type=int, default=10)
     p.add_argument("--checkpoint-period-s", type=float, default=2.5)
@@ -557,8 +723,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "real_motion": real_motion,
         "simple_contract": {
             "target_selection": "best current stream detection, no target lock, no track-id persistence",
-            "planning": "A* on current Livox occupancy grid from body origin; goal-only relocation around occupied target stand-off is allowed",
-            "execution": "yaw-first/forward-only burst, stop only at checkpoint",
+            "planning": "A* on current Livox occupancy grid from body origin; goal-only relocation around occupied target stand-off is allowed; stale body-frame targets are never replanned",
+            "execution": "yaw-first/forward-only burst, stop only at checkpoint; if target is temporarily missing, optionally continue the previously generated open-loop queue",
             "disabled": [
                 "StepwiseTargetNavPolicyRuntime",
                 "PrimaryTargetLock",
@@ -589,6 +755,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     exit_code = 0
     last_target: Target2D | None = None
+    active_queue: list[Command2D] = []
     livox_adapter.start()
     sink.connect()
     sink.arm()
@@ -619,11 +786,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 require_fresh=True,
             )
             target_source = "current_stream"
+            target_missing_policy = str(args.target_missing_policy)
+            if target_missing_policy == "reuse_last":
+                # Backward-compatible CLI spelling.  The old behavior replanned
+                # to a stale body-frame target after robot motion, which is
+                # geometrically invalid and caused obstacle runs to turn/replan
+                # erratically.  Treat it as continue_plan instead.
+                target_missing_policy = "continue_plan"
             if current_target is not None:
                 last_target = current_target
-            elif args.target_missing_policy == "reuse_last" and last_target is not None:
-                current_target = last_target
-                target_source = "last_known_reused"
+            elif target_missing_policy == "continue_plan" and active_queue:
+                target_source = "active_plan_continued_target_missing"
             else:
                 current_target = None
                 target_source = "missing_stop"
@@ -642,12 +815,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             commands: list[Command2D] = []
             command_meta: dict[str, Any] = {"reason": "no_target"}
             emergency_stop = False
-            if current_target is None:
-                command_meta = {"reason": "target_missing"}
-            elif (not args.disable_emergency_front_stop) and front_min is not None and front_min <= float(args.emergency_front_stop_m):
+            if (not args.disable_emergency_front_stop) and front_min is not None and front_min <= float(args.emergency_front_stop_m):
                 emergency_stop = True
                 command_meta = {"reason": "emergency_front_stop", "front_min_m": front_min}
-            else:
+            elif current_target is not None:
+                # Fresh target: replan in the current body frame, then replace
+                # the open-loop queue.  This is the only place where A* is
+                # allowed to consume a body-frame target coordinate.
                 plan, plan_meta = _plan_with_goal_relocation(
                     occupancy=occupancy,
                     target=current_target,
@@ -657,18 +831,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                     allow_goal_relocation=bool(args.allow_goal_relocation),
                     max_goal_relocation_m=float(args.goal_relocation_radius_m),
                 )
-                commands, command_meta = _make_burst_commands(
+                new_queue, queue_meta = _make_open_loop_command_queue(
                     plan=plan,
                     target=current_target,
                     forward_speed_mps=float(args.forward_speed_mps),
                     checkpoint_period_s=float(args.checkpoint_period_s),
-                    lookahead_m=float(args.lookahead_m),
+                    waypoint_spacing_m=float(args.lookahead_m),
                     min_turn_angle_rad=math.radians(float(args.min_turn_angle_deg)),
                     turn_speed_radps=float(args.turn_speed_radps),
                     turn_angle_max_rad=math.radians(float(args.turn_angle_max_deg)),
                     target_reached_radius_m=float(args.target_reached_radius_m),
                 )
-                command_meta = dict(command_meta) | {"plan_goal": plan_meta}
+                active_queue = list(new_queue)
+                commands, pop_meta = _pop_command_burst(active_queue, float(args.checkpoint_period_s))
+                command_meta = dict(queue_meta) | {"plan_goal": plan_meta, "queue_pop": pop_meta, "reason": "commands_ready" if commands else queue_meta.get("reason", "empty_command_queue")}
+            elif target_source == "active_plan_continued_target_missing" and active_queue:
+                # No fresh target at this checkpoint.  Continue the previously
+                # generated relative command queue, but do NOT replan using
+                # last_target because it is expressed in an old body frame.
+                commands, pop_meta = _pop_command_burst(active_queue, float(args.checkpoint_period_s))
+                command_meta = {
+                    "reason": "active_plan_continued_target_missing" if commands else "active_plan_empty_target_missing",
+                    "queue_pop": pop_meta,
+                    "stale_body_target_replan_blocked": True,
+                    "last_target_xy_b_for_logging_only": None if last_target is None else [float(last_target.x), float(last_target.y)],
+                }
+            else:
+                command_meta = {
+                    "reason": "target_missing",
+                    "stale_body_target_replan_blocked": True,
+                    "active_queue_len": len(active_queue),
+                }
 
             # Debug image before motion.
             image_path = debug_base / f"occupancy_grid_cycle_{cycle:06d}.png"
@@ -700,6 +893,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "target_xy_b": None if current_target is None else [float(current_target.x), float(current_target.y)],
                 "target_source": target_source,
                 "target_stream": target_meta,
+                "active_queue_len_after_decision": len(active_queue),
                 "lidar_point_count": int(lidar.point_count),
                 "front_min_m": front_min,
                 "emergency_stop": emergency_stop,
