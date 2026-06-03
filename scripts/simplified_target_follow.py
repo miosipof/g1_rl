@@ -62,7 +62,7 @@ from adapters.config import CommandLimitsConfig
 from adapters.lidar_debug import save_occupancy_debug_image
 from adapters.real_livox import LivoxAdapterConfig, UnitreeVibesLivox2Adapter, UnitreeVibesLivox2AdapterConfig
 from g1_nav_rl.mapping.occupancy_grid import OccupancyGridCfg, rasterize_points_to_occupancy_grid
-from g1_nav_rl.planning.grid_astar import GridAStarCfg, GridAStarResult, grid_cell_to_xy, plan_grid_path_xy, xy_to_grid_cell
+from g1_nav_rl.planning.grid_astar import GridAStarCfg, GridAStarResult, grid_cell_to_xy, plan_grid_path_xy, xy_to_grid_cell, inflate_occupancy_grid
 
 
 def _json_safe(value: Any) -> Any:
@@ -327,6 +327,126 @@ def _raw_front_min(points_body_xyz: np.ndarray, *, corridor_half_width_m: float,
     if not np.any(keep):
         return None
     return float(np.min(x[keep]))
+
+
+def _preview_command_burst(queue: Sequence[Command2D], max_duration_s: float) -> list[Command2D]:
+    """Return the next checkpoint-sized burst without mutating ``queue``."""
+
+    remaining = float(max_duration_s)
+    burst: list[Command2D] = []
+    for cmd in queue:
+        if remaining <= 1e-9:
+            break
+        duration = float(cmd.duration_s or 0.0)
+        if duration <= 1e-9:
+            continue
+        used = min(duration, remaining)
+        burst.append(_copy_command_with_duration(cmd, used))
+        remaining -= used
+        if used < duration:
+            break
+    return burst
+
+
+def _validate_burst_against_occupancy(
+    *,
+    occupancy: torch.Tensor,
+    grid_cfg: OccupancyGridCfg,
+    commands: Sequence[Command2D],
+    guard_inflation_m: float,
+    occupancy_threshold: float,
+    start_ignore_m: float,
+    sample_step_m: float,
+) -> dict[str, Any]:
+    """Validate the next open-loop command burst against the current LiDAR grid.
+
+    This is intentionally narrower than the old path_block guard: it does not
+    trigger from target loss, it does not replan by itself, and it only checks
+    the commands that are already about to be executed.  A blocked result means
+    the *current obstacle map* invalidated the active queue.
+    """
+
+    meta: dict[str, Any] = {
+        "checked": True,
+        "clear": True,
+        "reason": "clear",
+        "command_count": len(commands),
+        "guard_inflation_m": float(guard_inflation_m),
+        "start_ignore_m": float(start_ignore_m),
+        "sample_step_m": float(sample_step_m),
+    }
+    if not commands:
+        meta["reason"] = "empty_burst"
+        return meta
+
+    inflated = inflate_occupancy_grid(
+        occupancy,
+        cfg=grid_cfg,
+        inflation_radius=max(0.0, float(guard_inflation_m)),
+        occupancy_threshold=float(occupancy_threshold),
+    )
+    height, width = int(inflated.shape[0]), int(inflated.shape[1])
+
+    x = 0.0
+    y = 0.0
+    theta = 0.0
+    total_forward_m = 0.0
+    checked_samples = 0
+
+    for command_index, cmd in enumerate(commands):
+        duration = max(0.0, float(cmd.duration_s or 0.0))
+        vx = float(cmd.vx)
+        wz = float(cmd.wz)
+        if duration <= 1e-9:
+            continue
+        if abs(vx) > 1e-9:
+            distance = vx * duration
+            # This simplified runner should only use forward commands; still
+            # handle negative distances conservatively by sampling the segment.
+            steps = max(1, int(math.ceil(abs(distance) / max(1e-3, float(sample_step_m)))))
+            x0, y0 = x, y
+            for i in range(1, steps + 1):
+                frac = i / steps
+                s = distance * frac
+                px = x0 + s * math.cos(theta)
+                py = y0 + s * math.sin(theta)
+                if abs(s) <= float(start_ignore_m) and total_forward_m <= 1e-9:
+                    continue
+                cell = xy_to_grid_cell((px, py), grid_cfg)
+                row, col = cell
+                checked_samples += 1
+                if row < 0 or row >= height or col < 0 or col >= width:
+                    meta.update({
+                        "clear": False,
+                        "reason": "sample_out_of_grid",
+                        "blocked_command_index": command_index,
+                        "blocked_xy_b": [float(px), float(py)],
+                        "blocked_cell": [int(row), int(col)],
+                        "checked_samples": checked_samples,
+                    })
+                    return meta
+                if bool(inflated[row, col].item()):
+                    meta.update({
+                        "clear": False,
+                        "reason": "inflated_occupancy_on_queued_burst",
+                        "blocked_command_index": command_index,
+                        "blocked_xy_b": [float(px), float(py)],
+                        "blocked_cell": [int(row), int(col)],
+                        "checked_samples": checked_samples,
+                    })
+                    return meta
+            x = x0 + distance * math.cos(theta)
+            y = y0 + distance * math.sin(theta)
+            total_forward_m += abs(distance)
+        if abs(wz) > 1e-9:
+            theta = _angle_normalize(theta + wz * duration)
+
+    meta.update({
+        "checked_samples": checked_samples,
+        "preview_end_xyyaw_b": [float(x), float(y), float(theta)],
+        "preview_forward_m": float(total_forward_m),
+    })
+    return meta
 
 
 def _integrate_open_loop_pose(
@@ -716,6 +836,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="When the target is temporarily missing, allow obstacle-triggered replanning toward the active goal estimated from executed command bursts. Target loss alone still does not trigger a replan.",
     )
 
+    p.add_argument(
+        "--validate-active-queue-with-lidar",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Before continuing an active open-loop queue while the target is missing, validate the next checkpoint-sized burst against the current LiDAR occupancy grid. If blocked, the replan reason is obstacle/path blockage, not target missing.",
+    )
+    p.add_argument("--queued-segment-guard-inflation-m", type=float, default=0.25)
+    p.add_argument("--queued-segment-start-ignore-m", type=float, default=0.15)
+    p.add_argument("--queued-segment-sample-step-m", type=float, default=0.05)
+
     p.add_argument("--livox-frame-time", type=float, default=0.20)
     p.add_argument("--livox-frame-packets", type=int, default=120)
     p.add_argument("--livox-timeout", type=float, default=2.0)
@@ -906,6 +1036,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "front_min_m": front_min,
                     "threshold_m": obstacle_replan_front_m,
                 }
+
+            queue_validation: dict[str, Any] = {"checked": False, "reason": "not_applicable"}
+            if (
+                bool(args.validate_active_queue_with_lidar)
+                and target_source == "active_plan_continued_target_missing"
+                and active_queue
+                and not obstacle_replan_requested
+            ):
+                preview = _preview_command_burst(active_queue, float(args.checkpoint_period_s))
+                queue_validation = _validate_burst_against_occupancy(
+                    occupancy=occupancy,
+                    grid_cfg=grid_cfg,
+                    commands=preview,
+                    guard_inflation_m=float(args.queued_segment_guard_inflation_m),
+                    occupancy_threshold=float(args.occupancy_threshold),
+                    start_ignore_m=float(args.queued_segment_start_ignore_m),
+                    sample_step_m=float(args.queued_segment_sample_step_m),
+                )
+                if not bool(queue_validation.get("clear", True)):
+                    obstacle_replan_requested = True
+                    obstacle_replan_trigger = {
+                        "requested": True,
+                        "reason": "active_queue_blocked_by_current_lidar",
+                        "queue_validation": queue_validation,
+                    }
+
             if (not args.disable_emergency_front_stop) and front_min is not None and front_min <= float(args.emergency_front_stop_m):
                 emergency_stop = True
                 if bool(args.clear_queue_on_emergency_stop):
@@ -915,6 +1071,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "front_min_m": front_min,
                     "active_queue_cleared": bool(args.clear_queue_on_emergency_stop),
                     "obstacle_replan_trigger": obstacle_replan_trigger,
+                    "queue_validation": queue_validation,
                 }
             elif current_target is not None or (obstacle_replan_requested and bool(args.obstacle_replan_with_estimated_goal) and active_goal_xy_at_plan_b is not None):
                 # Fresh target: replan in the current body frame.
@@ -934,6 +1091,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "reason": "obstacle_replan_missing_goal",
                         "stale_body_target_replan_blocked": True,
                         "obstacle_replan_trigger": obstacle_replan_trigger,
+                        "queue_validation": queue_validation,
                     }
                 else:
                     if current_target is None:
@@ -970,6 +1128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "queue_pop": pop_meta,
                         "planning_source": planning_source,
                         "obstacle_replan_trigger": obstacle_replan_trigger,
+                        "queue_validation": queue_validation,
                         "reason": "obstacle_replan_commands_ready" if (obstacle_replan_requested and current_target is None and commands) else ("commands_ready" if commands else queue_meta.get("reason", "empty_command_queue")),
                     }
             elif target_source == "active_plan_continued_target_missing" and active_queue:
@@ -985,6 +1144,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "queue_pop": pop_meta,
                     "stale_body_target_replan_blocked": True,
                     "obstacle_replan_trigger": obstacle_replan_trigger,
+                    "queue_validation": queue_validation,
                     "last_target_xy_b_for_logging_only": None if last_target is None else [float(last_target.x), float(last_target.y)],
                     "active_goal_estimated_xy_b": None if estimated_goal is None else [float(estimated_goal.x), float(estimated_goal.y)],
                 }
@@ -993,6 +1153,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "reason": "target_missing",
                     "stale_body_target_replan_blocked": True,
                     "obstacle_replan_trigger": obstacle_replan_trigger,
+                    "queue_validation": queue_validation,
                     "active_queue_len": len(active_queue),
                 }
 
