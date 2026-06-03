@@ -59,7 +59,7 @@ from adapters.config import CommandLimitsConfig
 from adapters.lidar_debug import save_occupancy_debug_image
 from adapters.real_livox import LivoxAdapterConfig, UnitreeVibesLivox2Adapter, UnitreeVibesLivox2AdapterConfig
 from g1_nav_rl.mapping.occupancy_grid import OccupancyGridCfg, rasterize_points_to_occupancy_grid
-from g1_nav_rl.planning.grid_astar import GridAStarCfg, GridAStarResult, plan_grid_path_xy
+from g1_nav_rl.planning.grid_astar import GridAStarCfg, GridAStarResult, grid_cell_to_xy, plan_grid_path_xy, xy_to_grid_cell
 
 
 def _json_safe(value: Any) -> Any:
@@ -201,6 +201,88 @@ def _occupancy_from_lidar(points_body_xyz: np.ndarray, grid_cfg: OccupancyGridCf
     else:
         pts = torch.as_tensor(points[:, :2], dtype=torch.float32).unsqueeze(0)
     return rasterize_points_to_occupancy_grid(pts, valid=None, cfg=grid_cfg)[0].detach().cpu()
+
+
+def _plan_with_goal_relocation(
+    *,
+    occupancy: torch.Tensor,
+    target: Target2D,
+    grid_cfg: OccupancyGridCfg,
+    astar_cfg: GridAStarCfg,
+    allow_goal_relocation: bool,
+    allow_start_relocation: bool,
+    max_goal_relocation_m: float,
+) -> tuple[GridAStarResult, dict[str, Any]]:
+    """Plan from the real body origin, relocating only the goal if needed.
+
+    For object following, the exact RGB-D stand-off point can still fall inside
+    inflated LiDAR occupancy: the target object itself, its support surface, or
+    an inflated obstacle blob can cover that cell.  Treat that as a goal-side
+    issue only.  The start remains strict by default so we never silently plan
+    from a fictitious robot pose.
+    """
+
+    requested_goal_xy = (float(target.x), float(target.y))
+    requested_goal_cell = xy_to_grid_cell(requested_goal_xy, grid_cfg)
+    meta: dict[str, Any] = {
+        "requested_goal_xy_b": [requested_goal_xy[0], requested_goal_xy[1]],
+        "requested_goal_cell": list(requested_goal_cell),
+        "goal_relocated": False,
+        "goal_relocation_distance_m": 0.0,
+        "goal_relocation_max_m": float(max_goal_relocation_m),
+    }
+
+    strict = plan_grid_path_xy(
+        occupancy,
+        start_xy_b=(0.0, 0.0),
+        goal_xy_b=requested_goal_xy,
+        grid_cfg=grid_cfg,
+        planner_cfg=astar_cfg,
+        allow_start_relocation=bool(allow_start_relocation),
+        allow_goal_relocation=False,
+    )
+    if strict.found or strict.reason != "goal_occupied" or not bool(allow_goal_relocation):
+        return strict, meta
+
+    relocated = plan_grid_path_xy(
+        occupancy,
+        start_xy_b=(0.0, 0.0),
+        goal_xy_b=requested_goal_xy,
+        grid_cfg=grid_cfg,
+        planner_cfg=astar_cfg,
+        allow_start_relocation=bool(allow_start_relocation),
+        allow_goal_relocation=True,
+    )
+    if not relocated.found:
+        meta["goal_relocation_attempted"] = True
+        meta["goal_relocation_failed_reason"] = relocated.reason
+        return strict, meta
+
+    relocated_goal_xy = grid_cell_to_xy(relocated.goal_cell, grid_cfg)
+    relocation_distance = math.hypot(relocated_goal_xy[0] - requested_goal_xy[0], relocated_goal_xy[1] - requested_goal_xy[1])
+    meta.update({
+        "goal_relocation_attempted": True,
+        "goal_relocated": True,
+        "relocated_goal_cell": list(relocated.goal_cell),
+        "relocated_goal_xy_b": [float(relocated_goal_xy[0]), float(relocated_goal_xy[1])],
+        "goal_relocation_distance_m": float(relocation_distance),
+    })
+
+    if relocation_distance > float(max_goal_relocation_m):
+        meta["goal_relocation_rejected_reason"] = "relocated_goal_too_far"
+        meta["relocated_plan_reason"] = relocated.reason
+        return strict, meta
+
+    return GridAStarResult(
+        found=relocated.found,
+        start_cell=relocated.start_cell,
+        goal_cell=relocated.goal_cell,
+        path_cells=relocated.path_cells,
+        path_xy_b=relocated.path_xy_b,
+        cost=relocated.cost,
+        expansions=relocated.expansions,
+        reason="goal_relocated_from_occupied+" + str(relocated.reason),
+    ), meta
 
 
 def _path_length(path_xy_b: Sequence[tuple[float, float]]) -> float:
@@ -386,7 +468,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--astar-max-expansions", type=int, default=0)
     p.add_argument("--no-diagonal-astar", action="store_true")
     p.add_argument("--allow-start-relocation", action="store_true")
-    p.add_argument("--allow-goal-relocation", action="store_true")
+    p.add_argument("--allow-goal-relocation", dest="allow_goal_relocation", action="store_true", default=True)
+    p.add_argument("--disable-goal-relocation", dest="allow_goal_relocation", action="store_false")
+    p.add_argument("--goal-relocation-radius-m", type=float, default=0.80)
 
     p.add_argument("--emergency-front-stop-m", type=float, default=0.45)
     p.add_argument("--front-corridor-half-width-m", type=float, default=0.25)
@@ -473,7 +557,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "real_motion": real_motion,
         "simple_contract": {
             "target_selection": "best current stream detection, no target lock, no track-id persistence",
-            "planning": "A* on current Livox occupancy grid from body origin",
+            "planning": "A* on current Livox occupancy grid from body origin; goal-only relocation around occupied target stand-off is allowed",
             "execution": "yaw-first/forward-only burst, stop only at checkpoint",
             "disabled": [
                 "StepwiseTargetNavPolicyRuntime",
@@ -554,6 +638,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
             plan = None
+            plan_meta: dict[str, Any] = {}
             commands: list[Command2D] = []
             command_meta: dict[str, Any] = {"reason": "no_target"}
             emergency_stop = False
@@ -563,14 +648,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 emergency_stop = True
                 command_meta = {"reason": "emergency_front_stop", "front_min_m": front_min}
             else:
-                plan = plan_grid_path_xy(
-                    occupancy,
-                    start_xy_b=(0.0, 0.0),
-                    goal_xy_b=(float(current_target.x), float(current_target.y)),
+                plan, plan_meta = _plan_with_goal_relocation(
+                    occupancy=occupancy,
+                    target=current_target,
                     grid_cfg=grid_cfg,
-                    planner_cfg=astar_cfg,
+                    astar_cfg=astar_cfg,
                     allow_start_relocation=bool(args.allow_start_relocation),
                     allow_goal_relocation=bool(args.allow_goal_relocation),
+                    max_goal_relocation_m=float(args.goal_relocation_radius_m),
                 )
                 commands, command_meta = _make_burst_commands(
                     plan=plan,
@@ -583,6 +668,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     turn_angle_max_rad=math.radians(float(args.turn_angle_max_deg)),
                     target_reached_radius_m=float(args.target_reached_radius_m),
                 )
+                command_meta = dict(command_meta) | {"plan_goal": plan_meta}
 
             # Debug image before motion.
             image_path = debug_base / f"occupancy_grid_cycle_{cycle:06d}.png"
@@ -625,6 +711,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "goal_cell": list(plan.goal_cell),
                     "path_len": len(plan.path_xy_b),
                     "path_length_m": _path_length(plan.path_xy_b),
+                    "goal_metadata": plan_meta,
                 },
                 "command_meta": command_meta,
                 "commands": [_json_safe(c) for c in commands],
