@@ -777,6 +777,24 @@ class StepwiseNavigator:
         self.pending_replan_reason = None
         self.expected_pose_in_plan = (0.0, 0.0, 0.0)
 
+    def invalidate_plan(self, reason: str) -> None:
+        """Discard the active prediction after a real physical primitive.
+
+        Stage-A real execution replans from fresh body-frame perception after
+        every success, failure, or partial motion.
+        """
+
+        reason = str(reason).strip()
+        if not reason:
+            raise ValueError("invalidate_plan reason must be non-empty")
+        self.action_queue.clear()
+        self.current_action_index = 0
+        self.pending_replan_reason = reason
+        self.executed_actions_since_replan = 0
+        self.executed_forward_m_since_replan = 0.0
+        self.blind_actions_used = 0
+        self.expected_pose_in_plan = (0.0, 0.0, 0.0)
+
     def _stop_decision(
         self,
         *,

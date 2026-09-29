@@ -172,6 +172,12 @@ class PrimaryTargetLock:
             reason="reset",
         )
 
+    def invalidate_body_target(self) -> None:
+        """Forget stale coordinates while retaining the locked track identity."""
+
+        self.last_known_target = None
+        self.last_frame_timestamp_s = None
+
     @property
     def is_locked(self) -> bool:
         return self._locked_track_key is not None

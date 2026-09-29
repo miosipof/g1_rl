@@ -143,6 +143,21 @@ def test_navigator_missing_target_stops_immediately():
     assert missing.reason == "target_missing_stop_observe"
 
 
+def test_navigator_plan_invalidation_forces_fresh_replan() -> None:
+    cfg = _cfg(replan_every_actions=99, success_radius_m=0.05)
+    nav = StepwiseNavigator(cfg)
+    grid = torch.zeros((cfg.grid_cfg.height, cfg.grid_cfg.width), dtype=torch.float32)
+    first = nav.decide(target_xy_b=(1.0, 0.0), occupancy_grid=grid, front_min_distance_m=1.0)
+    assert first.execute
+    nav.invalidate_plan("action_completed_odometry")
+    assert nav.action_queue == []
+    assert nav.expected_pose_in_plan == (0.0, 0.0, 0.0)
+    second = nav.decide(target_xy_b=(0.9, 0.0), occupancy_grid=grid, front_min_distance_m=1.0)
+    assert second.execute
+    assert second.replan_attempted
+    assert second.replan_reason == "action_completed_odometry"
+
+
 def test_navigator_front_block_stops_and_marks_replan_pending():
     cfg = _cfg(emergency_front_stop_m=0.40)
     nav = StepwiseNavigator(cfg)

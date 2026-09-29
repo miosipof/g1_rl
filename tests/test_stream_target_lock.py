@@ -76,6 +76,18 @@ def test_primary_target_lock_reacquires_same_track_after_occlusion() -> None:
     assert reacquired.target.xy == (1.8, 0.1)
 
 
+def test_body_target_invalidation_preserves_identity_but_drops_coordinates() -> None:
+    lock = PrimaryTargetLock(PrimaryTargetLockConfig(target_class="bottle", max_lost_s=5.0))
+    lock.update(_frame(1.0, _track(3, 0.9, (2.0, 0.0))), now_s=1.0)
+    lock.invalidate_body_target()
+    missing = lock.update(_frame(2.0), now_s=2.0)
+    assert missing.locked_track_id == 3
+    assert missing.target is None
+    reacquired = lock.update(_frame(3.0, _track(3, 0.8, (1.7, 0.1))), now_s=3.0)
+    assert reacquired.target is not None
+    assert reacquired.target.xy == (1.7, 0.1)
+
+
 def test_primary_target_lock_rejects_large_jumps_and_keeps_last_known_temporarily() -> None:
     lock = PrimaryTargetLock(PrimaryTargetLockConfig(target_class="bottle", max_target_jump_m=0.5, max_lost_s=3.0))
     lock.update(_frame(1.0, _track(1, 0.9, (2.0, 0.0))), now_s=1.0)

@@ -10,3 +10,4 @@ data/
 *.pth
 *egg-info*
 .pytest_cache
+tmp/

@@ -21,11 +21,11 @@ class _FakeClient:
 
     def Move(self, vx: float, vy: float, omega: float, **kwargs: object) -> int:
         self.moves.append(((vx, vy, omega), dict(kwargs)))
-        return 123
+        return 0
 
     def StopMove(self) -> int:
         self.stop_count += 1
-        return 456
+        return 0
 
 
 class _ContinuousOnlyClient(_FakeClient):
@@ -46,6 +46,18 @@ class _NoKeywordClient(_FakeClient):
         return 999
 
 
+class _FailureCodeClient(_FakeClient):
+    def Move(self, vx: float, vy: float, omega: float, **kwargs: object) -> int:
+        self.moves.append(((vx, vy, omega), dict(kwargs)))
+        return 7
+
+
+class _StopFailureCodeClient(_FakeClient):
+    def StopMove(self) -> int:
+        self.stop_count += 1
+        return 8
+
+
 def _limits() -> CommandLimitsConfig:
     return CommandLimitsConfig.from_dict(
         {
@@ -64,7 +76,7 @@ def test_call_move_with_sdk_compat_handles_spelling_variants() -> None:
     cmd = Command2D(0.1, 0.0, 0.2)
 
     client = _FakeClient()
-    assert call_move_with_sdk_compat(client, cmd) == 123
+    assert call_move_with_sdk_compat(client, cmd) == 0
     assert client.moves[-1][1] == {"continous_move": True}
 
     continuous_client = _ContinuousOnlyClient()
@@ -78,7 +90,7 @@ def test_call_move_with_sdk_compat_handles_spelling_variants() -> None:
 
 def test_call_stop_move_prefers_stopmove() -> None:
     client = _FakeClient()
-    assert call_stop_move(client) == 456
+    assert call_stop_move(client) == 0
     assert client.stop_count == 1
     assert client.moves == []
 
@@ -128,6 +140,27 @@ def test_unitree_adapter_requires_arm_and_clips_before_send() -> None:
     assert accepted.ok
     assert accepted.command.tuple == pytest.approx((0.10, -0.03, 0.20))
     assert client.moves[-1][0] == pytest.approx((0.10, -0.03, 0.20))
+    assert client.moves[-1][1] == {"continous_move": False}
+
+
+def test_unitree_adapter_requires_explicit_sdk_success_codes() -> None:
+    move_failure = UnitreeLocoAdapter(
+        config=UnitreeLocoAdapterConfig(require_arm=False, require_fsm_id=None),
+        client=_FailureCodeClient(),
+        state_reader=lambda _: {"fsm_mode": 0},
+    )
+    result = move_failure.send_command(Command2D(0.01, 0.0, 0.0))
+    assert not result.accepted
+    assert result.status.details["code"] == 7
+
+    stop_failure = UnitreeLocoAdapter(
+        config=UnitreeLocoAdapterConfig(require_arm=False, require_fsm_id=None),
+        client=_StopFailureCodeClient(),
+        state_reader=lambda _: {"fsm_mode": 0},
+    )
+    result = stop_failure.stop()
+    assert not result.accepted
+    assert result.status.details["code"] == 8
 
 
 

@@ -14,7 +14,7 @@ requiring a live MID-360/SLAM source yet.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import time
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
@@ -22,6 +22,7 @@ import numpy as np
 
 from .config import AdapterRuntimeConfig
 from .types import AdapterHealth, AdapterStatus, LidarFrame, Pose2D, RGBDFrame, RobotObservation, RobotState
+from .real_unitree_odometry import UnitreeOdometryAdapter, snapshot_to_dict
 
 
 Clock = Callable[[], float]
@@ -33,6 +34,64 @@ class RGBDAdapterLike(Protocol):
 
     def read_frame(self) -> RGBDFrame:
         ...
+
+
+@runtime_checkable
+class ObservationProviderLike(Protocol):
+    def read_observation(self) -> RobotObservation:
+        ...
+
+
+@dataclass
+class UnitreeOdometryObservationProvider:
+    """Inject one atomic real-odometry snapshot into a base observation."""
+
+    base_provider: ObservationProviderLike
+    odometry: UnitreeOdometryAdapter
+    create_robot_state_if_missing: bool = True
+    source_name: str = "UnitreeOdometryObservationProvider"
+
+    def read_observation(self) -> RobotObservation:
+        obs = self.base_provider.read_observation()
+        snapshot = self.odometry.snapshot()
+        pose = snapshot.relative_pose
+        odom_dict = snapshot_to_dict(snapshot)
+        if obs.robot_state is None:
+            robot_state = None
+            if self.create_robot_state_if_missing:
+                robot_state = RobotState(
+                    timestamp_s=snapshot.raw.receive_time_s,
+                    pose=pose,
+                    mode="unitree_odometry",
+                    is_faulted=False,
+                    details={"unitree_odometry": odom_dict},
+                )
+        else:
+            robot_state = replace(
+                obs.robot_state,
+                timestamp_s=max(float(obs.robot_state.timestamp_s), snapshot.raw.receive_time_s),
+                pose=pose,
+                details={**dict(obs.robot_state.details), "unitree_odometry": odom_dict},
+            )
+        timestamp_s = max(
+            float(obs.timestamp_s),
+            snapshot.raw.receive_time_s,
+            float(robot_state.timestamp_s) if robot_state is not None else float("-inf"),
+        )
+        statuses = tuple(obs.statuses) + (self.odometry.status(),)
+        return replace(
+            obs,
+            timestamp_s=timestamp_s,
+            pose=pose,
+            robot_state=robot_state,
+            statuses=statuses,
+            metadata={
+                **dict(obs.metadata),
+                "source": self.source_name,
+                "unitree_odometry": odom_dict,
+                "robot_state_synthetic": False,
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -182,14 +241,6 @@ def rgbd_stats(frame: RGBDFrame) -> dict[str, Any]:
         "metadata": dict(frame.metadata),
     }
     return stats
-
-
-__all__ = [
-    "RGBDAdapterLike",
-    "RealSenseDryRunObservationProvider",
-    "SyntheticSupportConfig",
-    "rgbd_stats",
-]
 
 
 @runtime_checkable
@@ -368,11 +419,13 @@ class CompositeDryRunObservationProvider:
 
 # Keep __all__ in sync with the staged providers added after the Step 9 API.
 __all__ = [
+    "ObservationProviderLike",
     "RGBDAdapterLike",
     "LidarAdapterLike",
     "RealSenseDryRunObservationProvider",
     "LidarDryRunObservationProvider",
     "CompositeDryRunObservationProvider",
     "SyntheticSupportConfig",
+    "UnitreeOdometryObservationProvider",
     "rgbd_stats",
 ]

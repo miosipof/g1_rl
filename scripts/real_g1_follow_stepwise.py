@@ -11,7 +11,7 @@ Pipeline, inline YOLO mode::
       + Livox/MID-360 LiDAR snapshot
       -> RobotObservation(target_hint, lidar)
       -> StepwiseTargetNavPolicyRuntime
-      -> bounded Unitree Move command for action.duration_s
+      -> odometry-closed-loop Unitree Move primitive
       -> hard stop
       -> repeat
 
@@ -22,11 +22,11 @@ Pipeline, streaming YOLO mode::
       -> PrimaryTargetLock
       -> RobotObservation(target_hint, lidar)
       -> StepwiseTargetNavPolicyRuntime
-      -> bounded Unitree Move command for action.duration_s
+      -> odometry-closed-loop Unitree Move primitive
       -> hard stop
       -> repeat
 
-The stepwise controller has no command odometry and does not use the continuous
+The stepwise controller uses measured Unitree odometry and does not use the continuous
 SafetySupervisor.  It relies on A* obstacle inflation plus immediate forward
 sweep/front guards.  The script stops before each observation cycle and after each
 executed action so observations and commands remain synchronized.
@@ -38,7 +38,7 @@ import argparse
 import json
 import math
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Mapping
 import sys
@@ -66,8 +66,15 @@ from adapters import (
     StepwiseTargetNavPolicyRuntimeConfig,
     SyntheticSupportConfig,
     Target2D,
+    TerminalLocomotionFault,
     UnitreeLocoAdapter,
     UnitreeLocoAdapterConfig,
+    UnitreeOdometryAdapter,
+    UnitreeOdometryConfig,
+    UnitreeOdometryObservationProvider,
+    OdometryActionExecutor,
+    OdometryActionExecutorConfig,
+    real_motion_ready,
     make_run_id,
     timestamped_output_dir,
     write_run_info,
@@ -103,6 +110,11 @@ class StreamTargetObservationProvider:
         self.source_name = source_name
         self.last_read_result: Any | None = None
         self.last_target_state: Any | None = None
+        self.minimum_actionable_frame_timestamp_s = float("-inf")
+
+    def invalidate_body_target(self, *, after_timestamp_s: float) -> None:
+        self.target_lock.invalidate_body_target()
+        self.minimum_actionable_frame_timestamp_s = float(after_timestamp_s)
 
     def read_observation(self) -> RobotObservation:
         obs: RobotObservation = self.base_provider.read_observation()
@@ -110,7 +122,14 @@ class StreamTargetObservationProvider:
         target_state = self.target_lock.update_read_result(read_result, allow_stale=False)
         self.last_read_result = read_result
         self.last_target_state = target_state
-        target = target_state.target
+        frame_timestamp_s = None if read_result.frame is None else float(read_result.frame.timestamp_s)
+        target_fresh = bool(
+            target_state.target is not None
+            and not target_state.using_last_known
+            and frame_timestamp_s is not None
+            and frame_timestamp_s > self.minimum_actionable_frame_timestamp_s
+        )
+        target = target_state.target if target_fresh else None
         meta = dict(obs.metadata)
         meta["source"] = self.source_name
         meta["target_lock"] = target_state.to_dict()
@@ -119,6 +138,12 @@ class StreamTargetObservationProvider:
             "message": read_result.status.message,
             "timestamp_s": float(read_result.status.timestamp_s),
             "details": dict(read_result.status.details),
+        }
+        meta["target_measurement"] = {
+            "fresh_after_motion": target_fresh,
+            "measurement_timestamp_s": frame_timestamp_s,
+            "using_last_known": bool(target_state.using_last_known),
+            "minimum_timestamp_s": self.minimum_actionable_frame_timestamp_s,
         }
         if read_result.frame is not None:
             meta["detection_stream_frame"] = {
@@ -235,6 +260,7 @@ def _build_base_provider(
     cfg: Any,
     rs_adapter: RealSenseRGBDAdapter | None,
     livox_adapter: UnitreeVibesLivox2Adapter,
+    include_synthetic_robot_state: bool,
 ) -> CompositeDryRunObservationProvider:
     return CompositeDryRunObservationProvider(
         config=cfg,
@@ -242,9 +268,22 @@ def _build_base_provider(
         lidar_adapter=livox_adapter,
         support=SyntheticSupportConfig(mode="real_g1_stepwise"),
         include_synthetic_lidar_if_missing=False,
-        include_synthetic_robot_state=True,
+        include_synthetic_robot_state=include_synthetic_robot_state,
         source_name="RealG1StepwiseBaseObservationProvider",
     )
+
+
+def _target_is_fresh(observation: RobotObservation, *, after_timestamp_s: float) -> bool:
+    if observation.target_hint is None:
+        return False
+    measurement = observation.metadata.get("target_measurement")
+    if isinstance(measurement, Mapping):
+        return bool(measurement.get("fresh_after_motion", False))
+    tracking = observation.metadata.get("target_tracking")
+    if isinstance(tracking, Mapping) and tracking.get("state") != "tracking":
+        return False
+    timestamp_s = None if observation.rgbd is None else float(observation.rgbd.timestamp_s)
+    return timestamp_s is not None and timestamp_s > float(after_timestamp_s)
 
 
 def _execute_for_duration(
@@ -457,8 +496,28 @@ def main() -> int:
     parser.add_argument("--command-vy-scale", type=float, default=0.0, help="Default disables lateral motion on the real G1.")
     parser.add_argument("--command-wz-scale", type=float, default=1.0)
     parser.add_argument("--command-period-s", type=float, default=0.10, help="Refresh period while executing a real Move command.")
+    parser.add_argument("--odom-topic", default="rt/odommodestate")
+    parser.add_argument("--odom-stale-s", type=float, default=0.10)
+    parser.add_argument("--odom-startup-timeout-s", type=float, default=2.0)
+    parser.add_argument("--odom-max-position-jump-m", type=float, default=0.50)
+    parser.add_argument("--odom-max-yaw-jump-deg", type=float, default=45.0)
+    parser.add_argument("--odom-distance-tolerance-m", type=float, default=0.02)
+    parser.add_argument("--odom-distance-tolerance-fraction", type=float, default=0.20)
+    parser.add_argument("--odom-min-completion-progress-m", type=float, default=0.005)
+    parser.add_argument("--odom-yaw-tolerance-deg", type=float, default=2.0)
+    parser.add_argument("--odom-yaw-tolerance-fraction", type=float, default=0.20)
+    parser.add_argument("--odom-min-completion-progress-deg", type=float, default=0.5)
+    parser.add_argument("--odom-max-lateral-error-m", type=float, default=0.12)
+    parser.add_argument("--odom-no-progress-timeout-s", type=float, default=0.75)
+    parser.add_argument("--odom-min-progress-m", type=float, default=0.01)
+    parser.add_argument("--odom-min-progress-deg", type=float, default=1.0)
+    parser.add_argument("--odom-settle-linear-mps", type=float, default=0.03)
+    parser.add_argument("--odom-settle-yaw-radps", type=float, default=0.05)
+    parser.add_argument("--odom-settle-samples", type=int, default=3)
+    parser.add_argument("--odom-settle-timeout-s", type=float, default=1.0)
+    parser.add_argument("--action-timeout-scale", type=float, default=2.0)
+    parser.add_argument("--action-timeout-margin-s", type=float, default=0.50)
     parser.add_argument("--yes-i-understand-this-moves-the-robot", action="store_true")
-    parser.add_argument("--allow-synthetic-robot-state-motion", action="store_true", help="Required for real motion until real RobotState provider is implemented.")
 
     # Output.
     parser.add_argument("--save-lidar-debug", type=Path, default=None)
@@ -477,11 +536,6 @@ def main() -> int:
     if args.target_source == "stream" and args.detection_stream_path is None:
         raise SystemExit("--target-source stream requires --detection-stream-path")
     real_motion = bool(args.yes_i_understand_this_moves_the_robot)
-    if real_motion and not args.allow_synthetic_robot_state_motion:
-        raise SystemExit(
-            "Real motion currently uses synthetic RobotState in the observation provider. "
-            "Pass --allow-synthetic-robot-state-motion after external verification."
-        )
 
     cfg = load_adapter_config(args.config)
     run_id = args.run_id or make_run_id()
@@ -530,7 +584,35 @@ def main() -> int:
     )
     livox_adapter.start()
 
-    base_provider = _build_base_provider(args=args, cfg=cfg, rs_adapter=rs_adapter, livox_adapter=livox_adapter)
+    odometry: UnitreeOdometryAdapter | None = None
+    if real_motion:
+        odometry = UnitreeOdometryAdapter(
+            UnitreeOdometryConfig(
+                iface=str(args.iface),
+                topic=str(args.odom_topic),
+                stale_after_s=float(args.odom_stale_s),
+                startup_timeout_s=float(args.odom_startup_timeout_s),
+                max_position_jump_m=float(args.odom_max_position_jump_m),
+                max_yaw_jump_rad=math.radians(float(args.odom_max_yaw_jump_deg)),
+            )
+        )
+        odom_connect = odometry.connect()
+        if not odom_connect.ok:
+            livox_adapter.stop()
+            if rs_adapter is not None:
+                rs_adapter.stop()
+            raise SystemExit(f"Unitree odometry unavailable: {odom_connect.message}")
+        odometry.capture_origin()
+
+    base_provider: Any = _build_base_provider(
+        args=args,
+        cfg=cfg,
+        rs_adapter=rs_adapter,
+        livox_adapter=livox_adapter,
+        include_synthetic_robot_state=not real_motion,
+    )
+    if odometry is not None:
+        base_provider = UnitreeOdometryObservationProvider(base_provider=base_provider, odometry=odometry)
     if args.target_source == "yolo":
         observation_provider: Any = DetectTargetObservationProvider(
             base_provider=base_provider,
@@ -592,8 +674,51 @@ def main() -> int:
         ),
         command_limits=cfg.command_limits,
     )
-    sink.connect()
+    sink_status = sink.connect()
+    if not sink_status.ok:
+        if odometry is not None:
+            odometry.close()
+        livox_adapter.stop()
+        if rs_adapter is not None:
+            rs_adapter.stop()
+        raise SystemExit(f"Unitree locomotion unavailable: {sink_status.message}")
+    if real_motion:
+        state_ok, state_reasons, _ = sink.check_state_gate()
+        if not state_ok:
+            if odometry is not None:
+                odometry.close()
+            sink.close()
+            livox_adapter.stop()
+            if rs_adapter is not None:
+                rs_adapter.stop()
+            raise SystemExit(f"Unitree locomotion state gate rejected startup: {state_reasons}")
     sink.arm()
+    executor = None
+    if odometry is not None:
+        executor = OdometryActionExecutor(
+            sink=sink,
+            odometry=odometry,
+            config=OdometryActionExecutorConfig(
+                distance_tolerance_m=float(args.odom_distance_tolerance_m),
+                distance_tolerance_fraction=float(args.odom_distance_tolerance_fraction),
+                min_completion_progress_m=float(args.odom_min_completion_progress_m),
+                yaw_tolerance_rad=math.radians(float(args.odom_yaw_tolerance_deg)),
+                yaw_tolerance_fraction=float(args.odom_yaw_tolerance_fraction),
+                min_completion_progress_rad=math.radians(float(args.odom_min_completion_progress_deg)),
+                max_lateral_error_m=float(args.odom_max_lateral_error_m),
+                stale_after_s=float(args.odom_stale_s),
+                no_progress_timeout_s=float(args.odom_no_progress_timeout_s),
+                min_progress_m=float(args.odom_min_progress_m),
+                min_progress_rad=math.radians(float(args.odom_min_progress_deg)),
+                timeout_scale=float(args.action_timeout_scale),
+                timeout_margin_s=float(args.action_timeout_margin_s),
+                settle_linear_speed_mps=float(args.odom_settle_linear_mps),
+                settle_yaw_speed_radps=float(args.odom_settle_yaw_radps),
+                settle_samples=int(args.odom_settle_samples),
+                settle_timeout_s=float(args.odom_settle_timeout_s),
+                command_refresh_period_s=float(args.command_period_s),
+            ),
+        )
 
     run_info = {
         "run_id": run_id,
@@ -608,6 +733,12 @@ def main() -> int:
             "command_vx_scale": args.command_vx_scale,
             "command_vy_scale": args.command_vy_scale,
             "command_wz_scale": args.command_wz_scale,
+        },
+        "odometry": None if odometry is None else {
+            "topic": args.odom_topic,
+            "stale_after_s": args.odom_stale_s,
+            "max_position_jump_m": args.odom_max_position_jump_m,
+            "max_yaw_jump_deg": args.odom_max_yaw_jump_deg,
         },
     }
     write_run_info(lidar_debug_dir, run_info)
@@ -633,12 +764,37 @@ def main() -> int:
             command_rows_path.unlink()
 
     try:
+        last_motion_completion_s = float("-inf")
         for step in range(int(args.max_steps)):
-            stop_before = sink.stop(timestamp_s=time.monotonic())
-            if float(args.settle_s) > 0.0:
-                time.sleep(float(args.settle_s))
+            stationary_confirmed = True
+            if executor is not None and odometry is not None:
+                stop_before = executor.checked_stop()
+                before_wait = odometry.snapshot()
+                stationary = executor.wait_until_stationary(newer_than_sequence=before_wait.sequence)
+                stationary_confirmed = stationary.stationary
+                if not stationary_confirmed:
+                    print(f"[ERROR]: robot not stationary before observation: {stationary.reason}")
+                    exit_code = 1
+                    break
+            else:
+                stop_before = sink.stop(timestamp_s=time.monotonic())
+                if float(args.settle_s) > 0.0:
+                    time.sleep(float(args.settle_s))
 
             obs = observation_provider.read_observation()
+            target_fresh = _target_is_fresh(obs, after_timestamp_s=last_motion_completion_s)
+            if real_motion and not target_fresh and obs.target_hint is not None:
+                obs = replace(
+                    obs,
+                    target_hint=None,
+                    metadata={
+                        **dict(obs.metadata),
+                        "target_measurement": {
+                            **dict(obs.metadata.get("target_measurement", {})),
+                            "fresh_after_motion": False,
+                        },
+                    },
+                )
             command = stepwise_runtime.step(obs)
             decision = stepwise_runtime.last_decision
             detections = None
@@ -656,8 +812,44 @@ def main() -> int:
             )
 
             send_events: list[dict[str, Any]] = []
+            execution_result = None
+            stop_after = stop_before
             if command.is_stop or command.duration_s is None:
                 send_events.append({"phase": "no_motion", "reason": None if decision is None else decision.reason})
+            elif executor is not None and odometry is not None:
+                ready, gate_reason = real_motion_ready(
+                    odom_status=odometry.status(),
+                    target_fresh=target_fresh,
+                    stationary_confirmed=stationary_confirmed,
+                )
+                if not ready:
+                    stop_after = executor.checked_stop()
+                    send_events.append({"phase": "motion_gate_rejected", "reason": gate_reason})
+                else:
+                    assert decision is not None
+                    execution_result = executor.execute(
+                        action=decision.action,
+                        command=command,
+                        require_state_gate=True,
+                    )
+                    send_events.append({
+                        "phase": "odometry_execution",
+                        "accepted": bool(execution_result.completed),
+                        "reason": execution_result.reason,
+                    })
+                    stepwise_runtime.navigator.invalidate_plan(
+                        "action_completed_odometry"
+                        if execution_result.completed
+                        else "action_incomplete_odometry"
+                    )
+                    latest_after = odometry.snapshot()
+                    last_motion_completion_s = latest_after.raw.receive_time_s
+                    invalidator = getattr(observation_provider, "invalidate_body_target", None)
+                    if callable(invalidator):
+                        if args.target_source == "stream":
+                            invalidator(after_timestamp_s=last_motion_completion_s)
+                        else:
+                            invalidator(reason="odometry_action_finished")
             else:
                 send_events.extend(
                     _execute_for_duration(
@@ -669,9 +861,9 @@ def main() -> int:
                         json_lines=bool(args.json_lines),
                     )
                 )
-            stop_after = sink.stop(timestamp_s=time.monotonic())
-            if float(args.stop_after_action_s) > 0.0:
-                time.sleep(float(args.stop_after_action_s))
+                stop_after = sink.stop(timestamp_s=time.monotonic())
+                if float(args.stop_after_action_s) > 0.0:
+                    time.sleep(float(args.stop_after_action_s))
 
             tracking = obs.metadata.get("target_tracking")
             target_lock = obs.metadata.get("target_lock")
@@ -684,11 +876,21 @@ def main() -> int:
                 "sensor_ages_s": obs.sensor_ages_s(),
                 "target_tracking": tracking,
                 "target_lock": target_lock,
+                "target_measurement": obs.metadata.get("target_measurement", {
+                    "fresh_after_motion": target_fresh,
+                    "measurement_timestamp_s": None if obs.rgbd is None else obs.rgbd.timestamp_s,
+                    "using_last_known": False,
+                }),
                 "stepwise_decision": None if decision is None else decision.to_dict(),
                 "command": _command_dict(command),
                 "stop_before": {"accepted": stop_before.accepted, "status": _json_safe(stop_before.status)},
                 "send_events": send_events,
                 "stop_after": {"accepted": stop_after.accepted, "status": _json_safe(stop_after.status)},
+                "execution_result": None if execution_result is None else execution_result.to_dict(),
+                "odometry_start": None if execution_result is None else _json_safe(execution_result.start_pose),
+                "odometry_stop": None if execution_result is None else _json_safe(execution_result.stop_pose),
+                "odometry_settled": None if execution_result is None else _json_safe(execution_result.settled_pose),
+                "odometry": None if odometry is None else _json_safe(odometry.snapshot()),
                 "debug_paths": debug_paths,
             }
             if command_rows_path is not None:
@@ -714,13 +916,16 @@ def main() -> int:
             if decision is not None and decision.target_reached:
                 print(f"[INFO]: target reached at step={step}")
                 break
-            if real_motion and any(event.get("accepted") is False for event in send_events):
-                print("[ERROR]: command rejected during real motion; stopping")
+            if execution_result is not None and execution_result.reason in {"command_rejected", "stop_rejected"}:
+                print(f"[ERROR]: locomotion command failed: {execution_result.reason}")
                 exit_code = 1
                 break
     except KeyboardInterrupt:
         print("[WARN]: interrupted by user; stopping robot")
         exit_code = 130
+    except TerminalLocomotionFault as exc:
+        print(f"[ERROR]: terminal locomotion fault; autonomous motion locked out: {exc}")
+        exit_code = 1
     except Exception as exc:
         print(f"[ERROR]: real_g1_follow_stepwise failed: {exc!r}")
         exit_code = 1
@@ -729,6 +934,8 @@ def main() -> int:
             sink.stop(timestamp_s=time.monotonic())
         finally:
             sink.close()
+            if odometry is not None:
+                odometry.close()
             livox_adapter.stop()
             if rs_adapter is not None:
                 rs_adapter.stop()
