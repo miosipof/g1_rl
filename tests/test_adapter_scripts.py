@@ -137,6 +137,9 @@ def test_isaac_stepwise_stream_script_help_exposes_stepwise_flags() -> None:
     assert "--forward-segment-m" in result.stdout
     assert "--stream-target-body-x" in result.stdout
     assert "--no-static-stream" in result.stdout
+    assert "--odom-lag-s" in result.stdout
+    assert "--odom-position-noise-std-m" in result.stdout
+    assert "--legacy-duration-execution" in result.stdout
 
 
 def test_isaac_yolo_nav_exposes_stepwise_controller_mode() -> None:
@@ -145,6 +148,9 @@ def test_isaac_yolo_nav_exposes_stepwise_controller_mode() -> None:
     assert "StepwiseTargetNavPolicyRuntime" in script
     assert "--stepwise_forward_segment_m" in script
     assert "stepwise_trace.jsonl" in script
+    assert "IsaacOdometryAdapter" in script
+    assert "sim_executor.execute" in script
+    assert "action_completed_odometry" in script
 
 
 def test_isaac_stepwise_lidar_frame_promotes_xy_points_to_xyz() -> None:

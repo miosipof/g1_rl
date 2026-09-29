@@ -99,6 +99,21 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--emergency-front-stop-m", type=float, default=0.35)
     parser.add_argument("--action-duration-max-s", type=float, default=0.0, help="Compatibility option; synchronized stepwise controller does not clip action durations.")
     parser.add_argument("--sweep-start-ignore-m", "--stepwise_sweep_start_ignore_m", "--stepwise-sweep-start-ignore-m", dest="sweep_start_ignore_m", type=float, default=0.05, help="Distance near robot origin ignored by immediate swept-footprint path_blocked check.")
+    parser.add_argument("--legacy-duration-execution", action="store_true", help="Disable measured simulated odometry and execute each primitive for its planned duration.")
+    parser.add_argument("--odom-sample-period-s", type=float, default=0.02)
+    parser.add_argument("--odom-lag-s", type=float, default=0.0)
+    parser.add_argument("--odom-position-noise-std-m", type=float, default=0.0)
+    parser.add_argument("--odom-yaw-noise-std-deg", type=float, default=0.0)
+    parser.add_argument("--odom-velocity-noise-std-mps", type=float, default=0.0)
+    parser.add_argument("--odom-yaw-rate-noise-std-radps", type=float, default=0.0)
+    parser.add_argument("--odom-position-bias-x-m", type=float, default=0.0)
+    parser.add_argument("--odom-position-bias-y-m", type=float, default=0.0)
+    parser.add_argument("--odom-yaw-bias-deg", type=float, default=0.0)
+    parser.add_argument("--odom-distance-scale", type=float, default=1.0)
+    parser.add_argument("--odom-yaw-scale", type=float, default=1.0)
+    parser.add_argument("--odom-dropout-probability", type=float, default=0.0)
+    parser.add_argument("--odom-stale-s", type=float, default=0.10)
+    parser.add_argument("--odom-seed", type=int, default=0)
     parser.add_argument(
         "--save-rgb-screenshots",
         "--save-perception-images",
@@ -321,7 +336,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         str(float(args.sweep_start_ignore_m)),
         "--stepwise_action_duration_max_s",
         str(float(args.action_duration_max_s)),
+        "--stepwise_odom_sample_period_s",
+        str(float(args.odom_sample_period_s)),
+        "--stepwise_odom_lag_s",
+        str(float(args.odom_lag_s)),
+        "--stepwise_odom_position_noise_std_m",
+        str(float(args.odom_position_noise_std_m)),
+        "--stepwise_odom_yaw_noise_std_deg",
+        str(float(args.odom_yaw_noise_std_deg)),
+        "--stepwise_odom_velocity_noise_std_mps",
+        str(float(args.odom_velocity_noise_std_mps)),
+        "--stepwise_odom_yaw_rate_noise_std_radps",
+        str(float(args.odom_yaw_rate_noise_std_radps)),
+        "--stepwise_odom_position_bias_x_m",
+        str(float(args.odom_position_bias_x_m)),
+        "--stepwise_odom_position_bias_y_m",
+        str(float(args.odom_position_bias_y_m)),
+        "--stepwise_odom_yaw_bias_deg",
+        str(float(args.odom_yaw_bias_deg)),
+        "--stepwise_odom_distance_scale",
+        str(float(args.odom_distance_scale)),
+        "--stepwise_odom_yaw_scale",
+        str(float(args.odom_yaw_scale)),
+        "--stepwise_odom_dropout_probability",
+        str(float(args.odom_dropout_probability)),
+        "--stepwise_odom_stale_s",
+        str(float(args.odom_stale_s)),
+        "--stepwise_odom_seed",
+        str(int(args.odom_seed)),
     ]
+    if bool(args.legacy_duration_execution):
+        cmd.append("--no_stepwise_odometry_execution")
     if bool(args.target_lock_allow_track_switch):
         cmd.append("--target_lock_allow_track_switch")
     if bool(args.target_lock_no_require_track_id):

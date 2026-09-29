@@ -37,6 +37,11 @@ from .sim_isaac import (
     pose2d_from_xy_yaw,
     world_points_to_body_xyz,
 )
+from .sim_isaac_odometry import (
+    IsaacCommandSink,
+    IsaacOdometryAdapter,
+    IsaacOdometryConfig,
+)
 from .real_realsense import (
     RealSenseRGBDAdapter,
     RealSenseRGBDAdapterConfig,
@@ -250,6 +255,9 @@ __all__ = [
     "CommandLimitsConfig",
     "IsaacAdapterSkeleton",
     "IsaacAdapterSkeletonConfig",
+    "IsaacCommandSink",
+    "IsaacOdometryAdapter",
+    "IsaacOdometryConfig",
     "LatestLivoxFrameBuffer",
     "LidarConfig",
     "LidarFrame",

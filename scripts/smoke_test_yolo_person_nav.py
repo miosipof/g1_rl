@@ -491,6 +491,22 @@ parser.add_argument("--stepwise_emergency_front_stop_m", type=float, default=0.3
 parser.add_argument("--stepwise_action_duration_max_s", type=float, default=0.0, help="Compatibility option; synchronized stepwise controller does not clip action durations.")
 parser.add_argument("--stepwise_sweep_start_ignore_m", type=float, default=0.05, help="Distance near robot origin ignored by immediate swept-footprint path_blocked check.")
 parser.add_argument("--stepwise_stop_after_action_steps", type=int, default=1, help="Number of zero-command physics steps after each stepwise action.")
+parser.add_argument("--stepwise_odometry_execution", dest="stepwise_odometry_execution", action="store_true", default=True, help="Complete stepwise actions from simulated measured odometry, using the same executor as the real G1.")
+parser.add_argument("--no_stepwise_odometry_execution", "--no-stepwise-odometry-execution", dest="stepwise_odometry_execution", action="store_false", help="Use the legacy planned-duration execution loop for comparison.")
+parser.add_argument("--stepwise_odom_sample_period_s", "--stepwise-odom-sample-period-s", type=float, default=0.02)
+parser.add_argument("--stepwise_odom_lag_s", "--stepwise-odom-lag-s", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_position_noise_std_m", "--stepwise-odom-position-noise-std-m", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_yaw_noise_std_deg", "--stepwise-odom-yaw-noise-std-deg", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_velocity_noise_std_mps", "--stepwise-odom-velocity-noise-std-mps", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_yaw_rate_noise_std_radps", "--stepwise-odom-yaw-rate-noise-std-radps", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_position_bias_x_m", "--stepwise-odom-position-bias-x-m", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_position_bias_y_m", "--stepwise-odom-position-bias-y-m", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_yaw_bias_deg", "--stepwise-odom-yaw-bias-deg", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_distance_scale", "--stepwise-odom-distance-scale", type=float, default=1.0)
+parser.add_argument("--stepwise_odom_yaw_scale", "--stepwise-odom-yaw-scale", type=float, default=1.0)
+parser.add_argument("--stepwise_odom_dropout_probability", "--stepwise-odom-dropout-probability", type=float, default=0.0)
+parser.add_argument("--stepwise_odom_stale_s", "--stepwise-odom-stale-s", type=float, default=0.10)
+parser.add_argument("--stepwise_odom_seed", "--stepwise-odom-seed", type=int, default=0)
 parser.add_argument("--stepwise_front_x_max_m", type=float, default=1.0)
 parser.add_argument("--stepwise_front_y_abs_max_m", type=float, default=0.35)
 parser.add_argument("--stepwise_trace_jsonl", type=str, default="", help="Optional JSONL path for stepwise decisions. Default: <output_dir>/stepwise_trace.jsonl.")
@@ -618,6 +634,8 @@ from g1_nav_rl.perception.detection_stream import DetectionStreamClient, Detecti
 from adapters.stream_target_lock import PrimaryTargetLock, PrimaryTargetLockConfig  # noqa: E402
 from g1_nav_rl.navigation.stepwise import StepwiseNavConfig  # noqa: E402
 from adapters.stepwise_runtime import StepwiseTargetNavPolicyRuntime, StepwiseTargetNavPolicyRuntimeConfig  # noqa: E402
+from adapters.sim_isaac_odometry import IsaacCommandSink, IsaacOdometryAdapter, IsaacOdometryConfig  # noqa: E402
+from adapters.stepwise_executor import OdometryActionExecutor, OdometryActionExecutorConfig  # noqa: E402
 from adapters.types import LidarFrame, RobotObservation  # noqa: E402
 from g1_nav_rl.robots.g1_command_proxy import (  # noqa: E402
     G1CommandProxy,
@@ -3850,7 +3868,99 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
             f"front_stop={float(args_cli.stepwise_emergency_front_stop_m):.3f} m",
             flush=True,
         )
-        print("[INFO]: controller: StepwiseTargetNavPolicyRuntime; no command odometry; no continuous safety smoothing", flush=True)
+        print("[INFO]: controller: StepwiseTargetNavPolicyRuntime; no continuous safety smoothing", flush=True)
+
+        sim_time_s = [0.0]
+        sim_odometry: IsaacOdometryAdapter | None = None
+        sim_command_sink: IsaacCommandSink | None = None
+        sim_executor: OdometryActionExecutor | None = None
+
+        if bool(args_cli.stepwise_odometry_execution):
+            sim_odometry = IsaacOdometryAdapter(
+                IsaacOdometryConfig(
+                    sample_period_s=float(args_cli.stepwise_odom_sample_period_s),
+                    lag_s=float(args_cli.stepwise_odom_lag_s),
+                    position_noise_std_m=float(args_cli.stepwise_odom_position_noise_std_m),
+                    yaw_noise_std_rad=math.radians(float(args_cli.stepwise_odom_yaw_noise_std_deg)),
+                    linear_velocity_noise_std_mps=float(args_cli.stepwise_odom_velocity_noise_std_mps),
+                    yaw_rate_noise_std_radps=float(args_cli.stepwise_odom_yaw_rate_noise_std_radps),
+                    position_bias_x_m=float(args_cli.stepwise_odom_position_bias_x_m),
+                    position_bias_y_m=float(args_cli.stepwise_odom_position_bias_y_m),
+                    yaw_bias_rad=math.radians(float(args_cli.stepwise_odom_yaw_bias_deg)),
+                    distance_scale=float(args_cli.stepwise_odom_distance_scale),
+                    yaw_scale=float(args_cli.stepwise_odom_yaw_scale),
+                    dropout_probability=float(args_cli.stepwise_odom_dropout_probability),
+                    stale_after_s=float(args_cli.stepwise_odom_stale_s),
+                    seed=int(args_cli.stepwise_odom_seed),
+                )
+            )
+
+            def set_sim_command(command: Any) -> None:
+                command_tensor = torch.tensor(
+                    [[float(command.vx), float(command.vy), float(command.wz)]],
+                    dtype=torch.float32,
+                    device=device,
+                ).repeat(num_envs, 1)
+                proxy.set_command(command_tensor)
+
+            def push_sim_ground_truth() -> None:
+                assert sim_odometry is not None
+                position = proxy.pos_w[0].detach().cpu()
+                velocity = proxy.cmd_current[0].detach().cpu()
+                sim_odometry.push_ground_truth(
+                    timestamp_s=float(sim_time_s[0]),
+                    x=float(position[0].item()),
+                    y=float(position[1].item()),
+                    z=float(position[2].item()),
+                    yaw=float(proxy.yaw[0].detach().cpu().item()),
+                    vx=float(velocity[0].item()),
+                    vy=float(velocity[1].item()),
+                    vz=0.0,
+                    yaw_speed=float(velocity[2].item()),
+                )
+
+            def pump_sim_odometry() -> None:
+                proxy.step(sim_dt)
+                sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
+                scene.write_data_to_sim()
+                sim.step()
+                scene.update(sim_dt)
+                sim_time_s[0] += float(sim_dt)
+                push_sim_ground_truth()
+
+            sim_odometry.set_pump(pump_sim_odometry)
+            push_sim_ground_truth()
+            startup_deadline_s = float(sim_time_s[0]) + max(
+                0.25,
+                float(args_cli.stepwise_odom_lag_s) + 2.0 * float(args_cli.stepwise_odom_sample_period_s) + float(sim_dt),
+            )
+            sim_odometry.wait_for_snapshot(newer_than_sequence=-1, deadline_s=startup_deadline_s)
+            sim_odometry.capture_origin()
+            sim_command_sink = IsaacCommandSink(
+                set_sim_command,
+                clock=sim_odometry.clock,
+                command_period_s=0.10,
+            )
+            sim_executor = OdometryActionExecutor(
+                sink=sim_command_sink,
+                odometry=sim_odometry,
+                clock=sim_odometry.clock,
+                config=OdometryActionExecutorConfig(
+                    stale_after_s=float(args_cli.stepwise_odom_stale_s),
+                    settle_timeout_s=max(1.0, 2.0 * float(args_cli.stepwise_odom_lag_s) + 0.5),
+                    command_refresh_period_s=0.10,
+                ),
+            )
+            print(
+                "[INFO]: stepwise execution: measured Isaac odometry "
+                f"lag={float(args_cli.stepwise_odom_lag_s):.3f}s "
+                f"pos_noise={float(args_cli.stepwise_odom_position_noise_std_m):.4f}m "
+                f"yaw_noise={float(args_cli.stepwise_odom_yaw_noise_std_deg):.3f}deg "
+                f"dropout={float(args_cli.stepwise_odom_dropout_probability):.3f}",
+                flush=True,
+            )
+        else:
+            print("[WARN]: stepwise execution: legacy planned-duration mode", flush=True)
         print("[CKPT]: entering stepwise action loop", flush=True)
 
         for step_idx in range(int(args_cli.max_steps) + 1):
@@ -3975,7 +4085,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
                 target_hint = None
                 target_distance = math.inf
 
-            timestamp_s = float(step_idx) * float(sim_dt)
+            timestamp_s = float(sim_time_s[0]) if sim_odometry is not None else float(step_idx) * float(sim_dt)
             lidar_frame = _lidar_frame_from_lidar_obs(live_lidar_obs, timestamp_s=timestamp_s)
             observation = RobotObservation(
                 timestamp_s=timestamp_s,
@@ -4109,6 +4219,8 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
                     "lidar_valid_hits": live_valid_hits,
                     "occupied_cells": live_occupied,
                     "lidar_debug": lidar_debug,
+                    "odometry": None if sim_odometry is None else sim_odometry.snapshot().to_dict(),
+                    "execution_result": None,
                 }
             )
 
@@ -4170,23 +4282,51 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, fro
                 safety_override_count += 1
 
             if command.duration_s is not None and not command.is_stop:
-                action_steps = max(1, int(math.ceil(float(command.duration_s) / float(sim_dt))))
-                cmd = torch.tensor([[vx, vy, wz]], dtype=torch.float32, device=device).repeat(num_envs, 1)
-                proxy.set_command(cmd)
-                for _ in range(action_steps):
+                if sim_executor is not None and sim_odometry is not None:
+                    assert decision is not None
+                    execution_result = sim_executor.execute(
+                        action=decision.action,
+                        command=command,
+                        require_state_gate=False,
+                    )
+                    stepwise_rows[-1]["execution_result"] = execution_result.to_dict()
+                    stepwise_rows[-1]["odometry_after_execution"] = sim_odometry.snapshot().to_dict()
+                    stepwise_rows[-1]["ground_truth_after_execution"] = proxy.debug_state()
+                    stepwise_runtime.navigator.invalidate_plan(
+                        "action_completed_odometry"
+                        if execution_result.completed
+                        else "action_incomplete_odometry"
+                    )
+                    if not execution_result.completed:
+                        print(
+                            f"[WARN]: simulated odometry action incomplete at step={step_idx}: "
+                            f"reason={execution_result.reason}",
+                            flush=True,
+                        )
+                else:
+                    action_steps = max(1, int(math.ceil(float(command.duration_s) / float(sim_dt))))
+                    cmd = torch.tensor([[vx, vy, wz]], dtype=torch.float32, device=device).repeat(num_envs, 1)
+                    proxy.set_command(cmd)
+                    for _ in range(action_steps):
+                        proxy.step(sim_dt)
+                        sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
+                        scene.write_data_to_sim()
+                        sim.step()
+                        scene.update(sim_dt)
+
+            if sim_command_sink is not None and sim_odometry is not None:
+                sim_command_sink.stop(timestamp_s=sim_odometry.clock())
+                if command.is_stop or command.duration_s is None:
+                    for _ in range(max(1, int(args_cli.stepwise_stop_after_action_steps))):
+                        pump_sim_odometry()
+            else:
+                proxy.set_command(torch.zeros((num_envs, 3), dtype=torch.float32, device=device))
+                for _ in range(max(1, int(args_cli.stepwise_stop_after_action_steps))):
                     proxy.step(sim_dt)
                     sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
                     scene.write_data_to_sim()
                     sim.step()
                     scene.update(sim_dt)
-
-            proxy.set_command(torch.zeros((num_envs, 3), dtype=torch.float32, device=device))
-            for _ in range(max(1, int(args_cli.stepwise_stop_after_action_steps))):
-                proxy.step(sim_dt)
-                sync_lidar_mounts_to_proxy_usd(proxy.stage, lidar_mount_paths, proxy, mount_sync_cfg)
-                scene.write_data_to_sim()
-                sim.step()
-                scene.update(sim_dt)
 
         csv_path = output_dir / "nav_lidar_trace.csv"
         write_records_csv(csv_path, records)
