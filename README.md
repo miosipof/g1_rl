@@ -52,6 +52,9 @@ Isaac scripts must be run inside the Isaac Lab / Omniverse environment.
 
 ## Isaac stepwise odometry simulation
 
+See [`docs/ODOMETRY.md`](docs/ODOMETRY.md) for the complete simulation and real
+G1 testing procedure.
+
 The stepwise Isaac runner now completes motion from simulated odometry instead
 of assuming that command duration equals traveled distance. It uses the same
 completion, stop, and settling executor as the real G1 path. With no impairment
