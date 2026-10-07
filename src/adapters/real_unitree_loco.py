@@ -25,6 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .config import CommandLimitsConfig
 from .types import AdapterCommandResult, AdapterHealth, AdapterStatus, Command2D, RobotState
+from .unitree_channel import ensure_unitree_channel_initialized
 
 
 StateReader = Callable[[Any], Mapping[str, Any]]
@@ -52,6 +53,8 @@ class UnitreeLocoAdapterConfig:
     state_samples: int = 1
     state_interval_s: float = 0.05
     stop_on_close: bool = True
+    continuous_move: bool = False
+    sdk_success_codes: tuple[int, ...] = (0,)
 
     def __post_init__(self) -> None:
         if not self.iface:
@@ -70,6 +73,10 @@ class UnitreeLocoAdapterConfig:
                 raise ValueError(f"{name} must be finite with |scale| <= 10")
             object.__setattr__(self, name, value)
         object.__setattr__(self, "blocked_fsm_modes", tuple(int(v) for v in self.blocked_fsm_modes))
+        success_codes = tuple(int(v) for v in self.sdk_success_codes)
+        if not success_codes:
+            raise ValueError("sdk_success_codes must contain at least one explicit success code")
+        object.__setattr__(self, "sdk_success_codes", success_codes)
 
 
 @dataclass
@@ -111,15 +118,15 @@ class DryRunCommandSink:
         )
 
 
-def call_move_with_sdk_compat(client: Any, command: Command2D) -> Any:
+def call_move_with_sdk_compat(client: Any, command: Command2D, *, continuous_move: bool = True) -> Any:
     """Call Unitree ``Move`` while tolerating SDK keyword spelling variants."""
 
     move = getattr(client, "Move")
     try:
-        return move(command.vx, command.vy, command.wz, continous_move=True)
+        return move(command.vx, command.vy, command.wz, continous_move=bool(continuous_move))
     except TypeError:
         try:
-            return move(command.vx, command.vy, command.wz, continuous_move=True)
+            return move(command.vx, command.vy, command.wz, continuous_move=bool(continuous_move))
         except TypeError:
             return move(command.vx, command.vy, command.wz)
 
@@ -160,6 +167,17 @@ def call_stop_move(client: Any) -> Any:
     if hasattr(client, "Move"):
         return call_move_with_sdk_compat(client, Command2D.stop(source="stop_fallback_move_zero"))
     raise AttributeError("Unitree loco client has neither StopMove nor Move")
+
+
+def sdk_call_succeeded(code: Any, *, success_codes: Sequence[int] = (0,)) -> bool:
+    """Return whether an SDK RPC explicitly reported a configured success code."""
+
+    if isinstance(code, bool) or code is None:
+        return False
+    try:
+        return int(code) in {int(value) for value in success_codes}
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def load_loco_api_constants() -> dict[str, int]:
@@ -389,10 +407,9 @@ class UnitreeLocoAdapter:
             return self.status
 
         try:
-            from unitree_sdk2py.core.channel import ChannelFactoryInitialize  # type: ignore
             from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient  # type: ignore
 
-            ChannelFactoryInitialize(0, self.config.iface)
+            ensure_unitree_channel_initialized(self.config.iface)
             client = LocoClient()
             client.SetTimeout(self.config.timeout_s)
             client.Init()
@@ -492,15 +509,20 @@ class UnitreeLocoAdapter:
             return self._reject(sdk_command, "Unitree client unavailable", health=AdapterHealth.FAULT)
 
         try:
-            code = call_move_with_sdk_compat(self._client, sdk_command)
+            code = call_move_with_sdk_compat(
+                self._client,
+                sdk_command,
+                continuous_move=self.config.continuous_move,
+            )
+            accepted = sdk_call_succeeded(code, success_codes=self.config.sdk_success_codes)
             return AdapterCommandResult(
-                accepted=True,
+                accepted=accepted,
                 command=sdk_command,
                 status=AdapterStatus(
                     name="unitree_loco",
-                    health=AdapterHealth.OK,
+                    health=AdapterHealth.OK if accepted else AdapterHealth.FAULT,
                     timestamp_s=sdk_command.timestamp_s if sdk_command.timestamp_s is not None else self._clock(),
-                    message="Move command sent",
+                    message="Move command accepted" if accepted else "Move command returned a failure/unknown code",
                     details={
                         "code": code,
                         "dry_run": False,
@@ -554,14 +576,15 @@ class UnitreeLocoAdapter:
 
         try:
             code = call_stop_move(self._client)
+            accepted = sdk_call_succeeded(code, success_codes=self.config.sdk_success_codes)
             return AdapterCommandResult(
-                accepted=True,
+                accepted=accepted,
                 command=Command2D.stop(timestamp_s=ts, source="unitree_stop"),
                 status=AdapterStatus(
                     name="unitree_loco",
-                    health=AdapterHealth.OK,
+                    health=AdapterHealth.OK if accepted else AdapterHealth.FAULT,
                     timestamp_s=ts,
-                    message="stop command sent",
+                    message="stop command accepted" if accepted else "stop command returned a failure/unknown code",
                     details={"code": code},
                 ),
             )
@@ -613,6 +636,7 @@ __all__ = [
     "call_move_with_sdk_compat",
     "map_command_for_sdk",
     "call_stop_move",
+    "sdk_call_succeeded",
     "gate_loco_state",
     "load_loco_api_constants",
     "read_loco_state",

@@ -167,6 +167,14 @@ class DetectTargetObservationProvider:
         self.last_status = TargetTrackingStatus(state="lost", reason="not_initialized", active_target=None)
         self.last_detections: list[Detection2D] = []
 
+    def invalidate_body_target(self, *, reason: str = "robot_motion") -> None:
+        """Drop coordinates measured in the pre-motion body frame."""
+
+        self.active_target = None
+        self.last_seen_step = None
+        self.last_detections = []
+        self.last_status = TargetTrackingStatus(state="lost", reason=str(reason), active_target=None)
+
     def read_observation(self) -> RobotObservation:
         obs: RobotObservation = self.base_provider.read_observation()
         redetect_interval = self._current_redetect_interval()

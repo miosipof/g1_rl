@@ -50,6 +50,36 @@ PYTHONPATH=src pytest -q tests
 
 Isaac scripts must be run inside the Isaac Lab / Omniverse environment.
 
+## Isaac stepwise odometry simulation
+
+See [`docs/ODOMETRY.md`](docs/ODOMETRY.md) for the complete simulation and real
+G1 testing procedure.
+
+The stepwise Isaac runner now completes motion from simulated odometry instead
+of assuming that command duration equals traveled distance. It uses the same
+completion, stop, and settling executor as the real G1 path. With no impairment
+flags, odometry is derived directly from the command proxy.
+
+```bash
+python scripts/smoke_test_yolo_stepwise_nav.py -- --scenario front_box --max_steps 80
+```
+
+Artificial sensor imperfections are deterministic for a fixed seed:
+
+```bash
+python scripts/smoke_test_yolo_stepwise_nav.py \
+  --odom-lag-s 0.08 \
+  --odom-position-noise-std-m 0.01 \
+  --odom-yaw-noise-std-deg 0.5 \
+  --odom-dropout-probability 0.02 \
+  --odom-seed 7 \
+  -- --scenario front_box --max_steps 80
+```
+
+Use `--legacy-duration-execution` to compare against the earlier timed-action
+behavior. Per-action measured and ground-truth results are written to
+`stepwise_trace.jsonl`.
+
 ## Next implementation phase
 
 The current periodic re-detection is intentionally simple. Next steps:
@@ -59,4 +89,3 @@ The current periodic re-detection is intentionally simple. Next steps:
 - add moving-person scenarios and scripted person trajectories;
 - add search behavior for the `LOST` state instead of only stopping;
 - only after this baseline is stable, evaluate velocity prediction or recurrent filtering.
-

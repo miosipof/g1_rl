@@ -109,8 +109,30 @@ def sync_lidar_mounts_to_proxy_usd(
     mount_prim_paths: Sequence[str],
     proxy,
     cfg: LidarMountSyncCfg | None = None,
+    *,
+    scene=None,
+    asset_name: str = "lidar_mount",
+    write_to_sim: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Synchronize kinematic lidar mount prims to a command proxy pose."""
+    """Synchronize explicit world lidar mount prims to a command proxy pose.
+
+    The G1 proxy in these smoke tests is manually moved; it is not an
+    articulation root.  Isaac Lab RayCaster has historically not behaved like a
+    camera when attached under that manually moved proxy tree.  The stable
+    pattern used in the project is therefore:
+
+    - create an explicit lidar mount prim in the world/env namespace;
+    - attach RayCaster to that mount prim;
+    - manually write the mount USD transform from the current proxy pose before
+      stepping the simulator.
+
+    This helper intentionally does **not** write Isaac Lab RigidObject tensor
+    state.  Attempts to call ``write_root_pose_to_sim`` for this mount have
+    produced CUDA illegal-memory-access failures in headless IsaacSim runs.
+
+    ``scene``, ``asset_name`` and ``write_to_sim`` are retained only for
+    backwards-compatible call sites.  They are ignored by design.
+    """
     if not hasattr(proxy, "pos_w") or not hasattr(proxy, "yaw"):
         raise TypeError("proxy must expose pos_w and yaw tensors")
 

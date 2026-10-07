@@ -47,6 +47,20 @@ from .safety import (
     compute_rgbd_depth_clearances,
 )
 
+from .stepwise import (
+    StepwiseAction,
+    StepwiseActionKind,
+    StepwiseDecision,
+    StepwiseNavConfig,
+    StepwiseNavigator,
+    StepwisePlanResult,
+    forward_action_blocked,
+    front_clearance_from_points,
+    path_to_stepwise_actions,
+    plan_stepwise_actions,
+    target_reached,
+)
+
 __all__ = [
     "DepthCropClearances",
     "RgbdSafetyConfig",
@@ -86,4 +100,6 @@ __all__ = [
     "select_waypoint",
     "world_path_to_body_path",
     "world_to_body_xy",
+    "StepwiseAction",
 ]
+

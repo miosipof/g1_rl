@@ -129,3 +129,32 @@ def test_isaac_yolo_nav_stream_source_bypasses_bbox_provider_for_initial_snapsho
     assert 'def detection_stream_initial_target_world' in script
     assert 'if str(args_cli.target_source) == "stream":\n        target_xy, stream_meta = detection_stream_initial_target_world(step_idx=0)' in script
     assert 'stream initial target target_xy_w=' in script
+
+
+def test_isaac_stepwise_stream_script_help_exposes_stepwise_flags() -> None:
+    script = ROOT / "scripts" / "smoke_test_yolo_stepwise_nav.py"
+    result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True, check=True)
+    assert "--forward-segment-m" in result.stdout
+    assert "--stream-target-body-x" in result.stdout
+    assert "--no-static-stream" in result.stdout
+    assert "--odom-lag-s" in result.stdout
+    assert "--odom-position-noise-std-m" in result.stdout
+    assert "--legacy-duration-execution" in result.stdout
+
+
+def test_isaac_yolo_nav_exposes_stepwise_controller_mode() -> None:
+    script = (ROOT / "scripts" / "smoke_test_yolo_person_nav.py").read_text()
+    assert "--controller_mode" in script
+    assert "StepwiseTargetNavPolicyRuntime" in script
+    assert "--stepwise_forward_segment_m" in script
+    assert "stepwise_trace.jsonl" in script
+    assert "IsaacOdometryAdapter" in script
+    assert "sim_executor.execute" in script
+    assert "action_completed_odometry" in script
+
+
+def test_isaac_stepwise_lidar_frame_promotes_xy_points_to_xyz() -> None:
+    script = (ROOT / "scripts" / "smoke_test_yolo_person_nav.py").read_text()
+    assert "lidar_points_b must have shape [N, 2]" in script
+    assert "torch.cat((points_b, z), dim=-1)" in script
+    assert "zero_filled_2d_proxy_scan" in script
